@@ -1,27 +1,24 @@
 #!/usr/bin/env python
 #
-# This file is part of adbb.
+# This file is part of anidb-client.
 #
-# adbb is free software: you can redistribute it and/or modify
+# anidb-client is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# adbb is distributed in the hope that it will be useful,
+# anidb-client is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with adbb.  If not, see <http://www.gnu.org/licenses/>.
+# along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 
-from __future__ import with_statement
 import datetime
-import difflib
 import functools
-import re
 import os
-import xml.etree.cElementTree as etree
+import re
 
 from Crypto.Hash import MD4
 
@@ -30,42 +27,48 @@ try:
 except ImportError:
     libnfs = None
 
-import adbb.errors
+import anidb_client.errors
 
 ep_nr_re = [
-    re.compile(r'[Ss]([0-9]+)[ ._-]*e([0-9]+)([0-9-]*)', re.I),  # foo.s01.e01, foo.s01_e01, S01E02 foo, S01 - E02
-    re.compile(r'[\._ -]()ep_?([0-9]+)([0-9-]*)', re.I),  # foo.ep01, foo.EP_01
-    re.compile(r'[\\/\._ \[\(-]([0-9]{1,2})x([0-9]+)([0-9-]*)', re.I),  # foo.1x09* or just /1x09*
-    re.compile(r'[/\._ \-](s)p(?:ecials?)?[._ \-]{0,3}([0-9]{1,3})([0-9-]*)', re.I),  # specials
-    re.compile(r'[/\._ \-]{2}()([0-9]{1,4})([0-9-]*)', re.I),  # match '- nr' '-_nr' etc.
-    re.compile(r'[/\._ \-](s)[\._ \-]{0,3}([0-9]{1,3})([0-9-]*)', re.I),  # specials
-
+    re.compile(
+        r"[Ss]([0-9]+)[ ._-]*e([0-9]+)([0-9-]*)", re.IGNORECASE
+    ),  # foo.s01.e01, foo.s01_e01, S01E02 foo, S01 - E02
+    re.compile(r"[\._ -]()ep_?([0-9]+)([0-9-]*)", re.IGNORECASE),  # foo.ep01, foo.EP_01
+    re.compile(r"[\\/\._ \[\(-]([0-9]{1,2})x([0-9]+)([0-9-]*)", re.IGNORECASE),  # foo.1x09* or just /1x09*
+    re.compile(r"[/\._ \-](s)p(?:ecials?)?[._ \-]{0,3}([0-9]{1,3})([0-9-]*)", re.IGNORECASE),  # specials
+    re.compile(r"[/\._ \-]{2}()([0-9]{1,4})([0-9-]*)", re.IGNORECASE),  # match '- nr' '-_nr' etc.
+    re.compile(r"[/\._ \-](s)[\._ \-]{0,3}([0-9]{1,3})([0-9-]*)", re.IGNORECASE),  # specials
     None,  # the following regex are fallbacks and shouldn't be run if the
     # anime only has one episode. This None marks the breakpoint
-    re.compile(r'[/\._ \-](s)p?(?:ecials?)?[\._ \-]{1,3}([0-9]{0,3})([0-9-]*)', re.I),
+    re.compile(r"[/\._ \-](s)p?(?:ecials?)?[\._ \-]{1,3}([0-9]{0,3})([0-9-]*)", re.IGNORECASE),
     # specials that may not have number
-    re.compile(r'[/\._ \-](?:nc)?(o)p?(?:enings?)?[\._ \-]{0,3}([0-9]{0,3})([0-9-]*)', re.I),  # openings
-    re.compile(r'[/\._ \-](?:nc)?(e)d?(?:ndings?)?[\._ \-]{0,3}([0-9]{0,3})([0-9-]*)', re.I),  # endings
-    re.compile(r'[/\._ \-](t|pv)(?:railers?)?[\._ \-]{0,3}([0-9]{0,3})([0-9-]*)', re.I),  # trailers
+    re.compile(r"[/\._ \-](?:nc)?(o)p?(?:enings?)?[\._ \-]{0,3}([0-9]{0,3})([0-9-]*)", re.IGNORECASE),  # openings
+    re.compile(r"[/\._ \-](?:nc)?(e)d?(?:ndings?)?[\._ \-]{0,3}([0-9]{0,3})([0-9-]*)", re.IGNORECASE),  # endings
+    re.compile(r"[/\._ \-](t|pv)(?:railers?)?[\._ \-]{0,3}([0-9]{0,3})([0-9-]*)", re.IGNORECASE),  # trailers
     # "others"-type not implemented for now...
-    re.compile(r'[/\._ \-]()([0-9]{1,4})([0-9-]*)', re.I)  # if everything else fails, just match the first number(s)
+    re.compile(
+        r"[/\._ \-]()([0-9]{1,4})([0-9-]*)", re.IGNORECASE
+    ),  # if everything else fails, just match the first number(s)
 ]
-partfile_re = re.compile(r'[/\._ \-](p)(?:ar)t[/\._ \-]{0,3}([0-9ivx]+)', re.I)  # part-file, not complete episode/movie
-multiep_re = re.compile(r'[0-9]+')
-specials_re = re.compile(r'^(S|P|C|T|O)([0-9]+)$', re.I)
+partfile_re = re.compile(
+    r"[/\._ \-](p)(?:ar)t[/\._ \-]{0,3}([0-9ivx]+)", re.IGNORECASE
+)  # part-file, not complete episode/movie
+multiep_re = re.compile(r"[0-9]+")
+specials_re = re.compile(r"^(S|P|C|T|O)([0-9]+)$", re.IGNORECASE)
 
 
 # http://www.radicand.org/blog/orz/2010/2/21/edonkey2000-hash-in-python/
 def get_file_hash(path, nfs_obj=None):
-    if path.startswith('nfs://'):
-        with NFSFile(path, 'rb', nfs_obj) as f:
+    if path.startswith("nfs://"):
+        with NFSFile(path, "rb", nfs_obj) as f:
             return _calculate_ed2khash(f)
-    with open(path, 'rb') as f:
+    with open(path, "rb") as f:
         return _calculate_ed2khash(f)
 
 
 def _calculate_ed2khash(fileObj):
-    """ Returns the ed2k hash of a given file."""
+    """Returns the ed2k hash of a given file."""
+
     def gen(f):
         while True:
             x = f.read(9728000)
@@ -81,6 +84,11 @@ def _calculate_ed2khash(fileObj):
 
     a = gen(fileObj)
     hashes = [md4_hash(data) for data in a]
+    if not hashes:
+        # An empty file yields no chunks at all, so the multi-chunk branch below
+        # used to index hashes[0] and raise IndexError. ed2k defines the hash of
+        # an empty file as MD4 of nothing, which is what a zero-chunk file is.
+        return md4_hash(b"").hexdigest()
     if len(hashes) == 1:
         return hashes[0].hexdigest()
     else:
@@ -93,7 +101,7 @@ def _calculate_ed2khash(fileObj):
 
 def get_file_stats(path, nfs_obj=None):
     """Return (mtime, size). size is in bytes, mtime is a datetime object."""
-    if path.startswith('nfs://'):
+    if path.startswith("nfs://"):
         return _nfs_stats(path, nfs_obj)
 
     stat = os.stat(path)
@@ -103,11 +111,10 @@ def get_file_stats(path, nfs_obj=None):
     return (mtime, size)
 
 
-class NFSFile(object):
+class NFSFile:
     def __init__(self, path, mode, nfs_obj=None):
         if not libnfs:
-            raise adbb.errors.AniDBPathError(
-                "libnfs python module not installed, can't use nfs paths")
+            raise anidb_client.errors.AniDBPathError("libnfs python module not installed, can't use nfs paths")
         self.mode = mode
         self.handle = None
         self.nfs_obj = nfs_obj
@@ -116,7 +123,7 @@ class NFSFile(object):
 
         if self.nfs_obj:
             if path.startswith(nfs_obj.url):
-                self.rel_path = os.path.join('/', path[len(nfs_obj.url):])
+                self.rel_path = os.path.join("/", path[len(nfs_obj.url) :])
             else:
                 self.rel_path = self.path
 
@@ -140,9 +147,9 @@ class NFSFile(object):
 
 def _nfs_stats(path, nfs_obj=None):
     stats = None
-    with NFSFile(path, 'r', nfs_obj) as f:
+    with NFSFile(path, "r", nfs_obj) as f:
         stats = f.fstat()
 
-    mtime = stats['mtime']['sec'] + stats['mtime']['nsec'] / 10 ** 9
+    mtime = stats["mtime"]["sec"] + stats["mtime"]["nsec"] / 10**9
     mtime = datetime.datetime.fromtimestamp(mtime)
-    return (mtime, stats['size'])
+    return (mtime, stats["size"])

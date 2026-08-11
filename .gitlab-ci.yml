@@ -7,8 +7,10 @@
 # roll `main` by design, so each soaked scanner-image bump in ci-templates lands here on
 # the next pipeline with no second soak.
 #
-# container-scanning is intentionally NOT included: this repo builds no image, so there
-# is nothing to scan.
+# container-scanning is intentionally NOT included. This project's deliverable is a wheel
+# on PyPI, not an image; the Dockerfile here is a development and test harness that is
+# never published, so scanning it would gate releases on findings in a build tool that
+# ships to nobody. Dependency scanning covers the surface that does reach users.
 include:
   - project: 'boomshadow_private/personal/ci-templates'
     file:
@@ -18,13 +20,23 @@ include:
 
 stages:
   - validate
+  - test
+  - build
   - security
+  - publish
+
+# Pinned uv image (Python 3.14 + uv) shared by every job below. uv 0.11.25
+# (2026-06-27, within the 45-day soak); index digest verified from ghcr.io, and the
+# same one the Dockerfile pins so local and CI runs use an identical toolchain.
+.uv-image: &uv_image >-
+  ghcr.io/astral-sh/uv:0.11.25-python3.14-trixie-slim@sha256:2b2e474b3a72e84c92b18a2f011a14adcb045fb361f7d8667ed1f8f55eefdafd
 
 # Run a merge-request pipeline for MRs; otherwise a branch pipeline -- but never both for
 # the same branch at once (avoids duplicate pipelines when a branch has an open MR).
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
     - if: $CI_COMMIT_BRANCH
@@ -41,15 +53,168 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH
+
+# Publishing only ever happens from an annotated version tag, never from a branch.
+.rules-tag-only:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+
+# Shared uv setup. The cache is keyed on uv.lock, so it is reused until a dependency
+# actually changes. `--frozen` makes the job fail if uv.lock is out of date with
+# pyproject.toml rather than quietly resolving something different from local runs.
+.uv-job:
+  image: *uv_image
+  variables:
+    UV_CACHE_DIR: .uv-cache
+  cache:
+    key:
+      files:
+        - uv.lock
+    paths:
+      - .uv-cache
+  before_script:
+    - uv sync --frozen --group dev
 
 ############################
 # Validate
 ############################
-# A simple placeholder job so CI works.
-validate:placeholder:
-  extends: .rules-always
+# The lockfile must match pyproject.toml exactly. Without this a dependency added to
+# pyproject but never locked would install fine locally (uv resolves on the fly) and
+# then differ from what every other job and every user gets.
+validate:lockfile:
+  extends:
+    - .uv-job
+    - .rules-always
   stage: validate
-  image: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+  before_script: []
   script:
-    - echo pass
+    - uv lock --check
+
+############################
+# Test
+############################
+lint:
+  extends:
+    - .uv-job
+    - .rules-always
+  stage: test
+  script:
+    # Emit the GitLab Code Quality report, rendered inline on the MR diff.
+    # `|| true` so the report is always produced; the gating checks below fail the job.
+    - uv run --frozen ruff check --output-format=gitlab . > gl-code-quality-report.json || true
+    - uv run --frozen ruff check --output-format=full .
+    - uv run --frozen ruff format --diff .
+    - uv run --frozen codespell
+  artifacts:
+    when: always
+    reports:
+      codequality: gl-code-quality-report.json
+
+typecheck:
+  extends:
+    - .uv-job
+    - .rules-always
+  stage: test
+  script:
+    - uv run --frozen mypy
+
+# The suite never contacts AniDB: a fake UDP server on loopback stands in for the API,
+# and an autouse fixture fails any test that addresses a non-loopback host. That is
+# enforced by the tests themselves (tests/test_network_guard.py), not by this runner --
+# so it holds on a developer's machine too.
+test:
+  extends:
+    - .uv-job
+    - .rules-always
+  stage: test
+  script:
+    - uv run --frozen pytest --cov --cov-branch --cov-report=term --cov-report=xml --junitxml=report.xml
+  coverage: '/^TOTAL.+?(\d+\%)$/'
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+
+# The oldest interpreter the package claims to support. The jobs above run on 3.14; if
+# only those ran, a 3.12-only syntax or stdlib call would ship and break the floor
+# declared in requires-python.
+test:oldest-python:
+  extends: .rules-always
+  stage: test
+  image: ghcr.io/astral-sh/uv:0.11.25-python3.11-trixie-slim@sha256:4da9f7b2524bb30559ca94f6d986d9cd2a0f75c4fb5b82162ef3fe44ef6b45b5
+  variables:
+    UV_CACHE_DIR: .uv-cache
+  cache:
+    key:
+      files:
+        - uv.lock
+    paths:
+      - .uv-cache
+  before_script:
+    - uv sync --frozen --group dev --python 3.11
+  script:
+    - uv run --frozen --python 3.11 pytest -q
+
+############################
+# Build
+############################
+# Builds the wheel and sdist that the publish job uploads, so the artifact that is
+# released is the one that was tested rather than one rebuilt at publish time.
+build:dist:
+  extends: .rules-always
+  stage: build
+  image: *uv_image
+  variables:
+    # Deliberately NOT extending .uv-job. That sets UV_CACHE_DIR to `.uv-cache`
+    # inside the working tree, and `uv build` refuses to run with its cache inside
+    # the directory it is building from ("The cache directory `.uv-cache` is
+    # inside the build source directory"). This job also needs no `uv sync`: the
+    # build backend is resolved into an isolated environment by `uv build` itself.
+    UV_CACHE_DIR: /tmp/uv-cache
+  script:
+    - uv build
+    # Fail loudly if the build produced something unexpected before it can be published.
+    - ls -l dist/
+    - test -n "$(find dist -name '*.whl')"
+    - test -n "$(find dist -name '*.tar.gz')"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+############################
+# Publish
+############################
+# PyPI trusted publishing (OIDC): PyPI verifies a short-lived GitLab identity token
+# rather than a long-lived API token, so there is no upload credential stored in CI at
+# all. Configure the publisher at https://pypi.org/manage/account/publishing/ against
+# this project, the `publish:pypi` job name and the `pypi` environment before the first
+# release, or this job will fail authentication.
+#
+# Runs only from a vN.N.N tag, and only after the security stage has passed.
+publish:pypi:
+  extends: .rules-tag-only
+  stage: publish
+  image: *uv_image
+  environment:
+    name: pypi
+    url: https://pypi.org/project/anidb-client/
+  id_tokens:
+    PYPI_ID_TOKEN:
+      aud: pypi
+  needs:
+    - job: build:dist
+      artifacts: true
+  script:
+    # The tag must match the version inside the built wheel, or the release on PyPI
+    # would be labelled differently from the tag it was cut from. Read from the wheel
+    # filename rather than the source, so this checks the artifact being uploaded.
+    - WHEEL="$(find dist -name 'anidb_client-*.whl' -printf '%f\n' | head -1)"
+    - VERSION="$(echo "$WHEEL" | cut -d- -f2)"
+    - test "v$VERSION" = "$CI_COMMIT_TAG" || { echo "tag $CI_COMMIT_TAG != wheel version v$VERSION"; exit 1; }
+    - uv publish --trusted-publishing always

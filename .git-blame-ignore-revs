@@ -1,0 +1,11 @@
+# Revisions that changed formatting only, and would otherwise bury the real
+# authorship of every line they touched.
+#
+# Configure git to use this file once per clone:
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitLab and GitHub both honour it automatically in their blame views.
+
+# style: apply ruff format across the codebase
+c6e54d4503ecfb269aa2ca5b0be4330804a63cca

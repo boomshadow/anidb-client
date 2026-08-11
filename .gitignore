@@ -1,57 +1,67 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-
-# C extensions
 *.so
 
 # Distribution / packaging
 .Python
-env/
 build/
 develop-eggs/
 dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
 parts/
 sdist/
 var/
+wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# Virtualenvs / environments
+.venv/
+venv/
+env/
+ENV/
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# uv
+.uv-cache/
 
-# Unit test / coverage reports
-htmlcov/
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.cache/
 .tox/
+
+# Test / coverage reports
+htmlcov/
 .coverage
 .coverage.*
-.cache
-nosetests.xml
 coverage.xml
-*,cover
+report.xml
+junit.xml
+gl-code-quality-report.json
 
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
+# Local cache written by the anime-titles / anime-list fetchers when a developer
+# points them at the working tree instead of the system temp dir.
+*.xml.gz
 
 # Sphinx documentation
 docs/_build/
 
-# PyBuilder
-target/
+# Secrets — never commit. The library reads credentials from a netrc file.
+.netrc
+*.netrc
+
+# Local scratch databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

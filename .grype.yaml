@@ -1,0 +1,22 @@
+# Grype dependency-scan exceptions.
+#
+# An empty list is the healthy steady state, and this file is currently empty.
+#
+# Every entry MUST carry:
+#   * the CVE/GHSA id and the package it applies to
+#   * a one-sentence reason citing specific reachability evidence in THIS project
+#     -- a file path, a config key, a grep result -- not "not exploitable"
+#   * an explicit expiry, `[expires:YYYY-MM-DD]`, defaulting to 90 days out
+#
+# A suppression is only appropriate when the vulnerability is genuinely not
+# reachable here. If an in-soak fix exists, take the upgrade instead. At expiry,
+# re-evaluate: has a fix aged into the 45-day soak window, has reachability
+# changed, is there a newer advisory?
+#
+# The exception-audit CI template reads this file and fails the pipeline on
+# entries that are undated, expired, or missing a rationale.
+#
+# The runtime dependency surface here is deliberately small -- pycryptodome and
+# sqlalchemy -- so findings should be rare and worth reading individually.
+
+ignore: []

@@ -1,19 +1,20 @@
 #!/usr/bin/env python
 #
-# This file is part of adbb.
+# This file is part of anidb-client.
 #
-# adbb is free software: you can redistribute it and/or modify
+# anidb-client is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# adbb is distributed in the hope that it will be useful,
+# anidb-client is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with adbb.  If not, see <http://www.gnu.org/licenses/>.
+# along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
+
 
 class AniDBError(Exception):
     pass
@@ -50,11 +51,14 @@ class AniDBFileError(AniDBError):
 class AniDBPathError(AniDBError):
     pass
 
+
 class IllegalAnimeObject(AniDBError):
     pass
 
+
 class FanartError(AniDBError):
     pass
+
 
 class AniDBMissingImage(AniDBError):
     pass

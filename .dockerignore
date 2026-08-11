@@ -1,0 +1,39 @@
+.git/
+.gitignore
+.gitlab-ci.yml
+
+# Virtualenvs and caches -- rebuilt inside the image, and copying a host venv in would
+# shadow the container's own interpreter paths.
+.venv/
+venv/
+.uv-cache/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Build output
+dist/
+build/
+*.egg-info/
+
+# Coverage and test reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+report.xml
+gl-code-quality-report.json
+
+# Credentials and local state must never enter an image layer.
+.netrc
+*.netrc
+*.db
+*.sqlite
+*.sqlite3
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
