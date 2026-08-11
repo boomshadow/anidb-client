@@ -160,7 +160,13 @@ class AniDBObj:
             session.rollback()
 
     def __getattribute__(self, attr):
-        if attr in ["_updated", "_updating", "_anidb_link"]:
+        # Internal machinery stays readable on an object that has been marked
+        # illegal. Everything here is either the flag itself or a completion event
+        # that a waiting thread depends on -- File's `_file_updated` and
+        # `_mylist_updated` were missing, so a callback that marked the file illegal
+        # then raised on its own `self._file_updated.set()`, leaving the waiter
+        # blocked. Marking an object invalid must never make it unable to say so.
+        if attr in ["_updated", "_updating", "_anidb_link", "_file_updated", "_mylist_updated", "_illegal_object"]:
             return super().__getattribute__(attr)
         if super().__getattribute__("_illegal_object"):
             raise IllegalAnimeObject(f"{self} is not a valid AniDB object")
@@ -232,14 +238,25 @@ class Anime(AniDBObj):
             self._close_db_session(sess)
 
     def _db_data_callback(self, res):
-        ainfo = res.datalines[0]
-        relations = []
-        new = None
+        # "NO SUCH ANIME" carries no data lines, so this check has to come before
+        # anything reads them. It used to sit *after* `res.datalines[0]`, which
+        # raised IndexError on every 330 reply -- and because the exception left
+        # `_updated` unset, whoever was waiting on it waited forever. Asking for an
+        # aid AniDB does not have hung the caller permanently.
         if res.rescode == "330":
+            # `self.log` -- there is no such attribute on AniDBObj, and by this point
+            # `_illegal_object` had already been set, so __getattribute__ raised
+            # IllegalAnimeObject before `_updated.set()` could run. That left the 330
+            # path hanging even once the IndexError above it was fixed. Log through
+            # the module, and set the flag after, so neither can bite again.
+            anidb_client.log.warning(f"{self} is not a valid Anime object")
             self._illegal_object = True
-            self.log.warning(f"{self} is not a valid Anime object")
             self._updated.set()
             return
+
+        relations = []
+        new = None
+        ainfo = res.datalines[0]
 
         if all(x in ainfo and ainfo[x] for x in ["related_aid_list", "related_aid_type"]):
             # strict=False: AniDB has been seen to return the two lists at different
@@ -884,11 +901,22 @@ class File(AniDBObj):
                     self._anime = anime
                     self._episode = episodes[0]
                 try:
+                    # `anime` is None when there was nothing to guess from -- an fid
+                    # AniDB does not have, with no local path. That raised
+                    # AttributeError, which this clause did not catch, so the
+                    # exception escaped and left the waiter blocked.
+                    if anime is None:
+                        raise IllegalAnimeObject(f"Could not identify {self}")
                     finfo["aid"] = anime.aid
                     finfo["eid"] = episodes[0].eid
                     finfo["is_generic"] = self._is_generic
-                except (IllegalAnimeObject, IndexError):
+                except (IllegalAnimeObject, IndexError, TypeError):
                     self._illegal_object = True
+                    # Signal before returning. `_file_updated` is otherwise only set
+                    # at the very end of this method, so bailing out here left every
+                    # waiter blocked forever -- a file AniDB does not know, whose
+                    # anime and episode cannot be guessed, hung the caller.
+                    self._file_updated.set()
                     return
         else:
             finfo = res.datalines[0]
@@ -1303,9 +1331,15 @@ class File(AniDBObj):
         anidb_client.log.info(f"File {self} updated in mylist")
 
     def _guess_anime_ep_from_file(self, aid=None):
-        if not self.path:
+        # Read the path without going through __getattr__. This runs from inside
+        # _anidb_file_data_callback, and `self.path` on a File with no local path
+        # falls through to update_if_old() -- which starts a fetch and waits on the
+        # very event this callback exists to set. A File built from an fid AniDB
+        # does not have deadlocked there permanently.
+        path = self._path or (self.db_data.path if self.db_data else None)
+        if not path:
             return (None, None)
-        head, filename = os.path.split(self.path)
+        head, filename = os.path.split(path)
         head, parent_dir = os.path.split(head)
 
         if not aid:
@@ -1362,8 +1396,20 @@ class File(AniDBObj):
                 try:
                     ep = int(m)
                 except ValueError:
-                    if ep.lower() in anidb_client.mapper.roman_numbering:
-                        ep = anidb_client.mapper.roman_numbering[ep.lower()]
+                    if not m:
+                        # The specials, opening, ending and trailer patterns all
+                        # allow the number to be absent -- "foo.special.mkv",
+                        # "foo.NCOP.mkv" -- which is what an empty capture means
+                        # here. The first one of its kind is the only sensible
+                        # reading, so treat it as number 1.
+                        ep = 1
+                    elif m.lower() in anidb_client.mapper.roman_numbering:
+                        # `m`, not `ep`. This branch read `ep`, which on the first
+                        # iteration is unbound (int() had just failed) and on later
+                        # ones holds the *previous* episode number -- so it raised
+                        # UnboundLocalError or AttributeError rather than ever
+                        # converting a numeral.
+                        ep = anidb_client.mapper.roman_numbering[m.lower()]
                     else:
                         anidb_client.log.warning(
                             f"Got non-numeric episode number when searching '{filename}' with regex '{regex}'"

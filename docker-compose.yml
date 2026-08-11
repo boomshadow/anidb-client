@@ -19,6 +19,12 @@ services:
       # autouse fixture blocks non-loopback sockets; this makes an escape fail at the
       # DNS layer too, well before a packet could be addressed to anidb.net.
       NO_PROXY: "*"
+      # Where the schema tests find a real server database. Absent, they skip --
+      # so `uv run pytest` still works outside compose, it just covers less.
+      ANIDB_TEST_POSTGRES_URL: postgresql://anidb:anidb@db:5432/anidb_test
+    depends_on:
+      db:
+        condition: service_healthy
     init: true
     # Read-write on /app (tests write to tmp_path, tooling writes caches), but the
     # container never needs privileges.
@@ -26,6 +32,33 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+  # A real PostgreSQL, because SQLite does not exercise the parts of this schema most
+  # likely to break. The Enum columns become native CREATE TYPE enums on PostgreSQL and
+  # plain VARCHARs on SQLite, and `BigInteger().with_variant(Integer, "sqlite")` exists
+  # precisely because the two differ -- so a SQLite-only suite tests neither branch.
+  #
+  # Credentials are fixed and trivial on purpose: this database holds nothing, is
+  # reachable only on the compose network, and is destroyed with the container.
+  db:
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_USER: anidb
+      POSTGRES_PASSWORD: anidb
+      POSTGRES_DB: anidb_test
+      # A subdirectory of the tmpfs, so initdb creates a directory it owns rather than
+      # trying to initialise the mount point itself.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    # In RAM and discarded on exit. This is a test fixture, not storage: there is
+    # nothing here worth persisting between runs, and no state to leak into a test.
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U anidb -d anidb_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
 volumes:
   uv-cache:

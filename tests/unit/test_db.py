@@ -36,6 +36,9 @@ def session():
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as s:
         yield s
+    # Without this the pooled connections survive the test and are only closed
+    # when the collector gets round to them.
+    engine.dispose()
 
 
 def _anime(aid=6187, **kwargs):

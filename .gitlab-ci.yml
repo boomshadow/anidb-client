@@ -129,8 +129,23 @@ test:
     - .uv-job
     - .rules-always
   stage: test
+  # A real PostgreSQL for the schema tests. SQLite does not exercise the native enum
+  # types or the BigInteger/Integer variant the schema declares, so a SQLite-only run
+  # covers neither branch. Same image and digest as docker-compose.yml, so a local
+  # `task test` and this job talk to the same server version.
+  services:
+    - name: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+      alias: db
+  variables:
+    POSTGRES_USER: anidb
+    POSTGRES_PASSWORD: anidb
+    POSTGRES_DB: anidb_test
+    ANIDB_TEST_POSTGRES_URL: postgresql://anidb:anidb@db:5432/anidb_test
   script:
     - uv run --frozen pytest --cov --cov-branch --cov-report=term --cov-report=xml --junitxml=report.xml
+    # The PostgreSQL-backed tests skip silently when the server is unreachable, which
+    # would make this job quietly weaker than it looks. Fail instead.
+    - uv run --frozen pytest -q -m postgres --no-cov -p no:cacheprovider
   coverage: '/^TOTAL.+?(\d+\%)$/'
   artifacts:
     when: always

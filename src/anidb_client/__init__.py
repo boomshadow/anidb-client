@@ -25,6 +25,7 @@ import urllib.request
 
 import anidb_client.db
 import anidb_client.errors
+from anidb_client import errors as adbb_errors
 from anidb_client.anames import get_titles, update_anilist, update_animetitles
 from anidb_client.animeobjs import Anime, AnimeTitle, Episode, File, Group
 from anidb_client.link import AniDBLink
@@ -114,10 +115,15 @@ def init(
     except FileNotFoundError:
         nrc = None
 
-    # unless both username and password is given; look for credentials in netrc
-    if not (api_user and api_pass) or db_only:
+    # Credentials are needed only to open the UDP session. A db_only client never
+    # opens one, so it must not demand them -- the condition here used to read
+    # `... or db_only`, which made db_only *require* a netrc file and so refuse to
+    # start for exactly the cache-only use it exists to serve.
+    if not db_only and not (api_user and api_pass):
         if not nrc:
-            raise Exception("User and passwords are required if no netrc file exists")
+            raise adbb_errors.AniDBError(
+                "An AniDB username and password are required, either as arguments or in a netrc file"
+            )
         for host in ["api.anidb.net", "api.anidb.info", "anidb.net"]:
             try:
                 username, account, password = nrc.authenticators(host)

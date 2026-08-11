@@ -202,7 +202,12 @@ class AniDBLink(threading.Thread):
 
         try:
             self._listener.sock.sendto(data, self._server)
-        except socket.gaierror as e:
+        except OSError as e:
+            # Was `socket.gaierror` alone, which is one subclass of OSError and
+            # covers only name resolution. Anything else -- most often the socket
+            # being closed by stop() between the liveness check above and this call
+            # -- escaped and killed the sender thread silently. Every case wants
+            # the same treatment: log it, put the command back, and back off.
             anidb_client.log.warning(f"Failed to send command {command.command}: {e}")
             if command.command not in ("AUTH", "PING", "ENCRYPT"):
                 self._queue.append(command)
