@@ -63,6 +63,16 @@ anidb_client_name = "anidbclientpy"
 anidb_client_version = 1
 anidb_api_version = 3
 
+# Applied to every HTTP request the library makes: the anime-titles and anime-list
+# XML fetches, cover-image downloads and the fanart API. urllib defaults to no
+# timeout at all, which made each of those able to block its caller forever on a
+# server that accepts the connection and then stops talking -- a hang with no UDP
+# involved, and the one failure mode the transport's own timeouts do not cover.
+#
+# This is a per-socket-operation timeout rather than a bound on the whole
+# transfer, so it ends a stalled connection but not a pathologically slow one.
+HTTP_TIMEOUT = 30
+
 log = None
 _anidb = None
 _sessionmaker = None
@@ -147,24 +157,37 @@ def init(
         )
 
     if nrc:
-        # if no password is given in sql-url we try to look it up
-        # in netrc
-        parts = sql_db_url.split("/")
-        if parts[2] and ":" not in parts[2]:
-            if "@" in parts[2]:
-                username, host = parts[2].split("@")
-            else:
-                username, host = (None, parts[2])
+        # If the sql-url carries no password, look one up in netrc.
+        #
+        # This was string surgery on sql_db_url.split("/"), and it got the common
+        # case wrong in both directions. It tested `":" not in parts[2]` to mean
+        # "no password given", but a netloc also contains a colon before a port --
+        # so every URL naming a port, which is most of them, skipped the lookup
+        # entirely. And it interpolated the credentials raw, so a password
+        # containing any of :/?#@ produced a URL that parsed as something else.
+        # urllib.parse knows where the fields are, and quote() makes the values
+        # safe to put back.
+        parsed = urllib.parse.urlparse(sql_db_url)
+        if parsed.hostname and not parsed.password:
             try:
-                u, _account, password = nrc.authenticators(host)
+                netrc_user, _account, netrc_password = nrc.authenticators(parsed.hostname)
             except TypeError:
-                u, password = (None, None)
-            if password:
-                if not username:
-                    username = u
-                if username == u:
-                    parts[2] = f"{username}:{password}@{host}"
-        sql_db_url = "/".join(parts)
+                netrc_user, netrc_password = (None, None)
+            if netrc_password:
+                db_user = parsed.username or netrc_user
+                # Only supply the password if it belongs to the user in the URL:
+                # netrc holds one credential per host, and pairing it with a
+                # different username would just fail authentication confusingly.
+                if db_user == netrc_user:
+                    # hostname is lowercased and stripped of brackets by urlparse, so
+                    # an IPv6 literal has to be put back the way it came.
+                    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+                    if parsed.port:
+                        host = f"{host}:{parsed.port}"
+                    quoted_user = urllib.parse.quote(db_user, safe="")
+                    quoted_password = urllib.parse.quote(netrc_password, safe="")
+                    netloc = f"{quoted_user}:{quoted_password}@{host}"
+                    sql_db_url = parsed._replace(netloc=netloc).geturl()
 
         if not fanart_key:
             for host in ["fanart.tv", "assets.fanart.tv", "webservice.fanart.tv", "api.fanart.tv"]:
@@ -197,7 +220,7 @@ def download_image(filehandle, obj):
     url_base = "https://cdn.anidb.net/images/main"
     url = f"{url_base}/{obj.picname}"
     req = urllib.request.Request(url)
-    with urllib.request.urlopen(req) as f:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as f:
         filehandle.write(f.read())
 
 
@@ -213,7 +236,7 @@ def download_fanart(filehandle, url, preview=False):
         my_url = urllib.parse.urlparse(url)._replace(scheme="https", path=urllib.parse.quote(my_url.path))
 
     req = urllib.request.Request(my_url.geturl(), headers={"api-key": fanart_key})
-    with urllib.request.urlopen(req) as f:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as f:
         filehandle.write(f.read())
 
 

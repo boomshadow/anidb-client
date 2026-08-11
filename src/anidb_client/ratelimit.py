@@ -49,6 +49,14 @@ class RateLimiter:
     # bans last on the order of half an hour, so there is no point retrying sooner.
     BAN_BASE_DELAY = 1800
 
+    # Ceiling on that doubling, giving a longest back-off of BAN_BASE_DELAY * this.
+    # A successful authentication calls clear_ban(), so in the ordinary
+    # banned-then-readmitted cycle the multiplier rarely leaves 1. It compounds when
+    # authentication itself keeps failing, and without a ceiling that sequence walks
+    # off into delays measured in days -- a client that has, for practical purposes,
+    # stopped, while reporting only that it is waiting.
+    MAX_BAN_MULTIPLIER = 8
+
     def __init__(
         self,
         monotonic: Callable[[], float] | None = None,
@@ -82,9 +90,9 @@ class RateLimiter:
         """Record a ban or server-busy reply and return the new multiplier.
 
         Doubles per consecutive ban, so a server that stays unhappy is backed away
-        from rather than hammered at a fixed interval.
+        from rather than hammered at a fixed interval, up to MAX_BAN_MULTIPLIER.
         """
-        self._ban_multiplier = 1 if not self._ban_multiplier else self._ban_multiplier * 2
+        self._ban_multiplier = 1 if not self._ban_multiplier else min(self._ban_multiplier * 2, self.MAX_BAN_MULTIPLIER)
         return self._ban_multiplier
 
     def clear_ban(self) -> None:

@@ -417,6 +417,7 @@ class MylistResponse(Response):
         storage     - for example the title of the cd you have this on
         source     - where you got the file (bittorrent,dc++,ed2k,...)
         other     - other data regarding this file
+        filestate - the condition of the file (original, corrupted, self-edited, ...)
         """
         Response.__init__(self, cmd, restag, rescode, resstr, datalines)
         self.codestr = "MYLIST"
@@ -433,6 +434,10 @@ class MylistResponse(Response):
             "mylist_storage",
             "mylist_source",
             "mylist_other",
+            # The reply's last field, and previously unnamed here -- so the file
+            # state arrived, was never given a name, and was dropped, even though
+            # FileTable has a column for it and MYLISTADD already writes one.
+            "mylist_filestate",
         )
         self.coderep = ()
 

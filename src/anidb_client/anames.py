@@ -72,7 +72,10 @@ def update_xml(url):
     try:
         with open(tmp_file, "wb") as f:
             req = urllib.request.Request(url, data=None, headers={"User-Agent": _animetitles_useragent})
-            res = urllib.request.urlopen(req)
+            # TimeoutError from here is an OSError, so the existing handler below
+            # already treats a stalled fetch the way it treats a failed one: warn,
+            # and fall back to the cached copy if there is one.
+            res = urllib.request.urlopen(req, timeout=anidb_client.HTTP_TIMEOUT)
             anidb_client.log.info(f"Fetching cache file from {url}")
             f.write(res.read())
     except (OSError, urllib.error.URLError) as err:

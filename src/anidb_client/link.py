@@ -63,6 +63,11 @@ class AniDBLink(threading.Thread):
         self._rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter()
 
         self._current_tag = 0
+        # request() is called from the sender thread, from the listener thread (on a
+        # lost session, and on a timeout re-queue) and from whichever application
+        # thread asked for data. Handing two of them the same tag would cross one
+        # reply onto the other's command.
+        self._tag_lock = threading.Lock()
         self._myport = myport
         self._nat_ping_interval = nat_ping_interval
         self._do_ping = False
@@ -134,14 +139,15 @@ class AniDBLink(threading.Thread):
         UDP gives no ordering guarantee, so the tag is the only thing tying a
         reply back to the command that asked for it.
         """
-        if self._current_tag >= 999:
-            # Was the string "TOOO" -- letters, not zeros -- which was almost
-            # certainly meant to be "T000" and had the effect that the rollover
-            # tag differed from every other tag's format.
-            self._current_tag = 0
-            return "T000"
-        self._current_tag += 1
-        return f"T{self._current_tag:03d}"
+        with self._tag_lock:
+            if self._current_tag >= 999:
+                # Was the string "TOOO" -- letters, not zeros -- which was almost
+                # certainly meant to be "T000" and had the effect that the rollover
+                # tag differed from every other tag's format.
+                self._current_tag = 0
+                return "T000"
+            self._current_tag += 1
+            return f"T{self._current_tag:03d}"
 
     def _ping_callback(self, _resp):
         anidb_client.log.debug("Successful session refresh")
@@ -217,7 +223,7 @@ class AniDBLink(threading.Thread):
         command.started = None
         command.callback = callback
         command.tag = self._new_tag()
-        self._listener.cmd_queue[command.tag] = command
+        self._listener.queue_command(command)
         anidb_client.log.debug(f"Queued command {command.command} with tag {command.tag}")
         if command.command in ("ENCRYPT", "AUTH", "PING"):
             self._send_command(command)
@@ -265,9 +271,35 @@ class AniDBListener(threading.Thread):
         self._stopping = threading.Event()
 
         self.cmd_queue = {}
+        # The sender thread inserts into cmd_queue while this thread reads, pops and
+        # iterates it. Iterating a dict that another thread is inserting into raises
+        # RuntimeError, and a RuntimeError raised here ends the listener -- after
+        # which nothing reads the socket, no callback ever runs, and every caller
+        # waits on an event that can no longer be set. Both threads go through the
+        # three accessors below rather than touching the dict directly.
+        self._queue_lock = threading.Lock()
 
         self.daemon = True
         self.start()
+
+    def queue_command(self, command):
+        """Register a command so its reply can be matched back to it."""
+        with self._queue_lock:
+            self.cmd_queue[command.tag] = command
+
+    def pop_command(self, tag):
+        """Claim the command awaiting `tag`, or None if nothing is waiting.
+
+        Atomic on purpose: the callers used to test membership and then pop as two
+        steps, which the timeout sweep running on this same thread could interleave.
+        """
+        with self._queue_lock:
+            return self.cmd_queue.pop(tag, None)
+
+    def pending_commands(self):
+        """A snapshot of the outstanding (tag, command) pairs, safe to iterate."""
+        with self._queue_lock:
+            return list(self.cmd_queue.items())
 
     def _connect_socket(self, myport, timeout):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -288,8 +320,25 @@ class AniDBListener(threading.Thread):
         return self._cipher.encrypt(data)
 
     def decrypt(self, data):
+        """Decrypt one packet, raising ValueError if it is not an encrypted reply.
+
+        ValueError specifically, because run() suppresses exactly that and falls
+        back to reading the packet as plaintext -- which AniDB really does send on
+        an encrypted session, an untagged ban notice being the case that matters.
+        Any other exception type would escape that suppression and end the listener
+        thread, and a listener that has stopped reading the socket is a permanent
+        hang for every caller waiting on a reply.
+        """
+        if not data:
+            raise ValueError("Empty packet cannot be decrypted")
         data = self._cipher.decrypt(data)
+        # PKCS#5: the final byte gives the padding length, and the padding is that
+        # byte repeated. Neither holds for a plaintext packet whose length happens
+        # to be a multiple of the block size -- which was previously truncated by
+        # whatever its last byte said and the remains parsed as though a reply.
         pad_len = data[-1]
+        if not 1 <= pad_len <= 16 or data[-pad_len:] != bytes([pad_len]) * pad_len:
+            raise ValueError("Packet does not carry valid PKCS#5 padding; not an encrypted reply")
         return data[:-pad_len]
 
     def stop(self):
@@ -336,9 +385,8 @@ class AniDBListener(threading.Thread):
                 anidb_client.log.warning(f"Unparsable response from API ({e}): {repr(data)}")
                 continue
             if resp.restag:
-                if resp.restag in self.cmd_queue:
-                    cmd = self.cmd_queue.pop(resp.restag)
-                else:
+                cmd = self.pop_command(resp.restag)
+                if cmd is None:
                     continue
             else:
                 # No responsetag... we're probably banned
@@ -359,7 +407,7 @@ class AniDBListener(threading.Thread):
                     # We get here if an encrypted session has timed out
                     # No need to log in again if all that's left in queue is a
                     # logout command.
-                    if all(x.command == "LOGOUT" for x in self.cmd_queue.values()):
+                    if all(x.command == "LOGOUT" for _tag, x in self.pending_commands()):
                         self.stop()
                     else:
                         anidb_client.log.warning("Lost encrypted session with AniDB; attempting to reauthenticate")
@@ -396,7 +444,7 @@ class AniDBListener(threading.Thread):
         willpop = []
         cmd = None
         now = time()
-        for tag, cmd in self.cmd_queue.items():
+        for tag, cmd in self.pending_commands():
             if not tag:
                 continue
             if cmd.started:
@@ -405,7 +453,10 @@ class AniDBListener(threading.Thread):
                     willpop.append(tag)
 
         for tag in willpop:
-            cmd = self.cmd_queue.pop(tag)
+            cmd = self.pop_command(tag)
+            if cmd is None:
+                # Its reply landed between the sweep above and this pop.
+                continue
             if cmd.started < self._last_receive:
                 # API isn't dead yet, probably reauthenticating
                 self._sender.request(cmd, cmd.callback, prio=True)
