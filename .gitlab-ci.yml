@@ -1,0 +1,55 @@
+---
+############################
+# Setup
+############################
+# Shared security-scanning templates (Semgrep SAST, Grype dependency scanning, and the
+# .grype.yaml exception audit). Consumed from the default branch with no `ref:` -- they
+# roll `main` by design, so each soaked scanner-image bump in ci-templates lands here on
+# the next pipeline with no second soak.
+#
+# container-scanning is intentionally NOT included: this repo builds no image, so there
+# is nothing to scan.
+include:
+  - project: 'boomshadow_private/personal/ci-templates'
+    file:
+      - '/templates/sast.yml'
+      - '/templates/dependency-scanning.yml'
+      - '/templates/exception-audit.yml'
+
+stages:
+  - validate
+  - security
+
+# Run a merge-request pipeline for MRs; otherwise a branch pipeline -- but never both for
+# the same branch at once (avoids duplicate pipelines when a branch has an open MR).
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+############################
+# Shared rules
+############################
+# Runs on branch pushes (including main) and merge requests -- but NOT on the daily
+# security-rescan schedule. A scheduled pipeline is the rescan: only the security stage
+# (the included templates, which opt into `schedule` themselves) should run, so our own
+# jobs skip on schedule.
+.rules-always:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+############################
+# Validate
+############################
+# A simple placeholder job so CI works.
+validate:placeholder:
+  extends: .rules-always
+  stage: validate
+  image: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+  script:
+    - echo pass
