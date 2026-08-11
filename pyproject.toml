@@ -38,9 +38,9 @@ dependencies = [
 # importing it softly and the README documents it as a manual prerequisite.
 
 [project.urls]
-Homepage = "https://gitlab.com/boomshadow_private/personal/anidb-client"
-Source = "https://gitlab.com/boomshadow_private/personal/anidb-client"
-Issues = "https://gitlab.com/boomshadow_private/personal/anidb-client/-/issues"
+Homepage = "https://github.com/boomshadow/anidb-client"
+Source = "https://github.com/boomshadow/anidb-client"
+Issues = "https://github.com/boomshadow/anidb-client/issues"
 
 [dependency-groups]
 # Same supply-chain rule as the runtime dependencies above: exact and hash-locked,
