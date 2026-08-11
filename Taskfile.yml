@@ -65,13 +65,40 @@ tasks:
       - "{{.RUN}} {{.UV}} codespell"
 
   check:
-    desc: Run everything CI runs (lint, format, spell, typecheck, test)
+    desc: Run everything CI runs (lockfile, indexes, lint, format, spell, typecheck, test)
+    # Mirrors the pipeline's stage order: the validate stage first, then test. Keep this in
+    # step with CI -- a `check` that passes while the pipeline fails is worse than no task
+    # at all, and both SPEC-007 and CLAUDE.md tell readers these two run the same checks.
     cmds:
+      - task: lock:check
+      - task: index:check
       - task: lint
       - task: format:check
       - task: spell
       - task: typecheck
       - task: test:cov
+
+  spec-index:
+    desc: Validate specs and regenerate docs/specs/INDEX.md
+    cmds:
+      - "{{.RUN}} {{.UV}} python .claude/skills/spec/scripts/generate_index.py"
+
+  adr-index:
+    desc: Validate ADRs and regenerate docs/decisions/INDEX.md
+    cmds:
+      - "{{.RUN}} {{.UV}} python .claude/skills/adr/scripts/generate_index.py"
+
+  index:
+    desc: Regenerate both the spec and ADR indexes
+    cmds:
+      - task: spec-index
+      - task: adr-index
+
+  index:check:
+    desc: Verify both indexes match the spec/ADR frontmatter (what CI checks; writes nothing)
+    cmds:
+      - "{{.RUN}} {{.UV}} python .claude/skills/spec/scripts/generate_index.py --check"
+      - "{{.RUN}} {{.UV}} python .claude/skills/adr/scripts/generate_index.py --check"
 
   lock:
     desc: Re-resolve and update uv.lock (honours the 45-day soak)

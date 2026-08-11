@@ -1,0 +1,50 @@
+---
+title: "Coding Style and Conventions"
+description: "House coding conventions for anidb-client: Docker-native development with no host Python toolchain, the Taskfile as the developer-command entry point, ruff for formatting and linting, the mypy per-module strictness ratchet, codespell, the pin-and-verify supply-chain posture (exact pins, hashed uv.lock, a 45-day soak declared to the resolver, a digest-pinned base image), the no-network testing discipline enforced by the suite itself rather than by the runner, and the ratcheting coverage floor."
+status: accepted
+tags: [coding-style, conventions, python, ruff, mypy, ratchet, codespell, docker-native, taskfile, uv, uv-lock, supply-chain, pin-and-verify, soak, digest-pin, editorconfig, testing, network-guard, fake-server, coverage, coverage-floor, postgres-marker]
+---
+
+# Coding Style and Conventions
+
+This spec is the signpost for how code is written and checked here. The enforcing detail lives in self-documenting configs — `pyproject.toml`, `.editorconfig`, `Taskfile.yml`, the `Dockerfile` — which this spec points at rather than restates. It exists because several of these conventions are house rules a capable engineer would not infer from the code alone.
+
+## Docker-native development
+
+Everything runs inside a container. The host is expected to have Docker and [Task](https://taskfile.dev) and nothing else — no Python, no uv, no ruff, no pytest. Because this project is a library with no long-running service, the dev container is one-shot: commands run through `docker compose run --rm`, which the Taskfile wraps.
+
+The Taskfile is the line of truth for developer commands. `task --list` is the discoverable surface, and `task check` runs what CI runs. When a common operation appears, it gets a task.
+
+## Formatting, linting and typing
+
+**ruff** is both formatter and linter, configured in `pyproject.toml`. Its rule selection subsumes what would otherwise be several tools; the `pyproject` is authoritative for which rules are enabled.
+
+**mypy runs as a ratchet, not a wall.** The codebase arrived with no annotations at all, so blanket strictness would produce hundreds of errors and, inevitably, a blanket ignore — which checks nothing. Instead the baseline is lenient and catches what can be caught without annotations, and a per-module list opts individual modules into full strictness. The convention is one-directional: a module joins the strict list once it is annotated, and cannot silently regress afterwards. Adding a module to that list is the intended way to make progress; removing one is not.
+
+**codespell** checks prose and code alike. Its ignore list is for real words that look like typos — AniDB field names, values quoted from wire payloads — and each entry carries a note saying which. Whole files are skipped only when naming their contents individually would re-introduce the same false positives.
+
+`.editorconfig` is authoritative for indentation, charset and line endings per file type and must be honored. A new file type it does not cover gets a section added rather than ad-hoc formatting.
+
+## Supply-chain posture
+
+Every external input is pinned to an exact version and verified.
+
+- **Dependencies are pinned exact and hash-locked.** Direct dependencies name exact versions in `pyproject.toml`; `uv.lock` carries the resolved set with integrity hashes. Installs run frozen and never resolve at build time, so CI, the container and a developer's machine get identical trees.
+- **The 45-day soak is declared to the resolver, not just to the bot.** Renovate's release-age filter governs the updates it *proposes*, but a bot-side filter does not reach a lockfile refresh, which is delegated to the package manager — so transitive dependencies could otherwise land the day they are published. Declaring the window in `pyproject.toml` applies it to every resolution instead. A package that must be held younger than the window gets a dated per-package exception, so the waiver reads as deliberate on inspection rather than persisting silently.
+- **The base image is digest-pinned**, to the image index rather than a per-arch child so the right binary is selected per build platform.
+
+## Testing
+
+**The test suite never contacts AniDB.** A fake server on loopback stands in for the API, and an autouse guard fails any test that addresses a non-loopback host. The point worth stating is *where* that guard lives: it is enforced by the tests themselves, not by the container or the CI runner, so it holds on a developer's machine and in any environment the suite is run in. A test that reached the real API would risk an IP ban for whoever ran it next.
+
+Timing is injected, not slept through. The rate limiter takes its clock and its sleep function as parameters so ban back-off — measured in half-hours in production — is tested instantly. The suite carries a per-test timeout well above any legitimate test, so a test that blocks on a real socket or a real sleep fails loudly instead of hanging the run.
+
+**Tests that need a real PostgreSQL are marked, not silently skipped.** SQLite exercises neither the native enum types nor the wide-integer variant the schema declares, so a SQLite-only run covers neither branch. Those tests carry a marker and skip when no server URL is configured — which makes them cheap locally and easy to forget, so CI runs them a second time as an explicit gate that fails if they did not actually execute.
+
+**Coverage has a ratcheting floor.** The configured minimum is a floor to defend, not a target to sit at: it is raised as coverage grows, and set a little under the measured figure so an unrelated change does not fail the build on rounding.
+
+## Related Artifacts
+
+- **Line of truth (self-enforcing):** `pyproject.toml` (ruff rules, the mypy strict-module list, codespell's ignores, pytest configuration and markers, the coverage floor, exact dependency pins and the declared soak window); `uv.lock` (the resolved, hashed dependency set); `.editorconfig` (formatting per file type); `Taskfile.yml` (the developer commands); `Dockerfile` and `docker-compose.yml` (the container the commands run in).
+- **Related specs:** SPEC-008 (the CI pipeline that runs these same checks, and the scanning that reads `.grype.yaml`); SPEC-003 (why the PostgreSQL-marked tests exist at all).
+- **Tests:** style and typing conformance is enforced by the tooling itself through `task check` rather than by unit tests. The conventions that tooling cannot enforce are covered directly: the network guard's own behavior in `tests/test_network_guard.py`, and the bounded-HTTP-timeout rule — that no `urlopen` call site is left unbounded — in `tests/unit/test_http_timeouts.py`.
