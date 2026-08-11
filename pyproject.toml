@@ -52,6 +52,9 @@ dev = [
     # sleep on a retry path, and the transport is threaded. A suite-wide timeout
     # turns "CI hangs forever" into an ordinary test failure.
     "pytest-timeout==2.4.0",
+    # PostgreSQL driver for the schema tests. Test-only: the library declares no
+    # driver, since which one to install is the application's choice.
+    "psycopg2-binary==2.9.12",
     "ruff==0.15.20",
     "mypy==2.1.0",
     "codespell==2.4.2",
@@ -146,6 +149,9 @@ addopts = "-ra"
 # hits this has almost certainly blocked on a real socket or a real sleep().
 timeout = 60
 filterwarnings = ["error::DeprecationWarning:anidb_client.*"]
+markers = [
+    "postgres: needs a real PostgreSQL, from ANIDB_TEST_POSTGRES_URL (skipped when unset)",
+]
 
 [tool.coverage.run]
 source = ["anidb_client"]
@@ -154,11 +160,11 @@ branch = true
 [tool.coverage.report]
 show_missing = true
 skip_covered = false
-# Ratcheting floor: measured 31% when the suite was introduced, set a little below
-# so an unrelated change does not fail the build on rounding. Raise it as coverage
-# grows -- the number is a floor to defend, not a target to sit at. The bulk of what
-# remains uncovered is animeobjs.py, which needs a database and a link fixture.
-fail_under = 28
+# Ratcheting floor, raised as coverage grows -- a floor to defend, not a target to
+# sit at. 28% when the suite was introduced; 42% now that the object layer has a
+# fixture (animeobjs.py alone went 8% -> 31%). Set a little under the measured
+# figure so an unrelated change does not fail the build on rounding.
+fail_under = 40
 exclude_also = [
     "if __name__ == .__main__.:",
     "raise NotImplementedError",

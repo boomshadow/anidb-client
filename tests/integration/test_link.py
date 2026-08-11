@@ -58,6 +58,13 @@ def make_link(monkeypatch):
     for link in links:
         # Suppressed because a link whose listener already stopped (several tests
         # exercise exactly that) has nothing left to close.
+        #
+        # AniDBLink's sender thread has no stop short of a LOGOUT round-trip, so it
+        # outlives this teardown by design. Tests that deliberately provoke a ban
+        # leave it retrying, and it can therefore log one "Failed to send command"
+        # on the now-closed socket -- pytest reports that as a thread-exception
+        # warning. It is teardown noise, not a leak: the thread is a daemon and the
+        # send path handles the error rather than dying on it.
         with contextlib.suppress(Exception):
             link._listener.stop()
 

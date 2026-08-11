@@ -93,6 +93,16 @@ tasks:
     cmds:
       - "{{.RUN}} bash"
 
+  db:shell:
+    desc: Open a psql shell against the test database
+    cmds:
+      - docker compose exec db psql -U anidb -d anidb_test
+
+  db:up:
+    desc: Start the test database on its own (it starts with any other task anyway)
+    cmds:
+      - docker compose up -d --wait db
+
   clean:
     desc: Remove build artifacts, caches and the dev container image
     cmds:
