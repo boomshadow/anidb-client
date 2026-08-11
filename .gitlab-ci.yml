@@ -23,6 +23,7 @@ stages:
   - test
   - build
   - security
+  - drift-detection   # Anchored Development anchor-watch (MR-only)
   - publish
 
 # Pinned uv image (Python 3.14 + uv) shared by every job below. uv 0.11.25
@@ -61,6 +62,17 @@ workflow:
   rules:
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
 
+# Merge requests only, and never for Renovate's branches. Used by the drift gate: drift is
+# a pre-merge check rather than something to run on every branch push, and a dependency
+# bump is not a behavioural change to anchor against the specs. All Renovate branches are
+# prefixed `renovate/`; its MRs are matched by source-branch name, since
+# `$CI_COMMIT_BRANCH` is undefined in a merge_request_event pipeline.
+.rules-merge-request-only-no-renovate:
+  rules:
+    - if: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^renovate\//
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
 # Shared uv setup. The cache is keyed on uv.lock, so it is reused until a dependency
 # actually changes. `--frozen` makes the job fail if uv.lock is out of date with
 # pyproject.toml rather than quietly resolving something different from local runs.
@@ -91,6 +103,30 @@ validate:lockfile:
   before_script: []
   script:
     - uv lock --check
+
+# Validate spec/ADR frontmatter and confirm the committed INDEX files are current. `--check`
+# rebuilds each index from the frontmatter and fails if it differs from what was committed --
+# i.e. the author changed a spec or ADR without re-running the generator -- without writing
+# anything. The comparison lives in the generator rather than being a `git diff` here because
+# this image is a Python toolchain and carries no git; installing one to compare two strings
+# would put an unpinned apt package in the supply chain for no gain. The generators need
+# pyyaml, which is in the dev group, so these reuse the same synced environment as every
+# other job rather than needing a second image. See SPEC-000 and SPEC-008.
+validate:spec-index:
+  extends:
+    - .uv-job
+    - .rules-always
+  stage: validate
+  script:
+    - uv run --frozen python .claude/skills/spec/scripts/generate_index.py --check
+
+validate:adr-index:
+  extends:
+    - .uv-job
+    - .rules-always
+  stage: validate
+  script:
+    - uv run --frozen python .claude/skills/adr/scripts/generate_index.py --check
 
 ############################
 # Test
@@ -201,6 +237,31 @@ build:dist:
     paths:
       - dist/
     expire_in: 1 week
+
+############################
+# Drift detection
+############################
+# Anchored Development enforcement (SPEC-000): compares the MR diff against the specs, ADRs,
+# tests and navigation aids and fails the pipeline if they have drifted apart. MR-only, and
+# never on renovate branches -- see .rules-merge-request-only-no-renovate above. Runs in the
+# pinned anchor-watch image (Node + Claude Agent SDK), which drives the same agent defined at
+# .claude/agents/drift-detector.md that a local session spawns as a subagent. Requires the
+# CLAUDE_CODE_OAUTH_TOKEN project CI/CD variable for the Agent SDK to authenticate.
+#
+# Plain stage ordering, no `needs`: this is the one job that costs a model run, so it waits
+# until the cheap checks have passed rather than being spent on a pipeline that is already
+# red. `GIT_DEPTH: 0` because it diffs against the merge-request base commit, which the
+# default shallow clone is not guaranteed to contain.
+anchor-watch:
+  extends: .rules-merge-request-only-no-renovate
+  stage: drift-detection
+  image: registry.gitlab.com/boomshadow/anchor-watch-image:2.0.1@sha256:baafe435f4b77d22d882cc57266292536f39b94af3fe3aa4a629b21a5a6b5269
+  dependencies: []
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - node .claude/agents/scripts/ci-drift-detector.mjs
+  allow_failure: false
 
 ############################
 # Publish

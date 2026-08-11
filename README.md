@@ -432,6 +432,19 @@ test that reaches the real API risks an IP ban for whoever runs it next.
 Dependencies are pinned exactly and hash-locked in `uv.lock`, and the resolver
 enforces a 45-day cooldown on new releases.
 
+### Documentation
+
+This project follows [Anchored Development](https://anchored-dev.org/). Behavior is
+specified by domain in [`docs/specs/`](docs/specs/INDEX.md) and architectural reasoning
+lives in [`docs/decisions/`](docs/decisions/INDEX.md); a CI check compares every merge
+request against them so they cannot quietly go stale.
+
+The specs are the authoritative description of what the library does. This README is
+written for people installing the package rather than working on it, so it deliberately
+repeats some of that material instead of pointing away —
+[ADR-001](docs/decisions/ADR-001-readme-stays-a-complete-user-facing-document.md) explains
+why. Where the two disagree, the spec is right.
+
 ## Upgrading
 
 ### Object API
