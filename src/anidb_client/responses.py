@@ -150,9 +150,17 @@ class LoginAcceptedNewVerResponse(Response):
         self.codetail = ()
         self.coderep = ()
 
+        # Identical to LoginAcceptedResponse above -- 200 and 201 differ only in
+        # whether a newer client version exists, not in what the reply carries.
+        #
+        # This used to read `int(nat is None and nat or "0")`, which evaluates to
+        # 0 for every possible input: the `is None` is inverted, and the and/or
+        # chain collapses to "0" regardless. So `address` was never parsed, and
+        # since link.py treats 201 as a successful login, _auth_handler then read
+        # attrs["address"], raised KeyError on the response thread, and never set
+        # the authenticated event -- hanging every command queued behind it.
         nat = cmd.parameters["nat"]
-        nat = int(nat is None and nat or "0")
-        if nat:
+        if nat in ("1", 1):
             self.codehead = ("sesskey", "address")
         else:
             self.codehead = ("sesskey",)
@@ -999,8 +1007,11 @@ class NotificationResponse(Response):
         self.codehead = ()
         self.coderep = ()
 
+        # `buddy` is a username, so the previous `int(buddy is not None and buddy
+        # or "0")` reached int("someuser") and raised ValueError while the response
+        # object was still being built -- on the response thread, leaving the
+        # caller waiting. Only its presence matters here, not its value.
         buddy = cmd.parameters["buddy"]
-        buddy = int(buddy is not None and buddy or "0")
         if buddy:
             self.codetail = ("notifies", "msgs", "buddys")
         else:

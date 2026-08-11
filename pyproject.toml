@@ -163,10 +163,11 @@ skip_covered = false
 # Ratcheting floor, raised as coverage grows -- a floor to defend, not a target to
 # sit at. 28% when the suite was introduced, 40% once the object layer had a
 # fixture, 55% now that the cache-freshness, mylist, external-mapping and
-# filename-inference paths are covered. animeobjs.py alone has gone 8% -> 58%.
-# Set a little under the measured figure so an unrelated change does not fail the
-# build on rounding.
-fail_under = 55
+# filename-inference paths are covered, and 65% once responses.py was exercised
+# (37% -> 96%, largely by constructing every class in the code table once).
+# animeobjs.py alone has gone 8% -> 58%. Set a little under the measured figure so
+# an unrelated change does not fail the build on rounding.
+fail_under = 65
 exclude_also = [
     "if __name__ == .__main__.:",
     "raise NotImplementedError",
