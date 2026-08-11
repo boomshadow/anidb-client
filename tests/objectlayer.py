@@ -85,8 +85,15 @@ class RecordingLink:
         return [c for c in self.requests if c.command == command.upper()]
 
     def params_for(self, command):
-        """The parameter dict of each request for `command`, minus transport fields."""
-        return [{k: v for k, v in c.parameters.items() if k not in ("tag", "s")} for c in self.requests_for(command)]
+        """The parameters each request for `command` actually puts on the wire.
+
+        Drops the transport fields, and drops None values -- flatten() omits those,
+        so including them would assert on fields that were never sent.
+        """
+        return [
+            {k: v for k, v in c.parameters.items() if k not in ("tag", "s") and v is not None}
+            for c in self.requests_for(command)
+        ]
 
     # AniDBLink surface the object layer touches beyond request().
     def set_banned(self, code, reason=None):  # pragma: no cover - not exercised here

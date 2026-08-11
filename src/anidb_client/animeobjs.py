@@ -91,12 +91,41 @@ class AniDBObj:
     def _extra_refresh_probability(self):
         return 0
 
+    def _probability_of_refresh(self):
+        """Percent chance that this object's cached data should be re-fetched.
+
+        Extracted from update_if_old so the policy can be read and tested on its
+        own. It decides how often this library talks to an API that bans clients
+        for talking to it too often, which makes it worth being able to state
+        exactly, rather than inferring it from whether a request happened to go
+        out.
+
+        Nothing for the first week, 2% in the second, then about half again each
+        week after -- plus whatever the subclass adds -- capped at 100.
+        """
+        age = datetime.datetime.now(self._timezone) - self._to_timezoneaware(self.db_data.updated)
+        # Whole weeks since the data was fetched. The original counted this by
+        # subtracting a week from `age` each pass and breaking when it went
+        # negative, which worked but hid the loop's actual bound in a mutating
+        # local. Same number of terms, stated directly.
+        weeks_old = age // datetime.timedelta(weeks=1)
+
+        class_probability = self._extra_refresh_probability()
+        refresh_probability = 0
+        for _week in range(weeks_old):
+            if refresh_probability >= 100:
+                break
+            refresh_probability = 2 if not refresh_probability else math.ceil(refresh_probability * 1.5)
+
+        total = min(100, refresh_probability + class_probability)
+        anidb_client.log.debug(f"Probability of updating {self}: {total}% ({class_probability}% from class rules)")
+        return total
+
     def update_if_old(self, block=False):
         if not self.db_data:
             self.update(block=True)
         else:
             age = datetime.datetime.now(self._timezone) - self._to_timezoneaware(self.db_data.updated)
-            ref = datetime.timedelta()
             # never update twice the same day...
             if age < datetime.timedelta(days=1):
                 return
@@ -110,25 +139,7 @@ class AniDBObj:
             if time_since_dice < datetime.timedelta(hours=20):
                 return
 
-            # probability is in percent
-            # start with any extra refresh probability-parameters this class
-            # implements. Default is 0, meaning it will never request the same
-            # data twice the first week.
-            #
-            # add 2% probability the second week and than raise probability
-            # ~50% each coming week (rounded up to closest whole percent)
-            class_probability = self._extra_refresh_probability()
-            refresh_probability = 0
-            while refresh_probability < 100:
-                age -= datetime.timedelta(weeks=1)
-                if age < ref:
-                    break
-                refresh_probability = 2 if not refresh_probability else math.ceil(refresh_probability * 1.5)
-            refresh_probability += class_probability
-            refresh_probability = min(100, refresh_probability)
-            anidb_client.log.debug(
-                f"Probability of updating {self}: {refresh_probability}% ({class_probability}% from class rules)"
-            )
+            refresh_probability = self._probability_of_refresh()
 
             sess = self._get_db_session()
             self.db_data = sess.merge(self.db_data)
@@ -589,7 +600,15 @@ class Episode(AniDBObj):
             if self.db_data.epno:
                 self._episode_number = self.db_data.epno
             if not self._anime:
-                self._anime = self.db_data.aid
+                # An Anime, not the bare aid. Every other path here assigns an
+                # object, and `Episode.anime` is documented as one -- but an
+                # Episode built from an eid took this branch and got an int. The
+                # damage was silent: `self.anime.aid` in _get_ext_epid raised
+                # AttributeError, which Python turns into a __getattr__ lookup,
+                # which returns None for an unknown field. So tvdb_episode and
+                # tmdb_episode simply answered None for every eid-built Episode
+                # rather than failing.
+                self._anime = Anime(self.db_data.aid)
         self._close_db_session(sess)
 
     def _anidb_data_callback(self, res):
@@ -1171,7 +1190,13 @@ class File(AniDBObj):
         elif self.db_data and self.db_data.lid:
             req = MyListDelCommand(lid=self.db_data.lid)
             self._anidb_link.request(req, _mylistdel_callback, prio=True)
-        elif self._is_generic:
+        elif self.is_generic:
+            # `self.is_generic`, not `self._is_generic`. The private attribute is
+            # only set when the File was constructed as generic in this process; a
+            # generic entry loaded from the cache leaves it None, so this branch was
+            # skipped and the else below built MYLISTDEL with size and ed2k -- both
+            # None for a generic file -- which the command rejects outright. The add
+            # path already reads the public property.
             episodes = self._multiep or [self.episode.episode_number]
             for ep in episodes:
                 wait.clear()
@@ -1273,8 +1298,13 @@ class File(AniDBObj):
                 fid=self.fid, state=state_num, viewed=viewed, viewdate=viewdate, source=source, other=other
             )
         elif self.is_generic or not self._path:
-            episodes = self.multiep
-            for ep in episodes:
+            # One MYLISTADD per episode, sent inside the loop. The send used to sit
+            # after the whole if/elif chain, so a generic file covering several
+            # episodes built a command for each and then sent only the last one --
+            # every episode but one was silently missing from mylist. The exact
+            # mirror of the deletion loop, which sent once per episode but always
+            # named the same one.
+            for ep in self.multiep:
                 wait.clear()
                 req = MyListAddCommand(
                     aid=self._anime.aid,
@@ -1286,6 +1316,11 @@ class File(AniDBObj):
                     source=source,
                     other=other,
                 )
+                self._anidb_link.request(req, _mylistadd_callback, prio=True)
+                wait.wait()
+            # Already sent; nothing left for the single send below. This also stops
+            # an empty episode list reaching it with req still None.
+            req = None
         else:
             req = MyListAddCommand(
                 size=self.size,
@@ -1296,8 +1331,9 @@ class File(AniDBObj):
                 source=source,
                 other=other,
             )
-        self._anidb_link.request(req, _mylistadd_callback, prio=True)
-        wait.wait()
+        if req is not None:
+            self._anidb_link.request(req, _mylistadd_callback, prio=True)
+            wait.wait()
         if edit:
             sess = self._get_db_session()
             self.db_data = sess.merge(self.db_data)
