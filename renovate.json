@@ -2,5 +2,19 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "Keep the uv image version in .gitlab-ci.yml and the Dockerfile moving together. They are pinned to the same tag and digest on purpose, so that a local `task test` and a CI run use an identical toolchain; splitting them across two MRs would leave the two disagreeing in between.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["ghcr.io/astral-sh/uv"],
+      "groupName": "uv toolchain image"
+    },
+    {
+      "description": "hatchling is the build backend, pinned in build-system.requires. It is not installed at runtime and not part of the application's dependency surface, so it does not need to travel with the runtime dependency updates.",
+      "matchManagers": ["pep621"],
+      "matchDepTypes": ["build-system.requires"],
+      "groupName": "build backend"
+    }
   ]
 }

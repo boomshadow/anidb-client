@@ -1,0 +1,31 @@
+# Development harness. There is no service to run -- this project is a library -- so
+# `dev` is a one-shot container driven by `docker compose run --rm`, which the Taskfile
+# wraps. Nothing here is deployed.
+services:
+  dev:
+    build:
+      context: .
+    image: anidb-client-dev
+    # The working tree is bind-mounted so edits are live without a rebuild. The
+    # virtualenv lives at /opt/venv inside the image (see Dockerfile), so it is not
+    # shadowed by this mount.
+    volumes:
+      - .:/app
+      # Named volume rather than a path inside /app: uv refuses to build a
+      # distribution whose cache directory sits inside the source tree.
+      - uv-cache:/opt/uv-cache
+    environment:
+      # Belt-and-braces against a test reaching the real AniDB API. The suite's own
+      # autouse fixture blocks non-loopback sockets; this makes an escape fail at the
+      # DNS layer too, well before a packet could be addressed to anidb.net.
+      NO_PROXY: "*"
+    init: true
+    # Read-write on /app (tests write to tmp_path, tooling writes caches), but the
+    # container never needs privileges.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  uv-cache:

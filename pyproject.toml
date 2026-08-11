@@ -1,2 +1,181 @@
+[project]
+name = "anidb-client"
+description = "Object-oriented UDP client library for AniDB"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Jacob Tirey", email = "jacob@tirey.io" }]
+keywords = ["anidb", "anime", "udp", "api", "client", "mylist"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# Single source of truth is `__version__` in the package (see [tool.hatch.version]).
+# This is the distribution's own semantic version and is deliberately unrelated to
+# `anidb_client_version`, the integer registered with AniDB and sent in AUTH.
+dynamic = ["version"]
+
+# Pinned exact and hash-locked in uv.lock (supply-chain rule). Each version is the
+# latest released on or before the 45-day soak cutoff at the time it was pinned.
+dependencies = [
+    "pycryptodome==3.23.0",
+    "sqlalchemy==2.0.51",
+]
+
+# No `nfs` extra on purpose. File(path='nfs://...') needs the `libnfs` Python module,
+# whose newest release is a 2016 sdist that compiles against libnfs system headers.
+# Declaring it installable would hand most users a build failure, so fileinfo.py keeps
+# importing it softly and the README documents it as a manual prerequisite.
+
+[project.urls]
+Homepage = "https://gitlab.com/boomshadow_private/personal/anidb-client"
+Source = "https://gitlab.com/boomshadow_private/personal/anidb-client"
+Issues = "https://gitlab.com/boomshadow_private/personal/anidb-client/-/issues"
+
+[dependency-groups]
+# Same supply-chain rule as the runtime dependencies above: exact and hash-locked,
+# latest within the 45-day soak window as of 2026-08-11.
+dev = [
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    # Every test either talks to a loopback UDP server or exercises code that can
+    # sleep on a retry path, and the transport is threaded. A suite-wide timeout
+    # turns "CI hangs forever" into an ordinary test failure.
+    "pytest-timeout==2.4.0",
+    "ruff==0.15.20",
+    "mypy==2.1.0",
+    "codespell==2.4.2",
+]
+
+[tool.uv]
+# Dependency cooldown -- the 45-day soak, enforced by the resolver rather than by
+# discipline. Renovate's release-age filter governs the updates it *proposes*, but not
+# the lockfile refreshes it delegates to the package manager, so transitive
+# dependencies could otherwise land the day they are published. uv applies this to
+# every resolution -- CI's, the bot's, and a developer's -- and records the resulting
+# cutoff in uv.lock.
+exclude-newer = "45 days"
+
+# Deliberate soak exceptions, each dated just past the release it admits so a further
+# bump has to be argued again rather than riding in on a standing waiver. **These are
+# temporary**: delete an entry once its pinned version passes 45 days on the date
+# noted. An empty table here is the healthy steady state.
+[tool.uv.exclude-newer-package]
+
 [build-system]
-requires = ["setuptools", "wheel", "pycryptodome", "sqlalchemy"]
+requires = ["hatchling==1.30.1"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/anidb_client/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/anidb_client"]
+
+[tool.hatch.build.targets.sdist]
+# The sdist carries the tests so downstream packagers can run them.
+include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.ruff]
+# target-version is inferred from project.requires-python (>=3.11).
+# line-length 120: roomy for modern displays while still allowing side-by-side
+# editing; E501 stays enforced as a guardrail.
+line-length = 120
+
+[tool.ruff.lint]
+# Ruff subsumes flake8 + isort + pyupgrade + bugbear + refurb in one tool.
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "FURB"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+# Lenient by default, strict per module below. The codebase arrived with no
+# annotations at all, so blanket strictness would mean ~870 errors and a blanket
+# ignore -- which checks nothing. This setting still catches the errors that do
+# not need annotations to find, and the per-module list is the ratchet: a module
+# joins it once it is annotated, and can never silently regress afterwards.
+warn_unused_ignores = true
+warn_redundant_casts = true
+enable_error_code = ["ignore-without-code"]
+
+# --- The ratchet. Move a module up here once it is fully annotated. ---
+# The individual flags rather than `strict = true`: mypy does not accept `strict`
+# in a per-module section and silently applies it globally instead, which turns
+# the whole codebase strict and produces ~860 errors.
+[[tool.mypy.overrides]]
+module = ["anidb_client.errors", "anidb_client.ratelimit"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_decorators = true
+warn_return_any = true
+strict_equality = true
+no_implicit_reexport = true
+
+# --- Documented holes: third-party libraries without type information ---
+# pycryptodome ships no py.typed marker; it provides MD4 (for ed2k hashing) and
+# AES (for encrypted sessions).
+[[tool.mypy.overrides]]
+module = ["Crypto.*"]
+ignore_missing_imports = true
+
+# libnfs is an optional, soft-imported dependency for nfs:// paths and is not
+# installed in the development environment at all.
+[[tool.mypy.overrides]]
+module = ["libnfs"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+# No single test should take anywhere near this long: the fake AniDB server runs on
+# loopback and the rate limiter is injected with a fake clock in tests. A test that
+# hits this has almost certainly blocked on a real socket or a real sleep().
+timeout = 60
+filterwarnings = ["error::DeprecationWarning:anidb_client.*"]
+
+[tool.coverage.run]
+source = ["anidb_client"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# Ratcheting floor: measured 31% when the suite was introduced, set a little below
+# so an unrelated change does not fail the build on rounding. Raise it as coverage
+# grows -- the number is a floor to defend, not a target to sit at. The bulk of what
+# remains uncovered is animeobjs.py, which needs a database and a link fixture.
+fail_under = 28
+exclude_also = [
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+[tool.codespell]
+# acount -- an AniDB API field name (anime count) carried on GroupTable
+# fo     -- appears inside AniDB response payload samples, not prose
+# TOOO   -- no longer emitted (the rollover tag is "T000" now), but the comments
+#           and the regression test that record the old value still name it
+ignore-words-list = "acount,fo,TOOO"
+# Patterns are unanchored globs so they match however codespell is invoked. A
+# "./"-anchored form only matches when codespell is run from the repository root with
+# no path argument, and silently stops skipping otherwise.
+# ISO-639-2_utf-8.txt is the ISO language-name table. Roughly two dozen of the
+# language names in it look like misspellings of English words but are not, so the
+# whole file is skipped rather than each name being added to the list above.
+# (Naming them here would re-introduce the same false positives in this comment.)
+skip = "*/.git,*/LICENSE,*ISO-639-2_utf-8.txt,*uv.lock,*/.venv,*/htmlcov,*/dist"

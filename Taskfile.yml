@@ -1,0 +1,100 @@
+version: "3"
+
+# Every task runs inside the container defined in docker-compose.yml. Nothing in this
+# project requires a Python toolchain, uv, ruff or pytest on the host.
+#
+# `docker compose run --rm` is used rather than `exec` because a library has no
+# long-running service to exec into.
+
+vars:
+  RUN: docker compose run --rm dev
+  # --frozen: never re-resolve from inside a task. The lockfile is the contract; if it
+  # is out of date the command fails loudly instead of silently drifting from CI.
+  UV: uv run --frozen
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build (or rebuild) the development image
+    cmds:
+      - docker compose build
+
+  test:
+    desc: Run the test suite (pass extra pytest args after --)
+    cmds:
+      - "{{.RUN}} {{.UV}} pytest {{.CLI_ARGS}}"
+
+  test:cov:
+    desc: Run the test suite with a coverage report
+    cmds:
+      - "{{.RUN}} {{.UV}} pytest --cov --cov-report=term-missing {{.CLI_ARGS}}"
+
+  lint:
+    desc: Lint with ruff (also checks import sorting)
+    cmds:
+      - "{{.RUN}} {{.UV}} ruff check ."
+
+  lint:fix:
+    desc: Lint and auto-fix with ruff
+    cmds:
+      - "{{.RUN}} {{.UV}} ruff check --fix ."
+
+  format:
+    desc: Format code with ruff
+    cmds:
+      - "{{.RUN}} {{.UV}} ruff format ."
+
+  format:check:
+    desc: Check formatting without writing (shows the diff)
+    cmds:
+      - "{{.RUN}} {{.UV}} ruff format --diff ."
+
+  typecheck:
+    desc: Static type checking with mypy
+    cmds:
+      - "{{.RUN}} {{.UV}} mypy"
+
+  spell:
+    desc: Spell-check code and documentation
+    cmds:
+      - "{{.RUN}} {{.UV}} codespell"
+
+  check:
+    desc: Run everything CI runs (lint, format, spell, typecheck, test)
+    cmds:
+      - task: lint
+      - task: format:check
+      - task: spell
+      - task: typecheck
+      - task: test:cov
+
+  lock:
+    desc: Re-resolve and update uv.lock (honours the 45-day soak)
+    cmds:
+      - "{{.RUN}} uv lock"
+
+  lock:check:
+    desc: Verify uv.lock is up to date with pyproject.toml
+    cmds:
+      - "{{.RUN}} uv lock --check"
+
+  dist:
+    desc: Build the wheel and sdist into ./dist
+    cmds:
+      - "{{.RUN}} uv build"
+
+  shell:
+    desc: Open an interactive shell in the dev container
+    cmds:
+      - "{{.RUN}} bash"
+
+  clean:
+    desc: Remove build artifacts, caches and the dev container image
+    cmds:
+      - docker compose down --remove-orphans --volumes
+      - rm -rf dist build .pytest_cache .ruff_cache .mypy_cache htmlcov .coverage coverage.xml
