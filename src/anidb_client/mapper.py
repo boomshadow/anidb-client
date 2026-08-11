@@ -16,7 +16,43 @@
 # along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 import datetime
 
+import anidb_client
+
 _blacklist = ("unused", "retired", "reserved", "not_implemented")
+
+
+def _enum_converter(table, field):
+    """Convert an AniDB enumeration code, tolerating codes this table does not list.
+
+    Every converter built here runs inside a response callback, on the response
+    thread, and those callbacks set the event a caller is blocked on only after the
+    whole conversion loop has finished. So a KeyError raised in here is not one
+    dropped field -- it escapes the callback, the event is never set, and the
+    calling application waits forever.
+
+    AniDB extends these enumerations without announcing it, which makes an
+    unrecognised code an expected event rather than a corrupt one. It degrades to
+    None, and says so once, rather than deadlocking the caller.
+
+    Note that listing a new value in the table here is not on its own enough to
+    start storing it: the matching column in db.py constrains the same set, so a
+    genuinely new value needs a schema change alongside.
+    """
+
+    def convert(value):
+        if not value:
+            return None
+        try:
+            return table[value]
+        except KeyError:
+            # `log` is None until init() runs. Nothing reaches a response converter
+            # before then, but a warning path must not be the thing that raises.
+            if anidb_client.log is not None:
+                anidb_client.log.warning(f"Unknown AniDB {field} code {value!r}; leaving the field unset")
+            return None
+
+    return convert
+
 
 # each line is one byte
 # only change this if the api changes
@@ -71,8 +107,8 @@ file_map_f_converters = {
     "length_in_seconds": int,
     "description": lambda x: x or None,
     "aired_date": lambda x: datetime.date(1970, 1, 1) + datetime.timedelta(seconds=int(x)) if x and int(x) else None,
-    "mylist_state": lambda x: mylist_state_map[x] if x else None,
-    "mylist_filestate": lambda x: mylist_filestate_map[x] if x else None,
+    "mylist_state": _enum_converter(mylist_state_map, "mylist state"),
+    "mylist_filestate": _enum_converter(mylist_filestate_map, "mylist file state"),
     "mylist_viewed": lambda x: x == "1",
     "mylist_viewdate": lambda x: datetime.datetime.fromtimestamp(int(x)) if x and int(x) else None,
     "mylist_storage": lambda x: x or None,
@@ -89,7 +125,7 @@ episode_map_converters = {
     "rating": lambda x: int(x) / 100 if x else None,
     "votes": int,
     "aired": lambda x: datetime.date(1970, 1, 1) + datetime.timedelta(seconds=int(x)) if x and int(x) else None,
-    "type": lambda x: episode_type_map[x] if x else None,
+    "type": _enum_converter(episode_type_map, "episode type"),
 }
 
 mylist_map_converters = {
@@ -98,7 +134,12 @@ mylist_map_converters = {
     "eid": int,
     "aid": int,
     "gid": int,
-    "mylist_state": lambda x: mylist_state_map[x] if x else None,
+    "mylist_state": _enum_converter(mylist_state_map, "mylist state"),
+    # MYLIST returns the file state as its last field. It has to be converted here
+    # as well as parsed in responses.py: the callback converts every key the reply
+    # carried, so a field named in the response with no entry in this table raises
+    # KeyError -- which, on the response thread, is a hang rather than an error.
+    "mylist_filestate": _enum_converter(mylist_filestate_map, "mylist file state"),
     "mylist_viewdate": lambda x: datetime.datetime.fromtimestamp(int(x)) if x and int(x) else None,
     "mylist_storage": lambda x: x or None,
     "mylist_source": lambda x: x or None,

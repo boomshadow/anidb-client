@@ -133,6 +133,25 @@ class TestBanBackoff:
         limiter.clear_ban()
         assert limiter.register_ban() == 1
 
+    def test_the_doubling_stops_at_a_ceiling(self):
+        """Unbounded, this walks off into delays measured in days.
+
+        clear_ban() runs on every successful authentication, so the ordinary
+        banned-then-readmitted cycle rarely leaves 1. It compounds when
+        authentication itself keeps failing -- which is the case where a client
+        that has effectively stopped still reports only that it is waiting.
+        """
+        limiter, _ = make()
+        assert [limiter.register_ban() for _ in range(6)] == [1, 2, 4, 8, 8, 8]
+
+    def test_the_longest_back_off_is_bounded(self):
+        limiter, clock = make()
+        for _ in range(20):
+            limiter.register_ban()
+        limiter.wait()
+
+        assert clock.slept[0] == RateLimiter.BAN_BASE_DELAY * RateLimiter.MAX_BAN_MULTIPLIER
+
 
 class TestSendAccounting:
     def test_seconds_since_last_send_tracks_the_clock(self):

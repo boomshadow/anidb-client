@@ -12,6 +12,7 @@ import threading
 import pytest
 
 import anidb_client
+import anidb_client.commands
 from anidb_client.link import AniDBLink
 from anidb_client.ratelimit import RateLimiter
 from tests.fake_anidb import FakeAniDBServer
@@ -245,3 +246,142 @@ class TestTagAllocation:
         link._current_tag = 999
         assert link._new_tag() == "T000"
         assert link._new_tag() == "T001"
+
+    def test_concurrent_callers_never_get_the_same_tag(self, server, make_link):
+        """request() is called from the sender thread, from the listener thread
+        (on a lost session, and on a timeout re-queue) and from whichever
+        application thread asked for data. Two of them reading and incrementing
+        the counter unguarded can hand out one tag twice, which crosses one
+        reply onto the other's command -- and the command that loses never gets
+        an answer, so whoever is waiting on it waits forever.
+        """
+        link = make_link(server)
+        tags = []
+        lock = threading.Lock()
+        start = threading.Event()
+
+        def take():
+            start.wait()
+            mine = [link._new_tag() for _ in range(100)]
+            with lock:
+                tags.extend(mine)
+
+        threads = [threading.Thread(target=take) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        start.set()
+        for thread in threads:
+            thread.join()
+
+        assert len(tags) == len(set(tags)), "a tag was issued twice"
+
+
+class TestCommandQueue:
+    """The queue that ties a reply back to the command that asked for it.
+
+    It is written by the sender thread and read, popped and iterated by the
+    listener. Iterating a dict another thread is inserting into raises
+    RuntimeError, and a RuntimeError raised in the listener ends it -- after
+    which nothing reads the socket and every caller waits on an event that can
+    no longer be set.
+    """
+
+    def test_a_queued_command_can_be_claimed_once(self, server, make_link):
+        link = make_link(server)
+        listener = link._listener
+        command = anidb_client.commands.PingCommand()
+        command.tag = "T500"
+        listener.queue_command(command)
+
+        assert listener.pop_command("T500") is command
+        assert listener.pop_command("T500") is None, "claiming twice must not raise"
+
+    def test_claiming_an_unknown_tag_answers_none(self, server, make_link):
+        """A reply for a command already timed out and swept. Common, not an error."""
+        link = make_link(server)
+
+        assert link._listener.pop_command("T999") is None
+
+    def test_iterating_while_another_thread_queues_does_not_raise(self, server, make_link):
+        """The RuntimeError this lock exists to prevent."""
+        link = make_link(server)
+        listener = link._listener
+        stop = threading.Event()
+        errors = []
+
+        def writer():
+            counter = 0
+            while not stop.is_set():
+                command = anidb_client.commands.PingCommand()
+                command.tag = f"W{counter:04d}"
+                listener.queue_command(command)
+                listener.pop_command(command.tag)
+                counter += 1
+
+        def reader():
+            try:
+                while not stop.is_set():
+                    for _tag, cmd in listener.pending_commands():
+                        _ = cmd.command
+            except Exception as exc:  # noqa: BLE001 - the failure is what is under test
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+        for thread in threads:
+            thread.start()
+        threading.Event().wait(0.5)
+        stop.set()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+
+        # Drain whatever the writer left behind. Otherwise the listener's timeout
+        # sweep re-sends it during teardown, against a socket that is closing.
+        for tag, _cmd in listener.pending_commands():
+            listener.pop_command(tag)
+
+
+class TestDecryptionOfUnencryptedPackets:
+    """AniDB sends some replies in the clear on an encrypted session.
+
+    An untagged ban notice is the case that matters: it arrives before the
+    cipher is established, and it is what the client most needs to be able to
+    read. run() therefore decrypts speculatively and suppresses ValueError,
+    falling back to reading the packet as plaintext.
+
+    So the padding check has to raise ValueError specifically. Any other type
+    escapes that suppression and ends the listener thread, which is the
+    permanent hang this whole exercise is about.
+    """
+
+    def test_a_plaintext_packet_of_block_length_is_rejected_as_unencrypted(self, server, make_link):
+        """16 bytes of plaintext used to decrypt to noise, get truncated by
+        whatever its last byte happened to say, and be parsed as a reply."""
+        from Crypto.Cipher import AES
+
+        link = make_link(server)
+        listener = link._listener
+        listener._cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
+
+        with pytest.raises(ValueError):
+            listener.decrypt(b"555 BANNED\n" + b" " * 5)
+
+    def test_an_empty_packet_is_rejected_as_unencrypted(self, server, make_link):
+        from Crypto.Cipher import AES
+
+        link = make_link(server)
+        link._listener._cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
+
+        with pytest.raises(ValueError):
+            link._listener.decrypt(b"")
+
+    def test_a_properly_padded_packet_round_trips(self, server, make_link):
+        """The check must not reject real traffic."""
+        from Crypto.Cipher import AES
+
+        link = make_link(server)
+        listener = link._listener
+        listener._cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
+
+        assert listener.decrypt(listener.encrypt(b"200 sess1234 LOGIN ACCEPTED")) == b"200 sess1234 LOGIN ACCEPTED"

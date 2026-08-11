@@ -380,7 +380,11 @@ argument. The library looks for:
 * AniDB username, password and [encryption key](#encryption). The `account`
   field holds the encryption key. The machine name must be one of
   `api.anidb.net`, `api.anidb.info` or `anidb.net`.
-* Database credentials — machine name must match your MySQL/PostgreSQL hostname.
+* Database credentials — machine name must match the hostname in `sql_db_url`,
+  and only the hostname: no port, and no brackets around an IPv6 literal
+  (`machine ::1`, not `machine [::1]:5432`). Matching is case-insensitive. This
+  lookup only happens when the URL carries no password of its own; a password
+  already in the URL is left alone.
 * fanart.tv API key — machine name must be one of `fanart.tv`,
   `assets.fanart.tv`, `webservice.fanart.tv` or `api.fanart.tv`.
 

@@ -217,3 +217,48 @@ class TestUpdateMylist:
             from anidb_client.db import FileTable
 
             assert check.query(FileTable).one().lid == 7788
+
+    def test_the_entries_field_is_preferred_over_entrycnt(self, cached_file, link, anidb):
+        """Two spellings of the same field; the first one named wins, as before."""
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entries": "4321", "entrycnt": "9999"}]))
+        cached_file.update_mylist(state="on hdd")
+
+        with anidb.get_session() as check:
+            from anidb_client.db import FileTable
+
+            assert check.query(FileTable).one().lid == 4321
+
+    def test_a_reply_naming_neither_count_field_completes(self, cached_file, link):
+        """A hang, before. The count was assigned back over `res` itself, so when
+        the reply carried neither field the comparison that followed ran against
+        the Response object and raised TypeError -- on the response thread, which
+        skipped wait.set() and left update_mylist() blocked for good.
+        """
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"something_else": "1"}]))
+
+        # Returning at all is the assertion: under the old code this call did not.
+        cached_file.update_mylist(state="on hdd")
+
+        assert len(link.requests_for("MYLISTADD")) == 1
+
+    def test_a_reply_with_no_data_lines_at_all_completes(self, cached_file, link, anidb):
+        """Same hang by a different route: datalines[0] on an empty list."""
+        link.on("MYLISTADD", FakeResponse("210", datalines=[]))
+
+        cached_file.update_mylist(state="on hdd")
+
+        with anidb.get_session() as check:
+            from anidb_client.db import FileTable
+
+            assert check.query(FileTable).one().lid is None, "nothing to read means nothing to store"
+
+    def test_a_single_entry_reply_does_not_overwrite_the_lid(self, cached_file, link, anidb):
+        """One entry means the number is a count, not an lid. Storing it would
+        put a 1 in the lid column and make the next add look like an edit."""
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))
+        cached_file.update_mylist(state="on hdd")
+
+        with anidb.get_session() as check:
+            from anidb_client.db import FileTable
+
+            assert check.query(FileTable).one().lid is None

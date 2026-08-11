@@ -147,7 +147,11 @@ class AniDBObj:
             self._db_commit(sess)
             self._close_db_session(sess)
 
-            if random.randint(0, 100) <= refresh_probability:
+            # randint is inclusive at both ends, so the old randint(0, 100) drew from
+            # 101 values and `<= probability` fired for probability + 1 of them. A
+            # 0% probability -- what _probability_of_refresh returns for data that is
+            # not due -- still spent a rate-limited UDP call about 1% of the time.
+            if random.randint(1, 100) <= refresh_probability:
                 self.update(block=block)
 
     def _send_anidb_update_req(self):
@@ -187,18 +191,42 @@ class AniDBObj:
         local_vars = vars(self)
         if name not in ("updated", "relations"):
             local_name = f"_{name}"
-            # anidb_client._log.debug("Requested attribute {} (in local_vars: {})".format(
-            #    name, local_name in local_vars))
-            if local_name in local_vars and local_vars[local_name]:
+            # `is not None` rather than a truth test. A cached value that is
+            # legitimately falsy -- 0 votes, an empty description, False -- read as
+            # "not fetched yet" and fell through to update_if_old(), which can spend
+            # a rate-limited UDP call to be told the same zero again.
+            if local_name in local_vars and local_vars[local_name] is not None:
                 return local_vars[local_name]
 
         super().__getattribute__("_updating").acquire()
         super().__getattribute__("_updating").release()
         super().__getattribute__("update_if_old")()
-        # Not quite sure, but something-something db_data missing-something...
         if name == "relations":
-            relations = self.relations
-            if isinstance(relations, list):
+            # Read the relationship off db_data. This was `self.relations`, which for
+            # any class without a `relations` property -- Group, Episode, File --
+            # re-entered __getattr__ on the same name and recursed until the stack
+            # ran out. Anime was unaffected only because it declares the property, so
+            # this branch was never reached for it.
+            db_data = super().__getattribute__("db_data")
+            # Asked of the class, so that a table which simply has no relations
+            # answers None -- as the fall-through below does for any other unknown
+            # attribute -- without touching the instance and triggering a load.
+            if db_data is None or not hasattr(type(db_data), "relations"):
+                return None
+            try:
+                relations = db_data.relations
+            except sqlalchemy.orm.exc.DetachedInstanceError:
+                # _get_db_data() closes the session it used, so the cached row is
+                # detached and a lazy relationship cannot load through it. Re-attach
+                # a copy for the read. Anime's own `relations` property recovers the
+                # same way; this is that recovery for every other class, which
+                # previously could not get this far to need it.
+                sess = self._get_db_session()
+                try:
+                    relations = list(sess.merge(db_data).relations)
+                finally:
+                    self._close_db_session(sess)
+            if relations is None or isinstance(relations, list):
                 return relations
             return relations()
         return getattr(super().__getattribute__("db_data"), name, None)
@@ -435,7 +463,7 @@ class Anime(AniDBObj):
         for url in urls:
             req = urllib.request.Request(url, headers=headers)
             try:
-                with urllib.request.urlopen(req) as f:
+                with urllib.request.urlopen(req, timeout=anidb_client.HTTP_TIMEOUT) as f:
                     res = json.loads(f.read())
             except urllib.error.HTTPError as e:
                 if e.code != 404:
@@ -682,7 +710,12 @@ class File(AniDBObj):
     _anime = None
     _episode = None
     _group = None
-    _multiep: list[str] = []
+    # None, not []. A mutable default on the class is shared by every File in the
+    # process, so the first `.append` to it would leak one file's episode list into
+    # all the others. Nothing appends today -- every write here rebinds -- which is
+    # why this has not bitten yet, and is exactly the state in which it is cheap to
+    # fix.
+    _multiep: list[str] | None = None
     _fid = None
     _path = None
     _size = None
@@ -1238,14 +1271,19 @@ class File(AniDBObj):
                 # if 'entrycnt' is > 1 this is actually the lid...
                 # ... which is good I guess, because we want it.
                 anidb_client.log.debug(f"lines from MYLISTADD command: {res.datalines}")
-                if "entries" in res.datalines[0]:
-                    res = int(res.datalines[0]["entries"])
-                elif "entrycnt" in res.datalines[0]:
-                    res = int(res.datalines[0]["entrycnt"])
-                if res > 1:
+                # The count gets its own name. It used to be assigned back over `res`
+                # itself, so when the reply carried neither field -- or carried no
+                # data lines at all -- the comparison below ran against the Response
+                # object and raised. On the response thread that is not a lost id, it
+                # is a skipped wait.set() and a caller blocked for good.
+                line = res.datalines[0] if res.datalines else {}
+                entry_count = int(line.get("entries") or line.get("entrycnt") or 0)
+                if entry_count > 1:
+                    # More than one entry means the field was really the lid, which
+                    # is the thing we actually wanted.
                     sess = self._get_db_session()
                     self.db_data = sess.merge(self.db_data)
-                    self.db_data.update(lid=res)
+                    self.db_data.update(lid=entry_count)
                     self._db_commit(sess)
                     self._close_db_session(sess)
             wait.set()
@@ -1522,6 +1560,11 @@ class File(AniDBObj):
             return True
         if self._is_generic and other.is_generic:
             return self.episode == other.episode
+        # Two real files with different fids are not equal. Falling off the end here
+        # returned None, which is falsy and so read as "not equal" most of the time,
+        # but is not a bool: `bool(a == b)` and `a != b` both worked by accident, and
+        # anything inspecting the result itself saw None.
+        return False
 
     def __len__(self):
         return len(self.multiep)
