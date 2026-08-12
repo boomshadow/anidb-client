@@ -83,6 +83,80 @@ def _required[T](value: T | None, what: str) -> T:
     return value
 
 
+def _relation_rows(paired: Iterable[tuple[str, str]]) -> list[AnimeRelationTable]:
+    """Build relation rows from an ANIME reply, skipping pairs that cannot be named.
+
+    Both halves of a pair come from AniDB and both used to be read without a guard:
+    `int(aid)` raises ValueError on a non-numeric id, and `anime_relation_map[code]`
+    raises KeyError on any relation code the table does not list -- and AniDB extends
+    that enumeration without announcing it. This runs inside the ANIME response
+    callback, which sets the event the caller is blocked on only as its last
+    statement, so either exception is not a dropped field: it escapes the callback,
+    the event is never set, and the application waits forever with nothing logged.
+    One unrecognised relation code hung the caller permanently.
+
+    An unusable pair is therefore dropped, and said so, which is the tolerance the
+    `strict=False` zip at the call site already has for the same "AniDB returned
+    something odd" reason. Dropping loses the edge -- a related_anime() walk will not
+    follow that link -- and the warning is both the mitigation and the signal that
+    `anime_relation_map` has fallen behind. The alternatives were rejected in #5:
+    `AnimeRelationTable.relation_type` is a non-nullable Enum over the same
+    vocabulary, so storing the edge without a type needs a schema change and this
+    project has no migration story, and defaulting to "other" would be
+    indistinguishable from the "other" AniDB itself sends as code 100.
+    """
+    rows = []
+    for aid_text, type_code in paired:
+        relation_type = anidb_client.mapper.anime_relation_map.get(type_code)
+        if relation_type is None:
+            anidb_client.log.warning(
+                f"Unknown AniDB anime relation code {type_code!r} for related aid {aid_text!r}; skipping that relation"
+            )
+            continue
+        try:
+            related_aid = int(aid_text)
+        except ValueError:
+            anidb_client.log.warning(f"Non-numeric AniDB related aid {aid_text!r}; skipping that relation")
+            continue
+        rows.append(AnimeRelationTable(related_aid=related_aid, relation_type=relation_type))
+    return rows
+
+
+def _group_relation_rows(entries: Iterable[str]) -> list[GroupRelationTable]:
+    """The same rule for a GROUP reply, which words its relations differently.
+
+    A GROUP reply carries one "gid,code" string per relation rather than two
+    parallel lists, but the failure was identical -- `group_relation_map[code]` with
+    no default, in a callback whose last statement is the one that releases the
+    caller -- and so is the answer. See _relation_rows above for the reasoning; the
+    group vocabulary is constrained by `GroupRelationTable.relation_type` in exactly
+    the same way, and code 6 is already the "other" AniDB sends itself.
+    """
+    rows = []
+    for entry in entries:
+        gid_text, separator, type_code = entry.partition(",")
+        if not separator:
+            # What the comprehension's `if "," in x` filter did, kept as it was.
+            continue
+        relation_type = anidb_client.mapper.group_relation_map.get(type_code)
+        if relation_type is None:
+            anidb_client.log.warning(
+                f"Unknown AniDB group relation code {type_code!r} for related gid {gid_text!r}; skipping that relation"
+            )
+            continue
+        try:
+            related_gid = int(gid_text)
+        except ValueError:
+            # Not a hang on its own -- a non-numeric gid reaches a non-nullable
+            # integer column and fails the commit, which is caught and logged. But
+            # that loses the whole group row rather than the one bad relation, so it
+            # is dropped by the same rule as the code above.
+            anidb_client.log.warning(f"Non-numeric AniDB related gid {gid_text!r}; skipping that relation")
+            continue
+        rows.append(GroupRelationTable(related_gid=related_gid, relation_type=relation_type))
+    return rows
+
+
 class AniDBObj:
     # The cached row: an AnimeTable, EpisodeTable, FileTable or GroupTable, or None
     # before one has been found. `Any` rather than that union because the policy
@@ -351,7 +425,6 @@ class Anime(AniDBObj):
             self._updated.set()
             return
 
-        relations: list[AnimeRelationTable] = []
         # Separate from `relations` below, which used to be this and then the rows
         # built from it -- two types under one name, and unbindable when the reply
         # carried no relations at all.
@@ -367,10 +440,7 @@ class Anime(AniDBObj):
             del ainfo["related_aid_list"]
         if "related_aid_type" in ainfo:
             del ainfo["related_aid_type"]
-        relations = [
-            AnimeRelationTable(related_aid=int(x), relation_type=anidb_client.mapper.anime_relation_map[y])
-            for x, y in paired
-        ]
+        relations = _relation_rows(paired)
 
         # convert datatypes
         for attr, data in ainfo.items():
@@ -1794,15 +1864,7 @@ class Group(AniDBObj):
             ginfo: dict[str, Any] = res.datalines[0]
             for attr, data in ginfo.items():
                 if attr == "relations":
-                    relations = data.split("'")
-                    relations = [
-                        GroupRelationTable(
-                            related_gid=x.split(",")[0],
-                            relation_type=anidb_client.mapper.group_relation_map[x.split(",")[1]],
-                        )
-                        for x in relations
-                        if "," in x
-                    ]
+                    relations = _group_relation_rows(data.split("'"))
 
                     if self.db_data:
                         new_relations = []
