@@ -117,6 +117,69 @@ class TestRemoveFromMylist:
 
         assert link.params_for("MYLISTDEL") == [{"aid": 6187, "epno": "5"}]
 
+    def test_a_ranged_generic_file_deletes_each_episode(self, anidb, session, link):
+        """The mirror of `test_a_ranged_generic_file_sends_string_episode_numbers`.
+
+        The delete loop read `self._multiep` -- the *cached* result of the property,
+        which is None until something reads it -- with its own fallback to the raw
+        episode number. So a ranged generic file nobody had asked `multiep` about
+        sent one MYLISTDEL for epno "5-7", which matches no entry AniDB holds per
+        episode: the removal reported success and removed nothing, while the add
+        path on the same object had created three entries.
+
+        Built from an `Episode` object rather than an epno string for the same
+        reason the add test is: the string form seeds `_multiep` from the argument,
+        which is exactly the state this bug hides behind.
+        """
+        from anidb_client.db import FileTable
+
+        session.add(factories.make_anime(aid=6187))
+        session.add(factories.make_episode(aid=6187, eid=96480, epno="5-7"))
+        session.add(factories.make_file(aid=6187, eid=96480, fid=None, lid=None, is_generic=True))
+        session.commit()
+        ranged = anidb.File(anime=6187, episode=anidb.Episode(eid=96480))
+        ranged.db_data = session.query(FileTable).one()
+        ranged._is_generic = True
+        assert ranged._multiep is None, "the fallback under test is only reached while this is unset"
+
+        link.on("MYLISTDEL", FakeResponse("211"))
+        ranged.remove_from_mylist()
+
+        assert link.params_for("MYLISTDEL") == [
+            {"aid": 6187, "epno": "5"},
+            {"aid": 6187, "epno": "6"},
+            {"aid": 6187, "epno": "7"},
+        ]
+
+    def test_a_path_backed_files_removal_does_not_consult_its_filename(self, anidb, session, link, tmp_path):
+        """The half of the asymmetry that is deliberately kept.
+
+        `multiep` has a third branch: given a local path it may adopt the episode
+        set guessed from the filename. Expanding the range fixes the reported
+        defect without that, and a filename must not get to decide what is deleted
+        from someone's mylist. This pins that the narrow fix stayed narrow -- the
+        filename names episodes 5 to 7, and the removal still names only the
+        episode the cache believes the file to be.
+        """
+        from anidb_client.db import FileTable
+
+        path = tmp_path / "Kemono no Souja Erin - 05-07.mkv"
+        path.write_bytes(b"")
+        session.add(factories.make_anime(aid=6187))
+        session.add(factories.make_episode(aid=6187, eid=96461, epno="5"))
+        session.add(factories.make_file(aid=6187, eid=96461, fid=None, lid=None, is_generic=True))
+        session.commit()
+        f = anidb.File(path=str(path))
+        f.db_data = session.query(FileTable).one()
+        f._anime = anidb.Anime(6187)
+        f._episode = anidb.Episode(eid=96461)
+        f._is_generic = True
+
+        link.on("MYLISTDEL", FakeResponse("211"))
+        f.remove_from_mylist()
+
+        assert link.params_for("MYLISTDEL") == [{"aid": 6187, "epno": "5"}]
+
 
 class TestUpdateMylist:
     def test_an_existing_entry_is_edited_by_lid(self, anidb, session, link):
