@@ -119,7 +119,13 @@ enable_error_code = ["ignore-without-code"]
 # in a per-module section and silently applies it globally instead, which turns
 # the whole codebase strict and produces ~860 errors.
 [[tool.mypy.overrides]]
-module = ["anidb_client.errors", "anidb_client.ratelimit"]
+module = [
+    "anidb_client.db",
+    "anidb_client.errors",
+    "anidb_client.fileinfo",
+    "anidb_client.mapper",
+    "anidb_client.ratelimit",
+]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 disallow_untyped_calls = true
@@ -131,12 +137,9 @@ strict_equality = true
 no_implicit_reexport = true
 
 # --- Documented holes: third-party libraries without type information ---
-# pycryptodome ships no py.typed marker; it provides MD4 (for ed2k hashing) and
-# AES (for encrypted sessions).
-[[tool.mypy.overrides]]
-module = ["Crypto.*"]
-ignore_missing_imports = true
-
+# pycryptodome used to be listed here; as of 3.23.0 it ships py.typed and .pyi
+# stubs for MD4 and AES, so the waiver was suppressing nothing.
+#
 # libnfs is an optional, soft-imported dependency for nfs:// paths and is not
 # installed in the development environment at all.
 [[tool.mypy.overrides]]

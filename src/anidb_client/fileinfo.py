@@ -16,9 +16,11 @@
 # along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 
 import datetime
-import functools
 import os
 import re
+from collections.abc import Iterator
+from types import TracebackType
+from typing import IO, Any
 
 from Crypto.Hash import MD4
 
@@ -29,7 +31,13 @@ except ImportError:
 
 import anidb_client.errors
 
-ep_nr_re = [
+# `Any` rather than a protocol for the NFS handles and the libnfs context object.
+# libnfs ships no type information at all (see pyproject's documented holes), so
+# there is nothing to narrow to; writing a protocol here would describe a library
+# this project cannot check itself against.
+
+# None marks the breakpoint after which the regexes are fallbacks -- see below.
+ep_nr_re: list[re.Pattern[str] | None] = [
     re.compile(
         r"[Ss]([0-9]+)[ ._-]*e([0-9]+)([0-9-]*)", re.IGNORECASE
     ),  # foo.s01.e01, foo.s01_e01, S01E02 foo, S01 - E02
@@ -58,7 +66,7 @@ specials_re = re.compile(r"^(S|P|C|T|O)([0-9]+)$", re.IGNORECASE)
 
 
 # http://www.radicand.org/blog/orz/2010/2/21/edonkey2000-hash-in-python/
-def get_file_hash(path, nfs_obj=None):
+def get_file_hash(path: str, nfs_obj: Any = None) -> str:
     if path.startswith("nfs://"):
         with NFSFile(path, "rb", nfs_obj) as f:
             return _calculate_ed2khash(f)
@@ -66,10 +74,10 @@ def get_file_hash(path, nfs_obj=None):
         return _calculate_ed2khash(f)
 
 
-def _calculate_ed2khash(fileObj):
+def _calculate_ed2khash(fileObj: IO[bytes]) -> str:
     """Returns the ed2k hash of a given file."""
 
-    def gen(f):
+    def gen(f: IO[bytes]) -> Iterator[bytes]:
         while True:
             x = f.read(9728000)
             if x:
@@ -77,7 +85,7 @@ def _calculate_ed2khash(fileObj):
             else:
                 return
 
-    def md4_hash(data):
+    def md4_hash(data: bytes) -> MD4.MD4Hash:
         m = MD4.new()
         m.update(data)
         return m
@@ -91,15 +99,14 @@ def _calculate_ed2khash(fileObj):
         return md4_hash(b"").hexdigest()
     if len(hashes) == 1:
         return hashes[0].hexdigest()
-    else:
-        # reduce goes from left to right, but will not run digest on the first
-        # entry, so we'll have to do that first.
-        hashes[0] = hashes[0].digest()
-        res = md4_hash(functools.reduce(lambda a, d: a + d.digest(), hashes)).hexdigest()
-        return res
+    # Above one chunk, ed2k hashes the concatenated chunk digests. This was a
+    # functools.reduce over `a + d.digest()` seeded by overwriting hashes[0] with
+    # its own digest -- which made the list hold two different kinds of thing and
+    # is the same concatenation spelled out.
+    return md4_hash(b"".join(h.digest() for h in hashes)).hexdigest()
 
 
-def get_file_stats(path, nfs_obj=None):
+def get_file_stats(path: str, nfs_obj: Any = None) -> tuple[datetime.datetime, int]:
     """Return (mtime, size). size is in bytes, mtime is a datetime object."""
     if path.startswith("nfs://"):
         return _nfs_stats(path, nfs_obj)
@@ -112,11 +119,11 @@ def get_file_stats(path, nfs_obj=None):
 
 
 class NFSFile:
-    def __init__(self, path, mode, nfs_obj=None):
+    def __init__(self, path: str, mode: str, nfs_obj: Any = None) -> None:
         if not libnfs:
             raise anidb_client.errors.AniDBPathError("libnfs python module not installed, can't use nfs paths")
         self.mode = mode
-        self.handle = None
+        self.handle: Any = None
         self.nfs_obj = nfs_obj
 
         self.path = path
@@ -127,29 +134,34 @@ class NFSFile:
             else:
                 self.rel_path = self.path
 
-    def open(self):
+    def open(self) -> Any:
         if self.nfs_obj:
             self.handle = self.nfs_obj.open(self.rel_path, self.mode)
         else:
             self.handle = libnfs.open(self.path, self.mode)
         return self.handle
 
-    def close(self):
+    def close(self) -> None:
         if self.handle:
             self.handle.close()
 
-    def __enter__(self):
+    def __enter__(self) -> Any:
         return self.open()
 
-    def __exit__(self, type, value, traceback):
+    # Renamed from `type`/`value`/`traceback`: the first shadowed the builtin it
+    # needs in its own annotation. The interpreter passes these positionally.
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         self.close()
 
 
-def _nfs_stats(path, nfs_obj=None):
-    stats = None
+def _nfs_stats(path: str, nfs_obj: Any = None) -> tuple[datetime.datetime, int]:
     with NFSFile(path, "r", nfs_obj) as f:
         stats = f.fstat()
 
-    mtime = stats["mtime"]["sec"] + stats["mtime"]["nsec"] / 10**9
-    mtime = datetime.datetime.fromtimestamp(mtime)
-    return (mtime, stats["size"])
+    epoch = stats["mtime"]["sec"] + stats["mtime"]["nsec"] / 10**9
+    return (datetime.datetime.fromtimestamp(epoch), stats["size"])

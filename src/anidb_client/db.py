@@ -18,6 +18,7 @@
 
 import enum
 from collections.abc import Iterable
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -33,7 +34,7 @@ from sqlalchemy import (
     Unicode,
     create_engine,
 )
-from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
 
 # The constrained vocabularies, defined once.
 #
@@ -137,7 +138,7 @@ class Base(DeclarativeBase):
     """
 
 
-def init_db(url):
+def init_db(url: str) -> sessionmaker[Session]:
     # Connection-pool sizing is only meaningful for pools that queue. SQLAlchemy
     # gives in-memory SQLite a SingletonThreadPool, which takes neither argument
     # and raises TypeError if handed them -- so an in-memory cache, the obvious
@@ -197,11 +198,11 @@ class AnimeTable(Base):
 
     relations = relationship("AnimeRelationTable", backref="anime", cascade="all, delete")
 
-    def update(self, **kwargs):
+    def update(self, **kwargs: Any) -> None:
         for key, attr in kwargs.items():
             setattr(self, key, attr)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"<AnimeTable(pk={self.pk}, aid={self.aid}, episodes={self.nr_of_episodes}, "
             f"highest_episode_number={self.highest_episode_number}, updated="
@@ -231,7 +232,7 @@ class AnimeRelationTable(Base):
     # Python 3 never calls __cmp__, so it did nothing at all -- but it read as
     # though equality were value-based, which is the opposite of the truth.
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"<AnimeRelationTable(pk={self.pk}, anime_pk={self.anime_pk}, related_aid={self.related_aid}, "
             f"type={self.relation_type})>"
@@ -257,11 +258,11 @@ class EpisodeTable(Base):
     updated = Column(DateTime(timezone=True), nullable=False)
     last_update_dice = Column(DateTime(timezone=True), nullable=False)
 
-    def update(self, **kwargs):
+    def update(self, **kwargs: Any) -> None:
         for key, attr in kwargs.items():
             setattr(self, key, attr)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"<EpisodeTable(pk={self.pk}, aid={self.aid}, epno={self.epno}, "
             f"title_eng={self.title_eng}, updated={self.updated})>"
@@ -310,11 +311,11 @@ class FileTable(Base):
     updated = Column(DateTime(timezone=True), nullable=True)
     last_update_dice = Column(DateTime(timezone=True), nullable=False)
 
-    def update(self, **kwargs):
+    def update(self, **kwargs: Any) -> None:
         for key, attr in kwargs.items():
             setattr(self, key, attr)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         path = None
         if self.path:
             path = self.path.encode("utf-8")
@@ -350,11 +351,11 @@ class GroupTable(Base):
     updated = Column(DateTime(timezone=True), nullable=True)
     last_update_dice = Column(DateTime(timezone=True), nullable=False)
 
-    def update(self, **kwargs):
+    def update(self, **kwargs: Any) -> None:
         for key, attr in kwargs.items():
             setattr(self, key, attr)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<GroupTable(pk={self.pk}, gid={self.gid}, name={self.name}>"
 
 
@@ -372,7 +373,7 @@ class GroupRelationTable(Base):
     # Identity equality, and no __eq__ -- see AnimeRelationTable above. The same
     # dead Python 2 __cmp__ used to sit here too.
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"<GroupRelationTable(pk={self.pk}, group_pk={self.group_pk}, "
             f"related_gid={self.related_gid}, type={self.relation_type})>"
