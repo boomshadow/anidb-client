@@ -13,7 +13,7 @@ Read the **Writing ADRs** section of `docs/specs/SPEC-000-anchored-development.m
 
 ADR Decision sections document specific technical choices — naming the tool, the pattern, the trade-off, and the alternatives that were rejected and why. That specificity is the point; it is what prevents re-litigation.
 
-**Write an ADR when there is a real decision to record, not to populate the directory.** An ADR that restates what the code obviously does, or that reasons about a choice nobody would question, is overhead pretending to be rigor. The guiding question in SPEC-000 is the bar: would a capable engineer new to this codebase likely propose a different approach, and would that be a problem? If not, there is no ADR to write. A small number of ADRs is a healthy steady state for a project this size.
+**Write an ADR when there is a real decision to record, not to populate the directory.** An ADR that restates what the code obviously does, or that reasons about a choice nobody would question, is overhead pretending to be rigor. The guiding question in SPEC-000 is the bar: would a capable engineer new to this codebase likely propose a different approach, and would that be a problem? If yes, write it; if not, there is no ADR to write.
 
 Consequences sections should describe what changes for the team and the system's behavior, not restate implementation details. Avoid claims about the current state of other files (e.g., "`.gitlab-ci.yml` is unchanged") — those go stale. Instead, describe the structural outcome.
 

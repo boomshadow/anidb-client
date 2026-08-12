@@ -20,8 +20,7 @@ conventions in the `spec` and `adr` skills).
 - **Specs** (`docs/specs/`, index [`INDEX.md`](docs/specs/INDEX.md)) — behavioral
   expectations by domain. They describe behavior and point at the code.
 - **ADRs** (`docs/decisions/`, index [`INDEX.md`](docs/decisions/INDEX.md)) —
-  architectural reasoning and rejected alternatives. This project keeps a **small** ADR set
-  on purpose; do not write one to fill the directory (see the `adr` skill).
+  architectural reasoning and rejected alternatives.
 - **Lines of truth** — two, and they are different kinds of thing. The **AniDB UDP API** is
   an *external* contract: commands, response codes and field names are AniDB's, transcribed
   here in `src/anidb_client/commands.py` and `responses.py`. The **cache schema** in
