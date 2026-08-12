@@ -24,9 +24,26 @@ import urllib
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as etree
+from typing import Any
 
 import anidb_client.animeobjs
 from anidb_client.errors import AniDBError, AniDBFileError
+
+# One anime's row in the Anime-Lists mapping table: the XML element's own
+# attributes, plus a "name" and a "map" of per-source mapping dicts grafted on.
+# The values are heterogeneous by construction -- a string id sitting next to a
+# list of mapping dicts whose episode maps hold either a target episode or a
+# (target, part) pair -- so this is stated as a dict of Any rather than a shape
+# that would have to be widened at every leaf.
+type AnilistEntry = dict[str, Any]
+
+# What an AniDB episode maps to on the target service: one episode, several when
+# AniDB splits what the target treats as one, or a (target episode, part) pair
+# when several AniDB episodes share one target episode.
+type MappedEpisode = int | list[int] | tuple[str, int]
+
+# (aid, matched titles, score of the best title, the best title itself)
+type TitleMatch = tuple[int, list[anidb_client.animeobjs.AnimeTitle], float, str | None]
 
 # Sent when fetching the anime-titles / anime-list XML over HTTPS. AniDB asks
 # clients to identify themselves distinctly, so this matches the registered UDP
@@ -37,17 +54,17 @@ _anime_list_url = "https://github.com/Anime-Lists/anime-lists/raw/master/anime-l
 iso_639_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ISO-639-2_utf-8.txt")
 _update_interval = datetime.timedelta(hours=36)
 
-titles = None
-anilist = None
-languages = None
+titles: etree.Element | None = None
+anilist: dict[str, AnilistEntry] | None = None
+languages: dict[str, str] | None = None
 
-_tv_mappings = {
+_tv_mappings: dict[str, dict[str, str]] = {
     "tvdb": {"id": "tvdbid", "season": "defaulttvdbseason", "offset": "episodeoffset", "map_season": "tvdbseason"},
     "tmdb": {"id": "tmdbtv", "season": "tmdbseason", "offset": "tmdboffset", "map_season": "tmdbseason"},
 }
 
 
-def update_xml(url):
+def update_xml(url: str) -> str | None:
     file_name = url.split("/")[-1]
     ext = url.split(".")[-1]
     if os.name == "posix":
@@ -96,7 +113,7 @@ def update_xml(url):
     return cache_file
 
 
-def update_anilist():
+def update_anilist() -> None:
     # These are the global variables we want to update
     # reset them here.
     global anilist
@@ -109,11 +126,17 @@ def update_anilist():
         # routine outcome when AniDB has temporarily IP-banned you.
         raise AniDBFileError("Missing, and unable to fetch, list of anime mappings")
     xml = _read_anidb_xml(xml_file)
+    if xml is None:
+        raise AniDBFileError("Missing, and unable to fetch, list of anime mappings")
 
     # Iterate every anime entry in XML; save attributes in the anilist dict.
     for anime in xml.iter("anime"):
         aid = anime.attrib["anidbid"]
-        a_attrs = anime.attrib
+        # Copied rather than aliased: what goes into anilist grows a "map" and a
+        # "name" that are not strings, and this is the Element's own attribute
+        # dict. Nothing reads the element again once the loop has passed it, so
+        # the copy is equivalent -- it just stops the graft reaching back.
+        a_attrs: AnilistEntry = dict(anime.attrib)
         del a_attrs["anidbid"]
 
         anilist[aid] = a_attrs
@@ -126,7 +149,7 @@ def update_anilist():
         if mappings is not None:
             anilist[aid]["map"] = {}
             for m in mappings.iter("mapping"):
-                attrs = m.attrib
+                attrs: AnilistEntry = dict(m.attrib)
                 for source in ("tmdb", "tvdb"):
                     if source not in anilist[aid]["map"]:
                         anilist[aid]["map"][source] = []
@@ -160,10 +183,10 @@ def update_anilist():
                 anilist[aid]["map"][source].append(attrs)
 
         name = anime.find("name")
-        anilist[aid]["name"] = name.text
+        anilist[aid]["name"] = name.text if name is not None else None
 
 
-def update_animetitles():
+def update_animetitles() -> None:
     global titles
     xml_file = update_xml(_animetitles_url)
     if not xml_file and not titles:
@@ -171,7 +194,7 @@ def update_animetitles():
     titles = _read_anidb_xml(xml_file)
 
 
-def _verify_xml_file(path):
+def _verify_xml_file(path: str) -> bool:
     if not os.path.isfile(path):
         return False
 
@@ -181,15 +204,17 @@ def _verify_xml_file(path):
         anidb_client.log.error(f"Exception when reading xml file: {e}")
         return False
 
+    if tmp_xml is None:
+        return False
     # A truncated download still parses, so size is the sanity check.
     return len(tmp_xml.findall("anime")) >= 8000
 
 
-def _read_anidb_xml(filePath):
+def _read_anidb_xml(filePath: str | None) -> etree.Element | None:
     return _read_xml_into_etree(filePath)
 
 
-def _read_xml_into_etree(filePath):
+def _read_xml_into_etree(filePath: str | None) -> etree.Element | None:
     if not filePath:
         return None
 
@@ -204,7 +229,7 @@ def _read_xml_into_etree(filePath):
     return xmlASetree
 
 
-def _read_language_file():
+def _read_language_file() -> None:
     global languages
     languages = {}
     with open(iso_639_file) as f:
@@ -214,16 +239,21 @@ def _read_language_file():
                 languages[two] = three
 
 
-def get_lang_code(short):
+def get_lang_code(short: str | None) -> str | None:
     if not languages:
         _read_language_file()
 
-    if short in languages:
-        return languages[short]
-    return None
+    # `or {}` rather than a second None check: _read_language_file always leaves a
+    # dict behind, and mypy cannot see that it writes the global.
+    return (languages or {}).get(short) if short else None
 
 
-def get_titles(name=None, aid=None, max_results=10, score_for_match=0.8):
+def get_titles(
+    name: str | None = None,
+    aid: int | None = None,
+    max_results: int = 10,
+    score_for_match: float = 0.8,
+) -> list[TitleMatch]:
     global titles
     res = []
 
@@ -233,22 +263,26 @@ def get_titles(name=None, aid=None, max_results=10, score_for_match=0.8):
         raise AniDBFileError("Could not get valid title cache file.")
 
     for anime in titles.findall("anime"):
-        score = 0
+        score = 0.0
         best_title_match = None
         exact_match = None
-        if aid and aid == int(anime.get("aid")):
-            exact_match = anime.get("aid")
+        # `aid` is required by AniDB's own schema for this document, so an entry
+        # without one is a corrupt file rather than a case to carry.
+        anime_aid = int(anime.attrib["aid"])
+        if aid and aid == anime_aid:
+            exact_match = str(anime_aid)
 
         if name:
             name = name.replace("⁄", "/")
             for title in anime.findall("title"):
-                if name.lower() in title.text.lower():
-                    exact_match = title.text
-                diff = difflib.SequenceMatcher(a=name, b=title.text)
+                title_text = title.text or ""
+                if name.lower() in title_text.lower():
+                    exact_match = title_text
+                diff = difflib.SequenceMatcher(a=name, b=title_text)
                 title_score = diff.ratio()
                 if title_score > score:
                     score = title_score
-                    best_title_match = title.text
+                    best_title_match = title_text
 
         if score > score_for_match or exact_match:
             matched_titles = [
@@ -257,7 +291,7 @@ def get_titles(name=None, aid=None, max_results=10, score_for_match=0.8):
                 )
                 for x in anime.findall("title")
             ]
-            res.append((int(anime.get("aid")), matched_titles, score, best_title_match))
+            res.append((anime_aid, matched_titles, score, best_title_match))
 
     res.sort(key=lambda x: x[2], reverse=True)
 
@@ -266,42 +300,45 @@ def get_titles(name=None, aid=None, max_results=10, score_for_match=0.8):
     return res[:max_results]
 
 
-def anilist_maps(aid):
+def anilist_maps(aid: int) -> AnilistEntry:
     global anilist
     if not anilist:
         update_anilist()
-    if str(aid) in anilist:
-        return anilist[str(aid)]
-    return {}
+    if anilist is None:
+        # update_anilist either fills this in or raises; mirrors get_titles above.
+        raise AniDBFileError("Could not get valid anime mapping cache file.")
+    return anilist.get(str(aid), {})
 
 
-def _get_tvid(aid, key):
+def _get_tvid(aid: int, key: str) -> str | None:
     maps = anilist_maps(aid)
     if key in maps:
+        value: str = maps[key]
         try:
-            int(maps[key])
+            int(value)
         except ValueError:
             return None
-        return maps[key]
+        return value
     return None
 
 
-def get_tvdbid(aid, id_type="tv"):
+def get_tvdbid(aid: int, id_type: str = "tv") -> str | None:
     if id_type == "tv":
         return _get_tvid(aid, "tvdbid")
     return None
 
 
-def _get_movieid(aid, key):
+def _get_movieid(aid: int, key: str) -> str | list[str] | None:
     maps = anilist_maps(aid)
     if key in maps and maps[key] not in ["", "unknown"]:
-        if "," in maps[key]:
-            return maps[key].split(",")
-        return maps[key]
+        value: str = maps[key]
+        if "," in value:
+            return value.split(",")
+        return value
     return None
 
 
-def get_tmdbid(aid, id_type="movie"):
+def get_tmdbid(aid: int, id_type: str = "movie") -> str | list[str] | None:
     if id_type == "tv":
         return _get_tvid(aid, "tmdbtv")
     elif id_type == "movie":
@@ -309,7 +346,7 @@ def get_tmdbid(aid, id_type="movie"):
     return None
 
 
-def get_imdbid(aid, id_type="movie"):
+def get_imdbid(aid: int, id_type: str = "movie") -> str | list[str] | None:
     if id_type == "movie":
         return _get_movieid(aid, "imdbid")
     return None
@@ -322,7 +359,7 @@ def get_imdbid(aid, id_type="movie"):
 # the same target or
 # An array with episodes number if the anidb episode is mapped to multiple
 # target episodes
-def _db_ep_to_resp(db_epno):
+def _db_ep_to_resp(db_epno: str | int | tuple[str, int]) -> MappedEpisode | None:
     if type(db_epno) is int:
         return db_epno
     if type(db_epno) is tuple:
@@ -332,9 +369,10 @@ def _db_ep_to_resp(db_epno):
         if len(eps) == 1:
             return eps[0]
         return eps
+    return None
 
 
-def _get_tv_episode(aid, epno, source):
+def _get_tv_episode(aid: int, epno: str | int, source: str) -> tuple[int | None, MappedEpisode | None]:
     keys = _tv_mappings[source]
     maps = anilist_maps(aid)
     if keys["id"] not in maps:
@@ -409,13 +447,13 @@ def _get_tv_episode(aid, epno, source):
     return (int(db_season), int_epno)
 
 
-def get_tv_episode(aid, epno, source="tvdb"):
+def get_tv_episode(aid: int, epno: str | int, source: str = "tvdb") -> tuple[int | None, MappedEpisode | None]:
     return _get_tv_episode(aid, epno, source)
 
 
-def get_tvdb_episode(aid, epno):
+def get_tvdb_episode(aid: int, epno: str | int) -> tuple[int | None, MappedEpisode | None]:
     return _get_tv_episode(aid, epno, "tvdb")
 
 
-def get_tmdb_episode(aid, epno):
+def get_tmdb_episode(aid: int, epno: str | int) -> tuple[int | None, MappedEpisode | None]:
     return _get_tv_episode(aid, epno, "tmdb")

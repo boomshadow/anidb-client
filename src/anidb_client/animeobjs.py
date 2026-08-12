@@ -536,12 +536,14 @@ class Anime(AniDBObj):
 
 
 class AnimeTitle:
-    def __init__(self, titletype, lang, title):
+    # Annotated ahead of the rest of this module: anames.py builds these and is
+    # already on the mypy strict list, where an untyped constructor is an error.
+    def __init__(self, titletype: str | None, lang: str | None, title: str | None) -> None:
         self.titletype = titletype
         self.lang = lang
         self.title = title
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"AnimeTitle(titletype='{self.titletype}', lang='{self.lang}', title='{self.title}')"
 
 
