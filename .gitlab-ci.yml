@@ -228,15 +228,27 @@ build:dist:
 # .claude/agents/drift-detector.md that a local session spawns as a subagent. Requires the
 # CLAUDE_CODE_OAUTH_TOKEN project CI/CD variable for the Agent SDK to authenticate.
 #
-# Plain stage ordering, no `needs`: this is the one job that costs a model run, so it waits
-# until the cheap checks have passed rather than being spent on a pipeline that is already
-# red. `GIT_DEPTH: 0` because it diffs against the merge-request base commit, which the
-# default shallow clone is not guaranteed to contain.
+# This is the one job that costs a model run, so it waits on the checks that actually fail a
+# pipeline -- validate and test -- and not on the scanners, which it runs alongside instead.
+# `GIT_DEPTH: 0` because it diffs against the merge-request base commit, which the default
+# shallow clone is not guaranteed to contain.
 anchor-watch:
   extends: .rules-merge-request-only-no-renovate
   stage: drift-detection
   image: registry.gitlab.com/boomshadow/anchor-watch-image:2.0.1@sha256:baafe435f4b77d22d882cc57266292536f39b94af3fe3aa4a629b21a5a6b5269
-  dependencies: []
+  needs:
+    - job: validate:lockfile
+      artifacts: false
+    - job: validate:spec-index
+      artifacts: false
+    - job: validate:adr-index
+      artifacts: false
+    - job: lint
+      artifacts: false
+    - job: typecheck
+      artifacts: false
+    - job: test
+      artifacts: false
   variables:
     GIT_DEPTH: 0
   script:
