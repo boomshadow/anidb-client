@@ -22,7 +22,7 @@ import datetime
 
 import pytest
 import sqlalchemy
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 
 from anidb_client.db import AnimeRelationTable, AnimeTable, Base, FileTable, init_db
@@ -170,7 +170,7 @@ class TestNativeEnums:
             )
         )
         pg_session.commit()
-        assert pg_session.query(FileTable).one().mylist_state == "on hdd"
+        assert pg_session.scalars(select(FileTable)).one().mylist_state == "on hdd"
 
 
 class TestBigIntegerColumns:
@@ -198,7 +198,7 @@ class TestBigIntegerColumns:
             )
         )
         pg_session.commit()
-        assert pg_session.query(FileTable).one().size == big
+        assert pg_session.scalars(select(FileTable)).one().size == big
 
 
 class TestConstraints:
@@ -215,13 +215,13 @@ class TestConstraints:
     def test_deleting_an_anime_cascades_to_its_relations(self, pg_session):
         pg_session.add(factories.make_anime(aid=1))
         pg_session.commit()
-        anime = pg_session.query(AnimeTable).one()
+        anime = pg_session.scalars(select(AnimeTable)).one()
         pg_session.add(factories.make_relation(anime.pk, related_aid=2))
         pg_session.commit()
 
         pg_session.delete(anime)
         pg_session.commit()
-        assert pg_session.query(AnimeRelationTable).count() == 0
+        assert pg_session.scalar(select(func.count()).select_from(AnimeRelationTable)) == 0
 
     def test_aid_is_unique(self, pg_session):
         pg_session.add(factories.make_anime(aid=1))
@@ -240,7 +240,7 @@ class TestInitDb:
         """
         factory = init_db(postgres_url)
         with factory() as sess:
-            assert sess.query(AnimeTable).count() == 0
+            assert sess.scalar(select(func.count()).select_from(AnimeTable)) == 0
         bind = factory.kw["bind"]
         assert bind.pool.size() == 10
         bind.dispose()

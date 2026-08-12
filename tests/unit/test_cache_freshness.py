@@ -24,6 +24,7 @@ less directly and pull in a dependency to do it.
 import datetime
 
 import pytest
+from sqlalchemy import select
 
 from tests import factories
 
@@ -117,7 +118,7 @@ class TestTheDiceCooldown:
         with anidb.get_session() as check:
             from anidb_client.db import AnimeTable
 
-            stored = check.query(AnimeTable).one()
+            stored = check.scalars(select(AnimeTable)).one()
             assert datetime.datetime.now(UTC) - stored.last_update_dice.replace(tzinfo=UTC) < HOUR
 
 
