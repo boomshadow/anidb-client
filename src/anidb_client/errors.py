@@ -32,6 +32,18 @@ class AniDBMustAuthError(AniDBError):
     pass
 
 
+class AniDBAuthFailedError(AniDBError):
+    """AniDB refused this client's credentials or identity.
+
+    Distinct from AniDBMustAuthError, which means a command was sent before a
+    session existed. This one means a session was asked for and denied, and
+    denied for a reason that retrying cannot change -- a wrong password, an
+    unregistered client, an encryption type the server does not offer. Re-sending
+    rejected credentials is one of the surest ways to earn a ban, so the transport
+    latches this and stops rather than trying again.
+    """
+
+
 class AniDBPacketCorruptedError(AniDBError):
     pass
 

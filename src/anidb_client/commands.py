@@ -114,7 +114,11 @@ class AuthCommand(Command):
         super().__init__("AUTH", **parameters)
 
     def handle_timeout(self, link: AniDBLink) -> None:
-        link.set_banned(code=604, reason=b"API not responding")
+        # auth_failed() rather than set_banned(): both back off, but only this one
+        # settles the handshake the sender is waiting on. set_banned() left it
+        # unsettled, so an AUTH that simply went unanswered parked the sender as
+        # surely as one that was refused.
+        link.auth_failed("604", "API not responding")
 
 
 class LogoutCommand(Command):
@@ -491,7 +495,9 @@ class EncryptCommand(Command):
         super().__init__("ENCRYPT", **parameters)
 
     def handle_timeout(self, link: AniDBLink) -> None:
-        link.set_banned(code=604, reason=b"API not responding")
+        # See AuthCommand.handle_timeout: this half of the handshake has a waiter
+        # to release too.
+        link.auth_failed("604", "API not responding")
 
 
 class EncodingCommand(Command):

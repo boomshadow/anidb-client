@@ -9,12 +9,14 @@ import contextlib
 import logging
 import threading
 import time
+from concurrent.futures import Future
 from time import monotonic
 
 import pytest
 
 import anidb_client
 import anidb_client.commands
+from anidb_client.errors import AniDBAuthFailedError, AniDBBannedError
 from anidb_client.link import AniDBLink
 from anidb_client.ratelimit import RateLimiter
 from tests.fake_anidb import FakeAniDBServer
@@ -102,6 +104,23 @@ class TestAuthentication:
 
         _await(lambda: link._session == "sess1234", message="session key was never stored")
         assert link._authed.is_set()
+
+    def test_a_login_without_a_usable_address_still_authenticates(self, server, make_link):
+        """The NAT check must not be able to fail the login it is only advising.
+
+        AniDB returns the address it saw only when AUTH asked for it, and the
+        handler read the field with a subscript and split it unconditionally. A
+        reply that omitted it, or carried something that is not `ip:port`, raised
+        on a response thread before the session was ever marked up -- so the login
+        succeeded on the wire and hung the client anyway.
+        """
+        server.on("AUTH", "200 sess1234 LOGIN ACCEPTED")
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(lambda: link._authed.is_set(), message="a login with no address never completed")
+        assert link._session == "sess1234"
+        assert not link._do_ping, "an unreadable address must not be taken as evidence of NAT"
 
     def test_credentials_are_sent_but_never_logged(self, server, make_link, caplog):
         server.on("AUTH", AUTH_OK)
@@ -210,6 +229,112 @@ class TestBanHandling:
         assert link._rate_limiter.ban_multiplier >= 1
 
 
+class TestFailedAuthentication:
+    """A handshake AniDB refuses must settle, not park the sender.
+
+    The reported hang: `504 CLIENT BANNED` answers AUTH, so it arrives tagged and
+    reached the success handler, whose first act was to read a field only a
+    successful reply carries. That raised KeyError on a response thread -- where
+    nothing sees it -- leaving the authenticated event unset and the
+    authenticating flag set, so every later attempt short-circuited and the sender
+    waited forever on a reply that had already been delivered and dropped.
+
+    Every refusal code AniDB can answer a handshake with lands in the same place,
+    which is why these are parametrized rather than written for 504 alone. A wrong
+    password was as permanent a hang as a ban.
+    """
+
+    @pytest.mark.parametrize(
+        ("code", "text"),
+        [
+            ("500", "LOGIN FAILED"),
+            ("502", "ACCESS DENIED"),
+            ("503", "CLIENT VERSION OUTDATED"),
+            ("504", "CLIENT BANNED"),
+        ],
+    )
+    def test_a_refused_handshake_settles_instead_of_hanging(self, server, make_link, code, text):
+        server.on("AUTH", f"{code} {text}")
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(
+            lambda: not link._authenticating.is_set(),
+            message=f"{code} left the handshake latched; every later attempt would short-circuit",
+        )
+        assert not link._authed.is_set()
+        assert link._listener.is_alive(), f"{code} killed the listener"
+
+    def test_a_rejected_credential_is_not_offered_again(self, server, make_link):
+        """The gentleness rule: retrying a refusal is how a refusal becomes a ban.
+
+        AniDB has said these credentials are wrong. Nothing about sending them
+        again changes that, so the transport latches the failure and stops.
+        """
+        server.on("AUTH", "500 LOGIN FAILED")
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(lambda: link._auth_fatal is not None, message="a fatal refusal was not recorded")
+
+        # Every route back to the wire, refused.
+        link.reauthenticate()
+        link._reauthenticate()
+        threading.Event().wait(0.3)
+
+        sent = len(server.requests_for("AUTH"))
+        assert sent == 1, f"credentials AniDB already rejected were sent {sent} times"
+
+    def test_a_ban_is_retryable_and_backs_off(self, server, make_link):
+        """504 is not a wrong password: it clears on its own, so it may be retried.
+
+        What must not happen is retrying it immediately, which is what earns the
+        next one.
+        """
+        server.on("AUTH", "504 CLIENT BANNED")
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(lambda: link._rate_limiter.is_banned, message="a banned handshake registered no back-off")
+        assert link._auth_fatal is None, "a ban is temporary and must not latch"
+
+    def test_a_handshake_that_is_never_answered_settles_too(self, server, make_link):
+        """Silence has to end the attempt as surely as a refusal does.
+
+        The AUTH command's timeout used to back off without settling anything, so
+        an unanswered handshake parked the sender exactly like a refused one.
+        """
+        server.on("AUTH", lambda req: None)
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(
+            lambda: not link._authenticating.is_set(),
+            timeout=8.0,
+            message="an unanswered handshake never settled",
+        )
+
+    def test_an_unanswered_encryption_handshake_settles_too(self, server, make_link):
+        """The handshake has two legs when a key is configured, and either can stall.
+
+        ENCRYPT goes first and AUTH never follows it, so a silent ENCRYPT parks
+        the sender at exactly the same place a silent AUTH does. It gets the same
+        treatment for the same reason, and this pins the leg that is easy to
+        forget: without a key configured, nothing sends ENCRYPT at all.
+        """
+        server.on("ENCRYPT", lambda req: None)
+        link = make_link(server, api_key="0123456789abcdef")
+        link.reauthenticate()
+
+        server.wait_for("ENCRYPT")
+        _await(
+            lambda: not link._authenticating.is_set(),
+            timeout=8.0,
+            message="an unanswered encryption handshake never settled",
+        )
+        assert not link._authed.is_set()
+
+
 class TestListenerRobustness:
     def test_an_unparsable_reply_does_not_kill_the_listener(self, server, make_link):
         """Regression: this path used to call sys.exit(2).
@@ -227,7 +352,16 @@ class TestListenerRobustness:
         threading.Event().wait(0.3)
         assert link._listener.is_alive(), "listener thread died on a malformed packet"
 
-        # And it still works afterwards.
+        # The unanswered handshake settles rather than latching: an attempt that
+        # ends without releasing its waiter is the hang, not a lost result.
+        _await(
+            lambda: not link._authenticating.is_set(),
+            message="the handshake never settled, so nothing could start another",
+        )
+
+        # And it still works afterwards. A fresh handshake is only started when
+        # something asks for one -- there is no point authenticating into an idle
+        # session, least of all against an API that has just asked us to back off.
         server.on("AUTH", AUTH_OK)
         link.reauthenticate()
         _await(lambda: link._authed.is_set(), message="listener stopped serving after garbage")
@@ -470,6 +604,73 @@ class TestSharedTransportState:
 
         assert link.session is None
         assert link._listener.cipher is None
+
+    def test_only_one_thread_can_settle_a_handshake(self, server, make_link):
+        """Two threads race to settle the same attempt; exactly one may win.
+
+        Both are real: the listener settles on a reply, and its own timeout sweep
+        settles on silence. A reply landing as the sweep claims the same command
+        puts them on the same attempt at the same moment. Settling twice raises
+        InvalidStateError out of whichever lost -- on the listener thread, where
+        that ends the listener and hangs every caller.
+
+        The attempt is taken and cleared inside the lock, so the loser finds
+        nothing to settle rather than finding a settled one.
+        """
+        link = make_link(server)
+        with link._auth_lock:
+            link._auth_attempt = Future()
+            attempt = link._auth_attempt
+
+        start = threading.Barrier(2)
+        errors = []
+
+        def settle(error):
+            start.wait()
+            try:
+                link._settle_auth(error)
+            except Exception as e:  # pragma: no cover - the assertion below reports it
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=settle, args=(None,)),
+            threading.Thread(target=settle, args=(AniDBBannedError("banned"),)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert not errors, f"settling raced: {errors}"
+        assert attempt.done(), "the attempt was left unsettled"
+        assert link._auth_attempt is None, "a settled attempt must not stay claimable"
+
+    def test_settling_an_attempt_that_is_already_gone_is_harmless(self, server, make_link):
+        """The sweep can reach a handshake that settled a moment earlier.
+
+        Nothing to release is not an error; raising here would end the thread that
+        found out.
+        """
+        link = make_link(server)
+
+        link._settle_auth(None)
+        link._settle_auth(AniDBBannedError("banned"))
+
+    def test_a_latched_failure_stops_a_new_attempt_from_starting(self, server, make_link):
+        """The latch is read under the lock before any attempt begins.
+
+        Read outside it, the window between "not fatal" and "start sending" is
+        one where a refusal recorded by the listener is missed and the credentials
+        AniDB just rejected go out again.
+        """
+        link = make_link(server)
+        link._auth_fatal = AniDBAuthFailedError("refused")
+
+        link._reauthenticate()
+
+        assert link._auth_attempt is None, "a fatal refusal must not start another handshake"
+        assert not link._authenticating.is_set()
+        assert server.requests_for("AUTH") == []
 
     def test_decrypting_with_no_cipher_is_a_value_error(self, server, make_link):
         """ValueError specifically. run() suppresses exactly that and falls back to
