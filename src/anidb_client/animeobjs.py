@@ -122,6 +122,33 @@ def _relation_rows(paired: Iterable[tuple[str, str]]) -> list[AnimeRelationTable
     return rows
 
 
+def _expanded_epno(epno: str) -> list[str]:
+    """Expand a ranged episode number: "5-7" becomes ["5", "6", "7"].
+
+    How AniDB records one file covering several episodes, and the one part of a
+    file's episode set that is derived from the cache alone. Kept here rather than
+    inside `multiep` because the mylist *removal* path needs this much and no more:
+    it must expand a range, and it must not consult the filename the way the
+    property may (#12).
+
+    Strings, like every other route to an episode set -- containment and both mylist
+    loops compare against `Episode.episode_number`, which is text.
+
+    A range whose endpoints are not both numbers is answered as the single episode
+    number it came in as, which is what the removal path already did with it. That
+    keeps a deletion path from acquiring a new way to raise on data AniDB controls,
+    where before it sent the value through untouched.
+    """
+    if "-" not in epno:
+        return [epno]
+    start, _, stop = epno.partition("-")
+    try:
+        return [str(x) for x in range(int(start), int(stop) + 1)]
+    except ValueError:
+        anidb_client.log.debug(f"Episode number {epno!r} looks like a range but does not expand; taking it as one")
+        return [epno]
+
+
 def _group_relation_rows(entries: Iterable[str]) -> list[GroupRelationTable]:
     """The same rule for a GROUP reply, which words its relations differently.
 
@@ -981,15 +1008,11 @@ class File(AniDBObj):
             return self._multiep
 
         if "-" in self.episode.episode_number:
-            start, stop = self.episode.episode_number.split("-")
-            # Strings, like every other branch of this property. This was a bare
-            # `range`, so a ranged file's episode numbers were ints while an
-            # ordinary file's were strings -- and `__contains__` compares against
-            # `Episode.episode_number`, which is a string, so `episode in file`
-            # answered False for every episode of exactly the files it exists to
-            # describe. The mylist add and delete loops put the same values on the
-            # wire, where they went out as ints on this branch alone.
-            self._multiep = [str(x) for x in range(int(start), int(stop) + 1)]
+            # Through _expanded_epno, which is the same expansion the removal path
+            # needs on its own -- it wants a range expanded but not the filename
+            # branch below. Sharing it is what keeps the two from drifting apart
+            # again, which is the shape of the bug in #12.
+            self._multiep = _expanded_epno(self.episode.episode_number)
             return self._multiep
 
         if self.path:
@@ -1463,7 +1486,18 @@ class File(AniDBObj):
             # skipped and the else below built MYLISTDEL with size and ed2k -- both
             # None for a generic file -- which the command rejects outright. The add
             # path already reads the public property.
-            episodes = self._multiep or [self.episode.episode_number]
+            # `_expanded_epno`, not the raw episode number: a ranged epno reached
+            # here unexpanded and sent one MYLISTDEL for "5-7", which matches no
+            # entry AniDB holds -- so the removal reported success and removed
+            # nothing, while the symmetric add loop had created three entries.
+            #
+            # And `_expanded_epno`, not the `multiep` property, which is the other
+            # half of that asymmetry and deliberately kept: the property may also
+            # adopt the episode set guessed from the filename, and a filename must
+            # not get to decide what is deleted from someone's mylist. Expanding the
+            # range is the whole of the reported defect (#12); the filename branch
+            # is a behaviour change and wants its own evidence.
+            episodes = self._multiep or _expanded_epno(self.episode.episode_number)
             for ep in episodes:
                 wait.clear()
                 req = MyListDelCommand(aid=_required(self._anime, "anime").aid, epno=ep)
