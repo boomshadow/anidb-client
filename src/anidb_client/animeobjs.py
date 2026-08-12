@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any, override
 
 import sqlalchemy
@@ -291,11 +291,10 @@ class AniDBObj:
 
             refresh_probability = self._probability_of_refresh()
 
-            sess = self._get_db_session()
-            self.db_data = sess.merge(self.db_data)
-            self.db_data.last_update_dice = datetime.datetime.now(self._timezone)
-            self._db_commit(sess)
-            self._close_db_session(sess)
+            with self._db_session() as sess:
+                self.db_data = sess.merge(self.db_data)
+                self.db_data.last_update_dice = datetime.datetime.now(self._timezone)
+                self._db_commit(sess)
 
             # randint is inclusive at both ends, so the old randint(0, 100) drew from
             # 101 values and `<= probability` fired for probability + 1 of them. A
@@ -315,6 +314,29 @@ class AniDBObj:
 
     def _get_db_session(self) -> Session:
         return anidb_client.get_session()
+
+    @contextlib.contextmanager
+    def _db_session(self) -> Iterator[Session]:
+        """Open a cache session for the duration of a block, and always close it.
+
+        Every use of a session in this module used to be two statements, an open
+        and a close, with the body between them -- and anything raising in that
+        body skipped the close and leaked the pooled connection. The surrounding
+        `except` clauses log a database error rather than propagating it (SPEC-003
+        makes cache writes best-effort), so the leak was silent, and it was worst
+        exactly where the code takes an early `return` out of the middle.
+
+        This adds only the open/close pairing. It does not commit, and it does not
+        swallow anything: the callers that must not propagate a database error
+        keep the `except` clause they already had, so what commits and what is
+        logged is unchanged. SQLAlchemy's own `Session.begin()` would commit and
+        re-raise, which is the opposite of the best-effort rule.
+        """
+        session = self._get_db_session()
+        try:
+            yield session
+        finally:
+            self._close_db_session(session)
 
     def _db_commit(self, session: Session) -> None:
         try:
@@ -379,11 +401,8 @@ class AniDBObj:
                 # a copy for the read. Anime's own `relations` property recovers the
                 # same way; this is that recovery for every other class, which
                 # previously could not get this far to need it.
-                sess = self._get_db_session()
-                try:
+                with self._db_session() as sess:
                     relations = list(sess.merge(db_data).relations)
-                finally:
-                    self._close_db_session(sess)
             if relations is None or isinstance(relations, list):
                 return relations
             return relations()
@@ -427,13 +446,11 @@ class Anime(AniDBObj):
             probability -= 10
         return max(probability, 0)
 
-    def _get_db_data(self, close: bool = True) -> None:
-        sess = self._get_db_session()
-        res = sess.query(AnimeTable).filter_by(aid=self.aid).all()
-        if len(res) > 0:
-            self.db_data = res[0]
-        if close:
-            self._close_db_session(sess)
+    def _get_db_data(self) -> None:
+        with self._db_session() as sess:
+            res = sess.query(AnimeTable).filter_by(aid=self.aid).all()
+            if len(res) > 0:
+                self.db_data = res[0]
 
     def _db_data_callback(self, res: Response) -> None:
         # "NO SUCH ANIME" carries no data lines, so this check has to come before
@@ -475,44 +492,43 @@ class Anime(AniDBObj):
                 ainfo[attr] = anidb_client.mapper.anime_map_a_converters[attr](data)
 
         try:
-            sess = self._get_db_session()
-            if self.db_data:
-                self.db_data = sess.merge(self.db_data)
-                self.db_data.update(**ainfo)
-                self.db_data.updated = datetime.datetime.now(self._timezone)
-                new_relations = []
-                for r in relations:
-                    found = False
-                    for sr in self.db_data.relations:
-                        if r.related_aid == sr.related_aid:
-                            found = True
-                            sr.relation_type = r.relation_type
-                            sr.anime_pk = self.db_data.pk
-                            new_relations.append(sr)
-                    if not found:
-                        r.anime_pk = self.db_data.pk
-                        new_relations.append(r)
-                for r in self.db_data.relations:
-                    if r not in new_relations:
-                        sess.delete(r)
-                self.db_data.relations = new_relations
-            else:
-                new = AnimeTable(**ainfo)
-                # Through the row's own update() helper: these columns are declared in the
-                # legacy Column() style (see db.py's Base), so assigning to them directly is
-                # opaque to a type checker in a way setattr is not.
-                new.update(
-                    updated=datetime.datetime.now(self._timezone),
-                    last_update_dice=datetime.datetime.now(self._timezone),
-                )
-                new.relations = relations
-                # commit to sql database
-                sess.add(new)
+            with self._db_session() as sess:
+                if self.db_data:
+                    self.db_data = sess.merge(self.db_data)
+                    self.db_data.update(**ainfo)
+                    self.db_data.updated = datetime.datetime.now(self._timezone)
+                    new_relations = []
+                    for r in relations:
+                        found = False
+                        for sr in self.db_data.relations:
+                            if r.related_aid == sr.related_aid:
+                                found = True
+                                sr.relation_type = r.relation_type
+                                sr.anime_pk = self.db_data.pk
+                                new_relations.append(sr)
+                        if not found:
+                            r.anime_pk = self.db_data.pk
+                            new_relations.append(r)
+                    for r in self.db_data.relations:
+                        if r not in new_relations:
+                            sess.delete(r)
+                    self.db_data.relations = new_relations
+                else:
+                    new = AnimeTable(**ainfo)
+                    # Through the row's own update() helper: these columns are declared in the
+                    # legacy Column() style (see db.py's Base), so assigning to them directly is
+                    # opaque to a type checker in a way setattr is not.
+                    new.update(
+                        updated=datetime.datetime.now(self._timezone),
+                        last_update_dice=datetime.datetime.now(self._timezone),
+                    )
+                    new.relations = relations
+                    # commit to sql database
+                    sess.add(new)
 
-            if new:
-                self.db_data = new
-            self._db_commit(sess)
-            self._close_db_session(sess)
+                if new:
+                    self.db_data = new
+                self._db_commit(sess)
         except sqlalchemy.exc.OperationalError:
             anidb_client.log.error(f"Failed to update {self} in database")
         self._updated.set()
@@ -530,9 +546,8 @@ class Anime(AniDBObj):
         if self._in_mylist is not None:
             return self._in_mylist
         try:
-            sess = self._get_db_session()
-            res = sess.query(FileTable).filter(FileTable.aid == self._aid, FileTable.lid.is_not(None)).first()
-            self._close_db_session(sess)
+            with self._db_session() as sess:
+                res = sess.query(FileTable).filter(FileTable.aid == self._aid, FileTable.lid.is_not(None)).first()
             self._in_mylist = bool(res)
         except sqlalchemy.exc.OperationalError as e:
             anidb_client.log.error(f"Failed to get mylist status of {self} from database: {e}")
@@ -544,10 +559,18 @@ class Anime(AniDBObj):
         try:
             relations = [(x.relation_type, Anime(x.related_aid)) for x in self.db_data.relations]
         except sqlalchemy.orm.exc.DetachedInstanceError:
-            self._get_db_data(close=False)
-            sess = self._get_db_session()
-            relations = [(x.relation_type, Anime(x.related_aid)) for x in self.db_data.relations]
-            self._close_db_session(sess)
+            # The cached row is detached, so its lazy relationship cannot load
+            # through it. Re-attach a copy for the read, which is what __getattr__
+            # does for every class that has no `relations` property of its own.
+            #
+            # This used to be `_get_db_data(close=False)` -- a re-query on a
+            # session deliberately left open so the row stayed attached, followed
+            # by a second, unused session that was the only one closed. That is the
+            # one site here where the connection leaked on the ordinary path rather
+            # than only on an error, and `close` had no other caller.
+            with self._db_session() as sess:
+                self.db_data = sess.merge(self.db_data)
+                relations = [(x.relation_type, Anime(x.related_aid)) for x in self.db_data.relations]
         return relations
 
     def related_anime(self, exclude: Iterable[Anime] | None = None, only_in_mylist: bool = True) -> list[Anime]:
@@ -777,9 +800,8 @@ class Episode(AniDBObj):
         if self._in_mylist is not None:
             return self._in_mylist
         try:
-            sess = self._get_db_session()
-            res = sess.query(FileTable).filter(FileTable.eid == self.eid, FileTable.lid.is_not(None)).first()
-            self._close_db_session(sess)
+            with self._db_session() as sess:
+                res = sess.query(FileTable).filter(FileTable.eid == self.eid, FileTable.lid.is_not(None)).first()
             self._in_mylist = bool(res)
         except sqlalchemy.exc.OperationalError as e:
             anidb_client.log.error(f"Failed to get mylist status of {self} from database: {e}")
@@ -819,74 +841,72 @@ class Episode(AniDBObj):
         self._get_db_data()
 
     def _get_db_data(self) -> None:
-        sess = self._get_db_session()
-        if self._eid:
-            res = sess.query(EpisodeTable).filter_by(eid=self._eid).all()
-        else:
-            res = (
-                sess.query(EpisodeTable)
-                .filter(
-                    EpisodeTable.aid == _required(self._anime, "anime").aid,
-                    EpisodeTable.epno.ilike(self.episode_number),
+        with self._db_session() as sess:
+            if self._eid:
+                res = sess.query(EpisodeTable).filter_by(eid=self._eid).all()
+            else:
+                res = (
+                    sess.query(EpisodeTable)
+                    .filter(
+                        EpisodeTable.aid == _required(self._anime, "anime").aid,
+                        EpisodeTable.epno.ilike(self.episode_number),
+                    )
+                    .all()
                 )
-                .all()
-            )
-        if len(res) > 0:
-            self.db_data = res[0]
-            anidb_client.log.debug(f"Found db_data for episode: {self.db_data}")
-            if self.db_data.epno:
-                self._episode_number = self.db_data.epno
-            if not self._anime:
-                # An Anime, not the bare aid. Every other path here assigns an
-                # object, and `Episode.anime` is documented as one -- but an
-                # Episode built from an eid took this branch and got an int. The
-                # damage was silent: `self.anime.aid` in _get_ext_epid raised
-                # AttributeError, which Python turns into a __getattr__ lookup,
-                # which returns None for an unknown field. So tvdb_episode and
-                # tmdb_episode simply answered None for every eid-built Episode
-                # rather than failing.
-                self._anime = Anime(self.db_data.aid)
-        self._close_db_session(sess)
+            if len(res) > 0:
+                self.db_data = res[0]
+                anidb_client.log.debug(f"Found db_data for episode: {self.db_data}")
+                if self.db_data.epno:
+                    self._episode_number = self.db_data.epno
+                if not self._anime:
+                    # An Anime, not the bare aid. Every other path here assigns an
+                    # object, and `Episode.anime` is documented as one -- but an
+                    # Episode built from an eid took this branch and got an int. The
+                    # damage was silent: `self.anime.aid` in _get_ext_epid raised
+                    # AttributeError, which Python turns into a __getattr__ lookup,
+                    # which returns None for an unknown field. So tvdb_episode and
+                    # tmdb_episode simply answered None for every eid-built Episode
+                    # rather than failing.
+                    self._anime = Anime(self.db_data.aid)
 
     def _anidb_data_callback(self, res: Response) -> None:
         try:
-            sess = self._get_db_session()
-            if res.rescode == "340":
-                anidb_client.log.warning(f"No such episode in anidb: {self}")
-                self._illegal_object = True
-                self._updated.set()
-                return
-            einfo: dict[str, Any] = res.datalines[0]
-            new = None
-            for attr, data in einfo.items():
-                if attr == "epno":
-                    with contextlib.suppress(ValueError):
-                        einfo[attr] = str(int(data))
-                    continue
-                if attr in ("title_eng", "title_romaji", "title_kanji"):
-                    continue
-                einfo[attr] = anidb_client.mapper.episode_map_converters[attr](data)
+            with self._db_session() as sess:
+                if res.rescode == "340":
+                    anidb_client.log.warning(f"No such episode in anidb: {self}")
+                    self._illegal_object = True
+                    self._updated.set()
+                    return
+                einfo: dict[str, Any] = res.datalines[0]
+                new = None
+                for attr, data in einfo.items():
+                    if attr == "epno":
+                        with contextlib.suppress(ValueError):
+                            einfo[attr] = str(int(data))
+                        continue
+                    if attr in ("title_eng", "title_romaji", "title_kanji"):
+                        continue
+                    einfo[attr] = anidb_client.mapper.episode_map_converters[attr](data)
 
-            if self.db_data:
-                self.db_data = sess.merge(self.db_data)
-                self.db_data.update(**einfo)
-                self.db_data.updated = datetime.datetime.now(self._timezone)
-            else:
-                new = EpisodeTable(**einfo)
-                # Through the row's own update() helper: these columns are declared in the
-                # legacy Column() style (see db.py's Base), so assigning to them directly is
-                # opaque to a type checker in a way setattr is not.
-                new.update(
-                    updated=datetime.datetime.now(self._timezone),
-                    last_update_dice=datetime.datetime.now(self._timezone),
-                )
-                sess.add(new)
+                if self.db_data:
+                    self.db_data = sess.merge(self.db_data)
+                    self.db_data.update(**einfo)
+                    self.db_data.updated = datetime.datetime.now(self._timezone)
+                else:
+                    new = EpisodeTable(**einfo)
+                    # Through the row's own update() helper: these columns are declared in the
+                    # legacy Column() style (see db.py's Base), so assigning to them directly is
+                    # opaque to a type checker in a way setattr is not.
+                    new.update(
+                        updated=datetime.datetime.now(self._timezone),
+                        last_update_dice=datetime.datetime.now(self._timezone),
+                    )
+                    sess.add(new)
 
-            if new:
-                self.db_data = new
+                if new:
+                    self.db_data = new
 
-            self._db_commit(sess)
-            self._close_db_session(sess)
+                self._db_commit(sess)
         except sqlalchemy.exc.OperationalError:
             anidb_client.log.error(f"Failed to update {self} in database")
         self._updated.set()
@@ -1118,45 +1138,44 @@ class File(AniDBObj):
         self._get_db_data()
 
     def _get_db_data(self) -> None:
-        sess = self._get_db_session()
-        res = None
-        if self._fid:
-            res = sess.query(FileTable).filter_by(fid=self._fid).all()
-        elif self._lid:
-            res = sess.query(FileTable).filter_by(lid=self._lid).all()
-        elif self._path:
-            res = sess.query(FileTable).filter_by(path=self._path).all()
-            if res and res[0].size != self._size:
-                sess.delete(res[0])
-                self._db_commit(sess)
-                res = []
-            if not res:
-                res = sess.query(FileTable).filter_by(size=self._size, ed2khash=self.ed2khash).all()
-        elif _required(self._episode, "episode").eid:
-            res = (
-                sess.query(FileTable)
-                .filter_by(aid=_required(self._anime, "anime").aid, eid=_required(self._episode, "episode").eid)
-                .all()
-            )
+        with self._db_session() as sess:
+            res = None
+            if self._fid:
+                res = sess.query(FileTable).filter_by(fid=self._fid).all()
+            elif self._lid:
+                res = sess.query(FileTable).filter_by(lid=self._lid).all()
+            elif self._path:
+                res = sess.query(FileTable).filter_by(path=self._path).all()
+                if res and res[0].size != self._size:
+                    sess.delete(res[0])
+                    self._db_commit(sess)
+                    res = []
+                if not res:
+                    res = sess.query(FileTable).filter_by(size=self._size, ed2khash=self.ed2khash).all()
+            elif _required(self._episode, "episode").eid:
+                res = (
+                    sess.query(FileTable)
+                    .filter_by(aid=_required(self._anime, "anime").aid, eid=_required(self._episode, "episode").eid)
+                    .all()
+                )
+                if res and len(res) > 0:
+                    res = [x for x in res if x.lid]
             if res and len(res) > 0:
-                res = [x for x in res if x.lid]
-        if res and len(res) > 0:
-            self.db_data = res[0]
-            if self._path and self._path != self.db_data.path:
-                self.db_data.path = self._path
-            if not self.db_data.aid or not self.db_data.eid:
-                anime, episodes = self._guess_anime_ep_from_file()
-                self.db_data.aid = _required(anime, "anime").aid
-                self.db_data.eid = _required(episodes, "episodes")[0].eid
+                self.db_data = res[0]
+                if self._path and self._path != self.db_data.path:
+                    self.db_data.path = self._path
+                if not self.db_data.aid or not self.db_data.eid:
+                    anime, episodes = self._guess_anime_ep_from_file()
+                    self.db_data.aid = _required(anime, "anime").aid
+                    self.db_data.eid = _required(episodes, "episodes")[0].eid
 
-            sess.merge(self.db_data)
-            self._db_commit(sess)
-            anidb_client.log.debug(f"Found db_data for file: {self.db_data}")
-            self._is_generic = self.db_data.is_generic
-            self._part = self.db_data.part
-        if not self._anime and self.db_data and self.db_data.aid:
-            self._anime = Anime(self.db_data.aid)
-        self._close_db_session(sess)
+                sess.merge(self.db_data)
+                self._db_commit(sess)
+                anidb_client.log.debug(f"Found db_data for file: {self.db_data}")
+                self._is_generic = self.db_data.is_generic
+                self._part = self.db_data.part
+            if not self._anime and self.db_data and self.db_data.aid:
+                self._anime = Anime(self.db_data.aid)
 
     def _anidb_file_data_callback(self, res: Response) -> None:
         new = None
@@ -1280,27 +1299,26 @@ class File(AniDBObj):
                 finfo["eid"] = _required(episodes, "episodes")[0].eid
 
         try:
-            sess = self._get_db_session()
-            if self.db_data:
-                self.db_data = sess.merge(self.db_data)
-                anidb_client.log.debug(f"{self}: update {finfo}")
-                self.db_data.update(**finfo)
-                self.db_data.updated = datetime.datetime.now(self._timezone)
-            else:
-                new = FileTable(**finfo)
-                # Through the row's own update() helper: these columns are declared in the
-                # legacy Column() style (see db.py's Base), so assigning to them directly is
-                # opaque to a type checker in a way setattr is not.
-                new.update(
-                    updated=datetime.datetime.now(self._timezone),
-                    last_update_dice=datetime.datetime.now(self._timezone),
-                )
-                sess.add(new)
+            with self._db_session() as sess:
+                if self.db_data:
+                    self.db_data = sess.merge(self.db_data)
+                    anidb_client.log.debug(f"{self}: update {finfo}")
+                    self.db_data.update(**finfo)
+                    self.db_data.updated = datetime.datetime.now(self._timezone)
+                else:
+                    new = FileTable(**finfo)
+                    # Through the row's own update() helper: these columns are declared in the
+                    # legacy Column() style (see db.py's Base), so assigning to them directly is
+                    # opaque to a type checker in a way setattr is not.
+                    new.update(
+                        updated=datetime.datetime.now(self._timezone),
+                        last_update_dice=datetime.datetime.now(self._timezone),
+                    )
+                    sess.add(new)
 
-            if new:
-                self.db_data = new
-            self._db_commit(sess)
-            self._close_db_session(sess)
+                if new:
+                    self.db_data = new
+                self._db_commit(sess)
         except sqlalchemy.exc.OperationalError:
             anidb_client.log.error(f"Failed to update {self} in database")
         self._file_updated.set()
@@ -1332,18 +1350,60 @@ class File(AniDBObj):
             finfo["mylist_viewed"] = True
 
         try:
-            sess = self._get_db_session()
-            if (self.db_data and self.db_data.is_generic and finfo["gid"]) or (
-                self.db_data and not self.db_data.is_generic and finfo["fid"] != self.db_data.fid
-            ):
-                if finfo["gid"]:
-                    finfo["is_generic"] = False
-                else:
-                    finfo["is_generic"] = True
+            with self._db_session() as sess:
+                if (self.db_data and self.db_data.is_generic and finfo["gid"]) or (
+                    self.db_data and not self.db_data.is_generic and finfo["fid"] != self.db_data.fid
+                ):
+                    if finfo["gid"]:
+                        finfo["is_generic"] = False
+                    else:
+                        finfo["is_generic"] = True
 
-                # there is something in mylist; but it's not us :/
-                existing = sess.query(FileTable).filter_by(lid=finfo["lid"]).all()
-                if not existing:
+                    # there is something in mylist; but it's not us :/
+                    existing = sess.query(FileTable).filter_by(lid=finfo["lid"]).all()
+                    if not existing:
+                        new = FileTable(**finfo)
+                        # Through the row's own update() helper: these columns are declared in the
+                        # legacy Column() style (see db.py's Base), so assigning to them directly is
+                        # opaque to a type checker in a way setattr is not.
+                        new.update(
+                            updated=datetime.datetime.now(self._timezone),
+                            last_update_dice=datetime.datetime.now(self._timezone),
+                        )
+                        sess.add(new)
+                    else:
+                        obj = existing[0]
+                        # Through the row's own update() helper: these columns are declared in the
+                        # legacy Column() style (see db.py's Base), so assigning to them directly is
+                        # opaque to a type checker in a way setattr is not.
+                        obj.update(
+                            updated=datetime.datetime.now(self._timezone),
+                            last_update_dice=datetime.datetime.now(self._timezone),
+                        )
+                        obj.update(**finfo)
+                    self._db_commit(sess)
+                    self._mylist_updated.set()
+                    return
+
+                if self._path:
+                    finfo["path"] = self._path
+                    finfo["size"] = self._size
+                    finfo["ed2khash"] = self._ed2khash
+                    finfo["mtime"] = self._mtime
+
+                finfo["part"] = self._part
+
+                if finfo["gid"]:
+                    self._is_generic = False
+                else:
+                    self._is_generic = True
+                finfo["is_generic"] = self._is_generic
+                if self.db_data:
+                    anidb_client.log.debug(f"New mylist info: {finfo}")
+                    self.db_data = sess.merge(self.db_data)
+                    self.db_data.update(**finfo)
+                    self.db_data.updated = datetime.datetime.now(self._timezone)
+                else:
                     new = FileTable(**finfo)
                     # Through the row's own update() helper: these columns are declared in the
                     # legacy Column() style (see db.py's Base), so assigning to them directly is
@@ -1352,56 +1412,12 @@ class File(AniDBObj):
                         updated=datetime.datetime.now(self._timezone),
                         last_update_dice=datetime.datetime.now(self._timezone),
                     )
+                    anidb_client.log.debug(f"Adding mylist info: {finfo}")
                     sess.add(new)
-                else:
-                    obj = existing[0]
-                    # Through the row's own update() helper: these columns are declared in the
-                    # legacy Column() style (see db.py's Base), so assigning to them directly is
-                    # opaque to a type checker in a way setattr is not.
-                    obj.update(
-                        updated=datetime.datetime.now(self._timezone),
-                        last_update_dice=datetime.datetime.now(self._timezone),
-                    )
-                    obj.update(**finfo)
+
+                if new:
+                    self.db_data = new
                 self._db_commit(sess)
-                self._close_db_session(sess)
-                self._mylist_updated.set()
-                return
-
-            if self._path:
-                finfo["path"] = self._path
-                finfo["size"] = self._size
-                finfo["ed2khash"] = self._ed2khash
-                finfo["mtime"] = self._mtime
-
-            finfo["part"] = self._part
-
-            if finfo["gid"]:
-                self._is_generic = False
-            else:
-                self._is_generic = True
-            finfo["is_generic"] = self._is_generic
-            if self.db_data:
-                anidb_client.log.debug(f"New mylist info: {finfo}")
-                self.db_data = sess.merge(self.db_data)
-                self.db_data.update(**finfo)
-                self.db_data.updated = datetime.datetime.now(self._timezone)
-            else:
-                new = FileTable(**finfo)
-                # Through the row's own update() helper: these columns are declared in the
-                # legacy Column() style (see db.py's Base), so assigning to them directly is
-                # opaque to a type checker in a way setattr is not.
-                new.update(
-                    updated=datetime.datetime.now(self._timezone),
-                    last_update_dice=datetime.datetime.now(self._timezone),
-                )
-                anidb_client.log.debug(f"Adding mylist info: {finfo}")
-                sess.add(new)
-
-            if new:
-                self.db_data = new
-            self._db_commit(sess)
-            self._close_db_session(sess)
         except sqlalchemy.exc.OperationalError:
             anidb_client.log.error(f"Failed to update {self} in database")
         self._mylist_updated.set()
@@ -1507,7 +1523,6 @@ class File(AniDBObj):
             req = MyListDelCommand(size=self.size, ed2k=self.ed2khash)
             self._link().request(req, _mylistdel_callback, prio=True)
         self._lid = None
-        sess = self._get_db_session()
         finfo = {
             "mylist_state": None,
             "mylist_filestate": None,
@@ -1518,10 +1533,10 @@ class File(AniDBObj):
             "mylist_other": None,
             "lid": None,
         }
-        self.db_data = sess.merge(self.db_data)
-        self.db_data.update(**finfo)
-        self._db_commit(sess)
-        self._close_db_session(sess)
+        with self._db_session() as sess:
+            self.db_data = sess.merge(self.db_data)
+            self.db_data.update(**finfo)
+            self._db_commit(sess)
         wait.wait()
 
     def update_mylist(
@@ -1554,11 +1569,10 @@ class File(AniDBObj):
                 if entry_count > 1:
                     # More than one entry means the field was really the lid, which
                     # is the thing we actually wanted.
-                    sess = self._get_db_session()
-                    self.db_data = sess.merge(self.db_data)
-                    self.db_data.update(lid=entry_count)
-                    self._db_commit(sess)
-                    self._close_db_session(sess)
+                    with self._db_session() as sess:
+                        self.db_data = sess.merge(self.db_data)
+                        self.db_data.update(lid=entry_count)
+                        self._db_commit(sess)
             wait.set()
 
         try:
@@ -1578,10 +1592,9 @@ class File(AniDBObj):
         # Make sure this episode isn't already in mylist
         if not self.lid:
             # avoid a lookup call if we have a file in our database
-            sess = self._get_db_session()
-            res = sess.query(FileTable).filter_by(eid=self.episode.eid).all()
-            self._db_commit(sess)
-            self._close_db_session(sess)
+            with self._db_session() as sess:
+                res = sess.query(FileTable).filter_by(eid=self.episode.eid).all()
+                self._db_commit(sess)
             # `Any`: db.py declares its columns in the legacy Column() style, so a
             # read off a row is a Column[...] to a checker rather than the value.
             mylist_entries: list[Any] = [x for x in res if x.lid]
@@ -1648,25 +1661,24 @@ class File(AniDBObj):
             self._link().request(req, _mylistadd_callback, prio=True)
             wait.wait()
         if edit:
-            sess = self._get_db_session()
-            self.db_data = sess.merge(self.db_data)
-            if state:
-                self.db_data.mylist_state = state
-            if watched:
-                self.db_data.mylist_viewed = True
-                if isinstance(watched, datetime.datetime):
-                    self.db_data.mylist_viewdate = watched
+            with self._db_session() as sess:
+                self.db_data = sess.merge(self.db_data)
+                if state:
+                    self.db_data.mylist_state = state
+                if watched:
+                    self.db_data.mylist_viewed = True
+                    if isinstance(watched, datetime.datetime):
+                        self.db_data.mylist_viewdate = watched
+                    else:
+                        self.db_data.mylist_viewdate = datetime.datetime.now(self._timezone)
                 else:
-                    self.db_data.mylist_viewdate = datetime.datetime.now(self._timezone)
-            else:
-                self.db_data.mylist_viewed = False
-                self.db_data.mylist_viewdate = None
-            if source:
-                self.db_data.mylist_source = source
-            if other:
-                self.db_data.mylist_other = other
-            self._db_commit(sess)
-            self._close_db_session(sess)
+                    self.db_data.mylist_viewed = False
+                    self.db_data.mylist_viewdate = None
+                if source:
+                    self.db_data.mylist_source = source
+                if other:
+                    self.db_data.mylist_other = other
+                self._db_commit(sess)
         else:
             # Oh lord, another slowdown?
             # Sorry, since anidb doesn't return our lid and eid when adding we
@@ -1879,97 +1891,96 @@ class Group(AniDBObj):
         self._get_db_data()
 
     def _anidb_data_callback(self, res: Response) -> None:
-        sess = self._get_db_session()
-        if self.db_data:
-            self.db_data = sess.merge(self.db_data)
-
-        if res.rescode == "350":
+        with self._db_session() as sess:
             if self.db_data:
-                sess.delete(self.db_data)
-            if self._name:
-                new = GroupTable(
-                    name=self._name,
-                    short=self._name,
+                self.db_data = sess.merge(self.db_data)
+
+            if res.rescode == "350":
+                if self.db_data:
+                    sess.delete(self.db_data)
+                if self._name:
+                    new = GroupTable(
+                        name=self._name,
+                        short=self._name,
+                        updated=datetime.datetime.now(self._timezone),
+                        last_update_dice=datetime.datetime.now(self._timezone),
+                    )
+                    sess.add(new)
+            else:
+                ginfo: dict[str, Any] = res.datalines[0]
+                for attr, data in ginfo.items():
+                    if attr == "relations":
+                        relations = _group_relation_rows(data.split("'"))
+
+                        if self.db_data:
+                            new_relations = []
+                            for r in relations:
+                                found = False
+                                for sr in self.db_data.relations:
+                                    if r.related_gid == sr.related_gid:
+                                        found = True
+                                        sr.relation_type = r.relation_type
+                                        sr.group_pk = self.db_data.pk
+                                        new_relations.append(sr)
+                                if not found:
+                                    r.group_pk = self.db_data.pk
+                                    new_relations.append(r)
+                            for r in self.db_data.relations:
+                                if r not in new_relations:
+                                    sess.delete(r)
+                            relations = new_relations
+
+                        ginfo["relations"] = relations
+                    elif attr in anidb_client.mapper.group_map_converters:
+                        ginfo[attr] = anidb_client.mapper.group_map_converters[attr](data)
+
+            if self.db_data:
+                self.db_data.update(**ginfo)
+                self.db_data.updated = datetime.datetime.now(self._timezone)
+                new_relations = []
+                for r in ginfo["relations"]:
+                    found = False
+                    for sr in self.db_data.relations:
+                        if r.related_gid == sr.related_gid:
+                            found = True
+                            sr.relation_type = r.relation_type
+                            sr.group_pk = self.db_data.pk
+                            new_relations.append(sr)
+                    if not found:
+                        r.group_pk = self.db_data.pk
+                        new_relations.append(r)
+                for r in self.db_data.relations:
+                    if r not in new_relations:
+                        sess.delete(r)
+                self.db_data.relations = new_relations
+            else:
+                new = GroupTable(**ginfo)
+                # Through the row's own update() helper: these columns are declared in the
+                # legacy Column() style (see db.py's Base), so assigning to them directly is
+                # opaque to a type checker in a way setattr is not.
+                new.update(
                     updated=datetime.datetime.now(self._timezone),
                     last_update_dice=datetime.datetime.now(self._timezone),
                 )
                 sess.add(new)
-        else:
-            ginfo: dict[str, Any] = res.datalines[0]
-            for attr, data in ginfo.items():
-                if attr == "relations":
-                    relations = _group_relation_rows(data.split("'"))
+                self.db_data = new
 
-                    if self.db_data:
-                        new_relations = []
-                        for r in relations:
-                            found = False
-                            for sr in self.db_data.relations:
-                                if r.related_gid == sr.related_gid:
-                                    found = True
-                                    sr.relation_type = r.relation_type
-                                    sr.group_pk = self.db_data.pk
-                                    new_relations.append(sr)
-                            if not found:
-                                r.group_pk = self.db_data.pk
-                                new_relations.append(r)
-                        for r in self.db_data.relations:
-                            if r not in new_relations:
-                                sess.delete(r)
-                        relations = new_relations
-
-                    ginfo["relations"] = relations
-                elif attr in anidb_client.mapper.group_map_converters:
-                    ginfo[attr] = anidb_client.mapper.group_map_converters[attr](data)
-
-        if self.db_data:
-            self.db_data.update(**ginfo)
-            self.db_data.updated = datetime.datetime.now(self._timezone)
-            new_relations = []
-            for r in ginfo["relations"]:
-                found = False
-                for sr in self.db_data.relations:
-                    if r.related_gid == sr.related_gid:
-                        found = True
-                        sr.relation_type = r.relation_type
-                        sr.group_pk = self.db_data.pk
-                        new_relations.append(sr)
-                if not found:
-                    r.group_pk = self.db_data.pk
-                    new_relations.append(r)
-            for r in self.db_data.relations:
-                if r not in new_relations:
-                    sess.delete(r)
-            self.db_data.relations = new_relations
-        else:
-            new = GroupTable(**ginfo)
-            # Through the row's own update() helper: these columns are declared in the
-            # legacy Column() style (see db.py's Base), so assigning to them directly is
-            # opaque to a type checker in a way setattr is not.
-            new.update(
-                updated=datetime.datetime.now(self._timezone), last_update_dice=datetime.datetime.now(self._timezone)
-            )
-            sess.add(new)
-            self.db_data = new
-
-        self._db_commit(sess)
-        self._close_db_session(sess)
+            self._db_commit(sess)
         self._updated.set()
 
     def _get_db_data(self) -> None:
-        sess = self._get_db_session()
-        if self._gid:
-            res = sess.query(GroupTable).filter_by(gid=self._gid).all()
-        else:
-            res = (
-                sess.query(GroupTable)
-                .filter(sqlalchemy.or_(GroupTable.name.ilike(self._name), GroupTable.short.ilike(self._name)))
-                .all()
-            )
-        if len(res) > 0:
-            self.db_data = res[0]
-            anidb_client.log.debug(f"Found db_data for group: {self.db_data}")
-        self._close_db_session(sess)
+        with self._db_session() as sess:
+            if self._gid:
+                res = sess.query(GroupTable).filter_by(gid=self._gid).all()
+            else:
+                res = (
+                    sess.query(GroupTable)
+                    .filter(sqlalchemy.or_(GroupTable.name.ilike(self._name), GroupTable.short.ilike(self._name)))
+                    .all()
+                )
+            if len(res) > 0:
+                self.db_data = res[0]
+                anidb_client.log.debug(f"Found db_data for group: {self.db_data}")
 
     @override
     def _send_anidb_update_req(self, prio: bool = False) -> None:
