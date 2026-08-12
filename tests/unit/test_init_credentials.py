@@ -18,7 +18,13 @@ import anidb_client
 
 @pytest.fixture
 def clean_globals(monkeypatch):
-    """init() writes module globals; restore them regardless of what happens."""
+    """init() writes module globals; restore them regardless of what happens.
+
+    Teardown also disposes whatever engine init() left behind. That used to be a
+    line at the end of each test body, which is the same unpaired open/close the
+    library itself had: an assertion failing above it skipped the dispose and
+    leaked the pooled connections. A fixture cannot be skipped.
+    """
     for name, value in (
         ("log", logging.getLogger("anidb_client.test")),
         ("_anidb", None),
@@ -26,6 +32,13 @@ def clean_globals(monkeypatch):
         ("fanart_key", None),
     ):
         monkeypatch.setattr(anidb_client, name, value, raising=False)
+
+    yield
+
+    factory = anidb_client._sessionmaker
+    bind = factory.kw.get("bind") if factory is not None else None
+    if bind is not None:
+        bind.dispose()
 
 
 @pytest.fixture
@@ -60,13 +73,11 @@ class TestDbOnly:
 
         with anidb_client.get_session() as sess:
             assert sess is not None
-        anidb_client._sessionmaker.kw["bind"].dispose()
 
     def test_db_only_opens_no_udp_link(self, tmp_path, clean_globals, captured_link):
         anidb_client.init(f"sqlite:///{tmp_path}/cache.db", db_only=True)
 
         assert captured_link == [], "db_only must not construct a link"
-        anidb_client._sessionmaker.kw["bind"].dispose()
 
 
 class TestCredentialsRequired:
@@ -98,7 +109,6 @@ class TestCredentialsRequired:
 
         assert captured_link[0]["user"] == "u"
         assert captured_link[0]["pwd"] == "p"
-        anidb_client._sessionmaker.kw["bind"].dispose()
 
 
 class TestNetrcLookup:
@@ -112,7 +122,6 @@ class TestNetrcLookup:
 
         assert captured_link[0]["user"] == "netrcuser"
         assert captured_link[0]["pwd"] == "netrcpass"
-        anidb_client._sessionmaker.kw["bind"].dispose()
 
     def test_the_netrc_account_field_supplies_the_encryption_key(
         self, tmp_path, clean_globals, captured_link, netrc_file
@@ -121,17 +130,14 @@ class TestNetrcLookup:
         anidb_client.init(f"sqlite:///{tmp_path}/cache.db", netrc_file=netrc_file)
 
         assert captured_link[0]["api_key"] == "netrckey"
-        anidb_client._sessionmaker.kw["bind"].dispose()
 
     def test_an_explicit_api_key_beats_the_netrc_one(self, tmp_path, clean_globals, captured_link, netrc_file):
         anidb_client.init(f"sqlite:///{tmp_path}/cache.db", netrc_file=netrc_file, api_key="explicit")
 
         assert captured_link[0]["api_key"] == "explicit"
-        anidb_client._sessionmaker.kw["bind"].dispose()
 
     def test_explicit_credentials_are_not_overridden_by_netrc(self, tmp_path, clean_globals, captured_link, netrc_file):
         anidb_client.init(f"sqlite:///{tmp_path}/cache.db", netrc_file=netrc_file, api_user="u", api_pass="p")
 
         assert captured_link[0]["user"] == "u"
         assert captured_link[0]["pwd"] == "p"
-        anidb_client._sessionmaker.kw["bind"].dispose()
