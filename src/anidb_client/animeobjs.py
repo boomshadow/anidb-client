@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Iterator, Sequence
+from concurrent.futures import Future
 from typing import Any, override
 
 import sqlalchemy
@@ -58,7 +59,7 @@ from anidb_client.db import (
     GroupRelationTable,
     GroupTable,
 )
-from anidb_client.errors import AniDBError, AniDBFileError, IllegalAnimeObject
+from anidb_client.errors import AniDBCommandTimeoutError, AniDBError, AniDBFileError, IllegalAnimeObject
 from anidb_client.link import AniDBLink
 from anidb_client.responses import Response
 
@@ -193,6 +194,20 @@ class AniDBObj:
     # be typed more precisely than the row it forwards to.
     db_data: Any
 
+    # How long a blocking read waits for AniDB before giving up on it.
+    #
+    # Comfortably longer than the transport's own budget for a command that is
+    # simply going unanswered -- a few attempts at the transport timeout, plus the
+    # pacing between them -- so an ordinary slow reply is not cut short. Shorter
+    # than a ban back-off, on purpose: when the transport decides to stay quiet
+    # for half an hour, the caller is told rather than held.
+    REQUEST_TIMEOUT = 120.0
+
+    # Slack on joining the thread that does the work, over and above the wait
+    # inside it. Only large enough to cover the callback and cache write that
+    # follow the reply.
+    JOIN_GRACE = 10.0
+
     def __init__(self) -> None:
         self._anidb_link = anidb_client._anidb
         self._illegal_object = False
@@ -220,14 +235,60 @@ class AniDBObj:
             return obj.replace(tzinfo=self._timezone)
         return obj
 
+    def _await_reply(self, future: Future[Response]) -> Response:
+        """Block until the reply has been handled, or say why it never will be.
+
+        Every wait in this file used to be `Event.wait()` with no timeout, on an
+        event only a successful callback could set. When AniDB stopped answering
+        there was no callback, so there was no set, so the wait never ended: the
+        process stayed alive and idle, produced no result and no exit code, and
+        had to be killed. That is the whole of the reported incident from the
+        caller's side.
+
+        The bound here is the *caller's* patience, and it is deliberately shorter
+        than the transport's. The transport may still be backing off for half an
+        hour when this gives up -- and it should be, because backing off is what
+        keeps us welcome. What must not happen is the caller being held for that
+        long. If the command does eventually succeed its reply still lands in the
+        cache, so the wait was not wasted, merely not waited on.
+        """
+        try:
+            return future.result(timeout=self.REQUEST_TIMEOUT)
+        except TimeoutError as e:
+            # Re-raised as this library's own error: `result` raises the builtin,
+            # which tells a caller that something timed out but not that it was
+            # AniDB, and cannot be caught alongside the rest of the hierarchy.
+            raise AniDBCommandTimeoutError(f"AniDB did not answer within {self.REQUEST_TIMEOUT}s") from e
+
     def _fetch_anidb_data(self, block: bool) -> None:
         anidb_client.log.debug(f"Sending anidb request for {self}")
-        thread = threading.Thread(target=self._send_anidb_update_req, kwargs={"prio": block})
+        failure: list[BaseException] = []
+
+        def send() -> None:
+            try:
+                self._send_anidb_update_req(prio=block)
+            except BaseException as e:  # noqa: BLE001 - re-raised below on the caller's thread
+                failure.append(e)
+
+        thread = threading.Thread(target=send)
         thread.start()
-        if block:
-            thread.join()
-            if self._illegal_object:
-                raise IllegalAnimeObject(f"{self} is not a valid AniDB object")
+        if not block:
+            # Nobody is waiting, so there is nobody to raise to. The request still
+            # runs and still writes what it learns to the cache.
+            return
+        # Bounded, like everything else here. The work inside is already bounded,
+        # so exceeding this means the thread is stuck somewhere it should not be,
+        # and hanging the caller is not the way to report that.
+        thread.join(self.REQUEST_TIMEOUT + self.JOIN_GRACE)
+        if failure:
+            # Raised on the thread that asked, rather than dying unseen on the one
+            # that did the work. An exception in a thread nobody joins is reported
+            # by the interpreter at shutdown and by nothing at the time.
+            raise failure[0]
+        if thread.is_alive():
+            raise AniDBCommandTimeoutError(f"The update for {self} did not finish")
+        if self._illegal_object:
+            raise IllegalAnimeObject(f"{self} is not a valid AniDB object")
 
     def update(self, block: bool = False) -> None:
         locked = self._updating.acquire(False)
@@ -530,11 +591,17 @@ class Anime(AniDBObj):
 
     @override
     def _send_anidb_update_req(self, prio: bool = False) -> None:
-        self._updated.clear()
-        req = AnimeCommand(aid=str(self.aid), amask=anidb_client.mapper.getAnimeBitsA(anidb_client.mapper.anime_map_a))
-        self._link().request(req, self._db_data_callback, prio=prio)
-        self._updated.wait()
-        self._updating.release()
+        try:
+            self._updated.clear()
+            req = AnimeCommand(
+                aid=str(self.aid), amask=anidb_client.mapper.getAnimeBitsA(anidb_client.mapper.anime_map_a)
+            )
+            self._await_reply(self._link().request(req, self._db_data_callback, prio=prio))
+        finally:
+            # In a finally because the wait above can now raise. Released on any
+            # path out of here, or the object stays locked as "updating" for the
+            # rest of its life and every later update() silently does nothing.
+            self._updating.release()
 
     @property
     def in_mylist(self) -> bool | None:
@@ -905,14 +972,15 @@ class Episode(AniDBObj):
 
     @override
     def _send_anidb_update_req(self, prio: bool = False) -> None:
-        self._updated.clear()
-        if self._eid:
-            req = EpisodeCommand(eid=self._eid)
-        else:
-            req = EpisodeCommand(aid=_required(self._anime, "anime").aid, epno=self.episode_number)
-        self._link().request(req, self._anidb_data_callback, prio=prio)
-        self._updated.wait()
-        self._updating.release()
+        try:
+            self._updated.clear()
+            if self._eid:
+                req = EpisodeCommand(eid=self._eid)
+            else:
+                req = EpisodeCommand(aid=_required(self._anime, "anime").aid, epno=self.episode_number)
+            self._await_reply(self._link().request(req, self._anidb_data_callback, prio=prio))
+        finally:
+            self._updating.release()
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Episode):
@@ -1403,45 +1471,44 @@ class File(AniDBObj):
         # One name for both halves of this method: it sends a FILE request and then,
         # depending on what came back, a MYLIST one.
         req: Command
-        if req_file:
-            if self._fid:
-                self._file_updated.clear()
-                anidb_client.log.debug("sending file request with fid")
-                req = FileCommand(
-                    fid=self._fid,
-                    fmask=anidb_client.mapper.getFileBitsF(anidb_client.mapper.file_map_f),
-                    amask=anidb_client.mapper.getFileBitsA(["epno"]),
-                )
-                self._link().request(req, self._anidb_file_data_callback, prio=prio)
-                self._file_updated.wait()
-            elif self._size and self._path:
-                self._file_updated.clear()
-                anidb_client.log.debug("sending file request with size and hash")
-                req = FileCommand(
-                    size=self._size,
-                    ed2k=self.ed2khash,
-                    fmask=anidb_client.mapper.getFileBitsF(anidb_client.mapper.file_map_f),
-                    amask=anidb_client.mapper.getFileBitsA(["epno"]),
-                )
-                self._link().request(req, self._anidb_file_data_callback, prio=prio)
-                self._file_updated.wait()
+        try:
+            if req_file:
+                if self._fid:
+                    self._file_updated.clear()
+                    anidb_client.log.debug("sending file request with fid")
+                    req = FileCommand(
+                        fid=self._fid,
+                        fmask=anidb_client.mapper.getFileBitsF(anidb_client.mapper.file_map_f),
+                        amask=anidb_client.mapper.getFileBitsA(["epno"]),
+                    )
+                    self._await_reply(self._link().request(req, self._anidb_file_data_callback, prio=prio))
+                elif self._size and self._path:
+                    self._file_updated.clear()
+                    anidb_client.log.debug("sending file request with size and hash")
+                    req = FileCommand(
+                        size=self._size,
+                        ed2k=self.ed2khash,
+                        fmask=anidb_client.mapper.getFileBitsF(anidb_client.mapper.file_map_f),
+                        amask=anidb_client.mapper.getFileBitsA(["epno"]),
+                    )
+                    self._await_reply(self._link().request(req, self._anidb_file_data_callback, prio=prio))
 
-        # We want to send a mylist request only if explicitly asked for, or if
-        # we didn't get a fid from the File request
-        if req_mylist or not self.db_data or not self.db_data.fid:
-            if self._fid:
-                anidb_client.log.debug("fetching mylist with fid")
-                req = MyListCommand(fid=self._fid)
-            elif self._lid:
-                anidb_client.log.debug("fetching mylist with lid")
-                req = MyListCommand(lid=self._lid)
-            else:
-                anidb_client.log.debug("fetching mylist with aid and epno")
-                req = MyListCommand(aid=self.anime.aid, epno=self.episode.episode_number)
-            anidb_client.log.debug("sending mylist request")
-            self._link().request(req, self._anidb_mylist_data_callback, prio=prio)
-            self._mylist_updated.wait()
-        self._updating.release()
+            # We want to send a mylist request only if explicitly asked for, or if
+            # we didn't get a fid from the File request
+            if req_mylist or not self.db_data or not self.db_data.fid:
+                if self._fid:
+                    anidb_client.log.debug("fetching mylist with fid")
+                    req = MyListCommand(fid=self._fid)
+                elif self._lid:
+                    anidb_client.log.debug("fetching mylist with lid")
+                    req = MyListCommand(lid=self._lid)
+                else:
+                    anidb_client.log.debug("fetching mylist with aid and epno")
+                    req = MyListCommand(aid=self.anime.aid, epno=self.episode.episode_number)
+                anidb_client.log.debug("sending mylist request")
+                self._await_reply(self._link().request(req, self._anidb_mylist_data_callback, prio=prio))
+        finally:
+            self._updating.release()
 
     def __repr__(self) -> str:
         db_data = object.__getattribute__(self, "db_data")
@@ -1457,6 +1524,10 @@ class File(AniDBObj):
 
     def remove_from_mylist(self) -> None:
         wait = threading.Event()
+        # The removal still in flight when the cache is cleared below, waited on at
+        # the end. Held rather than waited on immediately so the local state is
+        # cleared whatever AniDB answers -- see the comment on that wait.
+        pending: Future[Response] | None = None
 
         def _mylistdel_callback(res: Response) -> None:
             if res.rescode == "211":
@@ -1467,10 +1538,10 @@ class File(AniDBObj):
 
         if self.db_data and self.db_data.fid:
             req = MyListDelCommand(fid=self.db_data.fid)
-            self._link().request(req, _mylistdel_callback, prio=True)
+            pending = self._link().request(req, _mylistdel_callback, prio=True)
         elif self.db_data and self.db_data.lid:
             req = MyListDelCommand(lid=self.db_data.lid)
-            self._link().request(req, _mylistdel_callback, prio=True)
+            pending = self._link().request(req, _mylistdel_callback, prio=True)
         elif self.is_generic:
             # `self.is_generic`, not `self._is_generic`. The private attribute is
             # only set when the File was constructed as generic in this process; a
@@ -1493,11 +1564,10 @@ class File(AniDBObj):
             for ep in episodes:
                 wait.clear()
                 req = MyListDelCommand(aid=_required(self._anime, "anime").aid, epno=ep)
-                self._link().request(req, _mylistdel_callback, prio=True)
-                wait.wait()
+                self._await_reply(self._link().request(req, _mylistdel_callback, prio=True))
         else:
             req = MyListDelCommand(size=self.size, ed2k=self.ed2khash)
-            self._link().request(req, _mylistdel_callback, prio=True)
+            pending = self._link().request(req, _mylistdel_callback, prio=True)
         self._lid = None
         finfo = {
             "mylist_state": None,
@@ -1513,7 +1583,8 @@ class File(AniDBObj):
             self.db_data = sess.merge(self.db_data)
             self.db_data.update(**finfo)
             self._db_commit(sess)
-        wait.wait()
+        if pending is not None:
+            self._await_reply(pending)
 
     def update_mylist(
         self,
@@ -1616,8 +1687,7 @@ class File(AniDBObj):
                     source=source,
                     other=other,
                 )
-                self._link().request(req, _mylistadd_callback, prio=True)
-                wait.wait()
+                self._await_reply(self._link().request(req, _mylistadd_callback, prio=True))
             # Already sent; nothing left for the single send below. This also stops
             # an empty episode list reaching it with req still None.
             req = None
@@ -1632,8 +1702,7 @@ class File(AniDBObj):
                 other=other,
             )
         if req is not None:
-            self._link().request(req, _mylistadd_callback, prio=True)
-            wait.wait()
+            self._await_reply(self._link().request(req, _mylistadd_callback, prio=True))
         if edit:
             with self._db_session() as sess:
                 self.db_data = sess.merge(self.db_data)
@@ -1953,11 +2022,12 @@ class Group(AniDBObj):
 
     @override
     def _send_anidb_update_req(self, prio: bool = False) -> None:
-        self._updated.clear()
-        req = GroupCommand(gid=self._gid) if self._gid else GroupCommand(gname=self._name)
-        self._link().request(req, self._anidb_data_callback, prio=prio)
-        self._updated.wait()
-        self._updating.release()
+        try:
+            self._updated.clear()
+            req = GroupCommand(gid=self._gid) if self._gid else GroupCommand(gname=self._name)
+            self._await_reply(self._link().request(req, self._anidb_data_callback, prio=prio))
+        finally:
+            self._updating.release()
 
     def __repr__(self) -> str:
         return "Group(gid='{}', name='{}')".format(
