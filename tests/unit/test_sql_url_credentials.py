@@ -40,7 +40,7 @@ def captured_url(monkeypatch):
     """Capture the URL init() hands to the database layer, and open nothing."""
     seen = []
 
-    def fake_init_db(url):
+    def fake_init_db(url, **kwargs):
         seen.append(url)
         return object()
 

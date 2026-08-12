@@ -179,6 +179,7 @@ anidb_client.init(
     db_only=False,
     client_name=None,
     client_version=None,
+    db_pool_size=10,
 )
 ```
 
@@ -189,6 +190,26 @@ the first request. Pass
 `db_only=True` to work entirely from cache without opening a UDP session, and
 `client_name`/`client_version` to authenticate as your own
 [registered client](#registering-a-client-with-anidb).
+
+`db_pool_size` bounds the connection pool the cache uses. The default suits a
+client of this library; raise or lower it if your application knows better. The
+pool is deliberately not unlimited — an unbounded one lets a connection leak
+consume your database server's connection slots, or your process's file
+descriptors, before anything points back here.
+
+**An in-memory SQLite URL (`sqlite://` or `sqlite:///:memory:`) is only allowed
+with `db_only=True`.** Outside cache-only mode this library runs a thread per API
+reply, each with its own connection — and every connection to an in-memory
+database is a *separate* database, so those threads would find one with no tables
+in it. `init()` refuses such a URL rather than appearing to work.
+
+**A SQLite cache is put into [WAL mode](https://www.sqlite.org/wal.html)**, so
+that a write does not lock out readers. This creates `-wal` and `-shm` files
+beside your database file. WAL does not work over a network filesystem, and the
+request is not fatal when it is refused: if SQLite answers with some other mode,
+the cache runs in that mode and logs which one it is; if the request fails
+outright, the cache keeps whatever mode it had and logs that WAL was not granted.
+Foreign keys are enforced on every SQLite connection.
 
 ## Reference
 
