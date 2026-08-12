@@ -21,7 +21,7 @@ import socket
 import threading
 import zlib
 from collections import deque
-from time import sleep, time
+from time import monotonic, sleep
 
 from Crypto.Cipher import AES
 
@@ -77,6 +77,11 @@ class AniDBLink(threading.Thread):
         self._stop = threading.Event()
         self._authed = threading.Event()
         self._authenticating = threading.Event()
+        # Guards the authentication state as a set: the two events above, the
+        # session key, and the listener's cipher. Every holder releases it before
+        # calling out, so a plain Lock suffices -- but that is a property of the
+        # current call graph, and set_banned -> reauthenticate -> _reauthenticate
+        # each take it in turn, which is close enough to nesting to be worth saying.
         self._auth_lock = threading.Lock()
         self._session = None
 
@@ -95,13 +100,13 @@ class AniDBLink(threading.Thread):
 
     def _encryption_handler(self, resp):
         self._session_key = hashlib.md5(bytes(self._api_key + resp.attrs["salt"], "utf-8")).digest()
-        self._listener._cipher = AES.new(self._session_key, AES.MODE_ECB)
+        self._listener.cipher = AES.new(self._session_key, AES.MODE_ECB)
         anidb_client.log.info("Encrypted session established")
         self._rate_limiter.clear_ban()
         self._send_auth()
 
     def _send_auth(self):
-        if self._api_key and not self._listener._cipher:
+        if self._api_key and not self._listener.cipher:
             anidb_client.log.error("Tried to do unencrypted auth but API Key is set!")
             return
         req = anidb_client.commands.AuthCommand(
@@ -131,7 +136,7 @@ class AniDBLink(threading.Thread):
         with self._auth_lock:
             self._authed.set()
             self._authenticating.clear()
-        anidb_client.log.info(f"Logged in to AniDB with session {self._session}")
+        anidb_client.log.info(f"Logged in to AniDB with session {self.session}")
 
     def _new_tag(self):
         """Return the next correlation tag, cycling T001..T999.
@@ -186,20 +191,26 @@ class AniDBLink(threading.Thread):
         if not self._listener.is_alive() or self._listener.sock is None:
             anidb_client.log.error("Listener has died; aborting")
             raise AniDBInternalError("Listener has died")
-        if not self._session and command.command not in ("AUTH", "PING", "ENCRYPT"):
+        # Read once and reused below. Testing `self._session` here and reading it
+        # again at authorize() let the listener thread clear the session in between,
+        # so a command could pass this check and then be authorized with None.
+        session = self.session
+        if not session and command.command not in ("AUTH", "PING", "ENCRYPT"):
             raise AniDBMustAuthError(f"You must be authed to execute command {command.command}")
         if command.command == "AUTH" and self._authed.is_set():
             anidb_client.log.warning("Attempted double auth; ignoring")
             return
-        elif command.command == "ENCRYPT" and self._listener._cipher:
+        elif command.command == "ENCRYPT" and self._listener.cipher:
             anidb_client.log.warning("Attempted double encrypt command; ignoring")
             return
-        command.authorize(self._session)
+        command.authorize(session)
         self._rate_limiter.record_send()
-        command.started = time()
+        command.started = monotonic()
         data = command.raw_data().encode("utf-8")
-        if self._listener._cipher:
-            data = self._listener.encrypt(data)
+        # One read, handed to encrypt() so the test and the use cannot disagree.
+        cipher = self._listener.cipher
+        if cipher:
+            data = self._listener.encrypt(data, cipher)
 
         if command.command == "AUTH":
             anidb_client.log.debug("NetIO > AUTH data is not logged!")
@@ -233,13 +244,30 @@ class AniDBLink(threading.Thread):
         else:
             self._queue.appendleft(command)
 
+    @property
+    def session(self):
+        """The current session key, or None.
+
+        Read through the lock because it is written by the listener thread (on a
+        successful AUTH, and cleared on a lost session) and read by the sender
+        thread on every command. Callers that both test it and use it must read it
+        once through here rather than touching `_session` twice.
+        """
+        with self._auth_lock:
+            return self._session
+
     def set_session(self, session):
-        self._session = session
+        with self._auth_lock:
+            self._session = session
 
     def reauthenticate(self):
-        self._authed.clear()
-        self._session = None
-        self._listener._cipher = None
+        # One critical section: a half-cleared state -- session gone but cipher
+        # still set, or the reverse -- is a command encrypted with a key the server
+        # has forgotten, or an unencrypted command on a session that requires one.
+        with self._auth_lock:
+            self._authed.clear()
+            self._session = None
+            self._listener.cipher = None
         self._reauthenticate()
 
     def stop(self):
@@ -266,8 +294,12 @@ class AniDBListener(threading.Thread):
         self.timeout = timeout
         self.sock = self._connect_socket(myport, self.timeout)
         self._sender = sender
+        # Written by whichever thread completes an ENCRYPT or drops the session,
+        # read by this thread on every packet. Behind an accessor rather than being
+        # reached into from AniDBLink, which is what it was.
+        self._cipher_lock = threading.Lock()
         self._cipher = None
-        self._last_receive = time()
+        self._last_receive = monotonic()
         self._stopping = threading.Event()
 
         self.cmd_queue = {}
@@ -281,6 +313,16 @@ class AniDBListener(threading.Thread):
 
         self.daemon = True
         self.start()
+
+    @property
+    def cipher(self):
+        with self._cipher_lock:
+            return self._cipher
+
+    @cipher.setter
+    def cipher(self, value):
+        with self._cipher_lock:
+            self._cipher = value
 
     def queue_command(self, command):
         """Register a command so its reply can be matched back to it."""
@@ -313,11 +355,17 @@ class AniDBListener(threading.Thread):
             self.sock.close()
             self.sock = None
 
-    def encrypt(self, data):
+    def encrypt(self, data, cipher):
+        # The cipher is passed in rather than read here, so the caller's `if cipher`
+        # test and this use are the same read. Reading it again would let the
+        # session drop in between -- and unlike the receive path, which can suppress
+        # the failure and treat the packet as plaintext, there is nothing sensible to
+        # do about it here except end the sender thread. So the race is removed
+        # rather than handled.
         pad_len = 16 - len(data) % 16
         padding = (chr(pad_len) * pad_len).encode("utf-8")
         data = data + padding
-        return self._cipher.encrypt(data)
+        return cipher.encrypt(data)
 
     def decrypt(self, data):
         """Decrypt one packet, raising ValueError if it is not an encrypted reply.
@@ -329,9 +377,16 @@ class AniDBListener(threading.Thread):
         thread, and a listener that has stopped reading the socket is a permanent
         hang for every caller waiting on a reply.
         """
+        # ValueError rather than an AttributeError on None: run() suppresses exactly
+        # ValueError and falls back to reading the packet as plaintext, which is what
+        # a packet arriving after the session dropped actually is. An AttributeError
+        # would escape and end the listener thread.
+        cipher = self.cipher
+        if cipher is None:
+            raise ValueError("No cipher established; packet cannot be an encrypted reply")
         if not data:
             raise ValueError("Empty packet cannot be decrypted")
-        data = self._cipher.decrypt(data)
+        data = cipher.decrypt(data)
         # PKCS#5: the final byte gives the padding length, and the padding is that
         # byte repeated. Neither holds for a plaintext packet whose length happens
         # to be a multiple of the block size -- which was previously truncated by
@@ -367,7 +422,7 @@ class AniDBListener(threading.Thread):
                     return
                 continue
             anidb_client.log.debug(f"NetIO < {repr(data)}")
-            if self._cipher:
+            if self.cipher:
                 with contextlib.suppress(ValueError):
                     data = self.decrypt(data)
             # A reply prefixed with two zero bytes is deflated (the AUTH comp=1
@@ -398,7 +453,7 @@ class AniDBListener(threading.Thread):
                     # that thread -- so the listener died silently and every
                     # later command timed out with no indication why.
                     anidb_client.log.error(f"Unparsable response from API: {repr(data)}")
-                    self._last_receive = time()
+                    self._last_receive = monotonic()
                     continue
                 reason = resp.resstr
                 if code in (600, 601, 602, 604):
@@ -417,7 +472,7 @@ class AniDBListener(threading.Thread):
                     # do not recognise is worth shouting about, but it is not worth
                     # killing the caller's process over.
                     anidb_client.log.error(f"Unhandled response from API: {repr(data)}")
-                self._last_receive = time()
+                self._last_receive = monotonic()
                 continue
             resp = resp.resolve(cmd)
             resp.parse()
@@ -430,12 +485,12 @@ class AniDBListener(threading.Thread):
                     anidb_client.log.warning("Lost session with AniDB; attempting to reauthenticate")
                     self._sender.reauthenticate()
                     self._sender.request(cmd, cmd.callback, prio=True)
-                self._last_receive = time()
+                self._last_receive = monotonic()
                 continue
             elif resp.rescode in ("203", "500", "503"):
                 self.stop()
 
-            self._last_receive = time()
+            self._last_receive = monotonic()
             resp_thread = threading.Thread(target=resp.handle)
             resp_thread.daemon = True
             resp_thread.start()
@@ -443,12 +498,12 @@ class AniDBListener(threading.Thread):
     def _handle_timeouts(self):
         willpop = []
         cmd = None
-        now = time()
+        now = monotonic()
         for tag, cmd in self.pending_commands():
             if not tag:
                 continue
             if cmd.started:
-                anidb_client.log.debug(f"Command {tag} started at {cmd.started} (now {time()})")
+                anidb_client.log.debug(f"Command {tag} started at {cmd.started} (now {monotonic()})")
                 if now - cmd.started > self.timeout:
                     willpop.append(tag)
 
