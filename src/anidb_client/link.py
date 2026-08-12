@@ -21,7 +21,7 @@ import socket
 import threading
 import zlib
 from collections import deque
-from time import monotonic, sleep
+from time import monotonic
 
 from Crypto.Cipher import AES
 
@@ -32,6 +32,10 @@ from anidb_client.responses import ResponseResolver
 
 
 class AniDBLink(threading.Thread):
+    # How long the sender waits on an empty queue before checking whether the
+    # session needs a keepalive.
+    IDLE_TICK = 0.2
+
     def __init__(
         self,
         user,
@@ -57,6 +61,8 @@ class AniDBLink(threading.Thread):
         self._client_version = client_version if client_version is not None else anidb_client.anidb_client_version
         self._server = (host, port)
         self._queue = deque()
+        # Guards the deque and wakes the sender when something is put on it.
+        self._queue_cv = threading.Condition()
 
         # Outbound pacing and ban back-off. See ratelimit.RateLimiter -- the policy
         # lives there so it can be read and tested without a socket.
@@ -86,6 +92,14 @@ class AniDBLink(threading.Thread):
         self._session = None
 
         self._api_key = api_key
+
+        # The listener is started here rather than from its own constructor. It
+        # reaches back into this object -- set_banned, reauthenticate, request --
+        # and every attribute above this line is one it can touch. Starting it
+        # mid-construction meant a reply arriving in that window hit an
+        # AttributeError on the listener thread and killed it, after which nothing
+        # read the socket and every caller waited on a reply that could not arrive.
+        self._listener.start()
 
         self.daemon = True
         self.start()
@@ -157,21 +171,56 @@ class AniDBLink(threading.Thread):
     def _ping_callback(self, _resp):
         anidb_client.log.debug("Successful session refresh")
 
-    def run(self):
-        # can't figure out a better way than to do a busy-wait here :/
-        while True:
-            while len(self._queue) < 1:
-                sleep(0.2)
-                time_since_cmd = self._rate_limiter.seconds_since_last_send()
-                if self._authed.is_set() and self._do_ping and time_since_cmd > self._nat_ping_interval:
-                    command = anidb_client.commands.PingCommand()
-                    self.request(command, self._ping_callback)
-                elif self._authed.is_set() and time_since_cmd >= 1800:
-                    command = anidb_client.commands.UptimeCommand()
-                    anidb_client.log.debug("Session idle for 30 minutes, sending UPTIME command")
-                    self.request(command, self._ping_callback)
+    def _enqueue(self, command, prio=False):
+        """Put a command on the send queue and wake the sender.
 
-            command = self._queue.pop()
+        Priority commands go on the end the sender pops from, so they jump the
+        line; ordinary ones go on the far end and are taken in order.
+        """
+        with self._queue_cv:
+            if prio:
+                self._queue.append(command)
+            else:
+                self._queue.appendleft(command)
+            self._queue_cv.notify()
+
+    def _take_next_command(self):
+        """The next command to send, or None if the queue stayed empty.
+
+        Was a `while len(queue) < 1: sleep(0.2)` spin. Waiting on a condition
+        instead means a queued command is picked up as soon as it is queued rather
+        than up to a tick later, and an idle client stops waking 5 times a second
+        to look at a deque. The timeout is kept because the idle keepalives below
+        are driven by it -- this is a poll for "has enough time passed", which a
+        notification cannot express.
+        """
+        with self._queue_cv:
+            if not self._queue:
+                self._queue_cv.wait(self.IDLE_TICK)
+            return self._queue.pop() if self._queue else None
+
+    def _send_idle_keepalive(self):
+        """Hold the session open while nothing else is going out.
+
+        Called on an empty queue, and outside the queue lock: both branches queue
+        a command, which needs that lock.
+        """
+        if not self._authed.is_set():
+            return
+        time_since_cmd = self._rate_limiter.seconds_since_last_send()
+        if self._do_ping and time_since_cmd > self._nat_ping_interval:
+            self.request(anidb_client.commands.PingCommand(), self._ping_callback)
+        elif time_since_cmd >= 1800:
+            anidb_client.log.debug("Session idle for 30 minutes, sending UPTIME command")
+            self.request(anidb_client.commands.UptimeCommand(), self._ping_callback)
+
+    def run(self):
+        while True:
+            command = self._take_next_command()
+            if command is None:
+                self._send_idle_keepalive()
+                continue
+
             anidb_client.log.debug(f"sending command {command.command} with tag {command.tag}")
             if self._authed.is_set() or command.command in ("AUTH", "ENCRYPT", "PING"):
                 self._send_command(command)
@@ -227,7 +276,7 @@ class AniDBLink(threading.Thread):
             # the same treatment: log it, put the command back, and back off.
             anidb_client.log.warning(f"Failed to send command {command.command}: {e}")
             if command.command not in ("AUTH", "PING", "ENCRYPT"):
-                self._queue.append(command)
+                self._enqueue(command, prio=True)
             self.set_banned(code=999, reason=b"Network unavailable")
 
     def request(self, command, callback, prio=False):
@@ -239,10 +288,7 @@ class AniDBLink(threading.Thread):
         if command.command in ("ENCRYPT", "AUTH", "PING"):
             self._send_command(command)
             return
-        if prio:
-            self._queue.append(command)
-        else:
-            self._queue.appendleft(command)
+        self._enqueue(command, prio=prio)
 
     @property
     def session(self):
@@ -311,8 +357,9 @@ class AniDBListener(threading.Thread):
         # three accessors below rather than touching the dict directly.
         self._queue_lock = threading.Lock()
 
+        # Not started here: AniDBLink starts it once its own construction is
+        # finished. See the comment at that call.
         self.daemon = True
-        self.start()
 
     @property
     def cipher(self):

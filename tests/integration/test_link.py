@@ -8,6 +8,7 @@ the ban handling that must never be provoked against the real service.
 import contextlib
 import logging
 import threading
+import time
 
 import pytest
 
@@ -448,3 +449,98 @@ class TestSharedTransportState:
 
         assert link._listener.cipher is None, "encrypt must not depend on the stored cipher"
         assert len(encrypted) % 16 == 0
+
+
+class TestListenerStartup:
+    def test_the_listener_does_not_start_itself(self, monkeypatch):
+        """It used to call self.start() from its own constructor.
+
+        The listener reaches back into AniDBLink -- set_banned, reauthenticate,
+        request -- and AniDBLink builds it partway through its own __init__, before
+        the auth lock, the events and the session attribute exist. A reply arriving
+        in that window hit an AttributeError on the listener thread and killed it,
+        after which nothing read the socket and every caller waited on a reply that
+        could no longer arrive. AniDBLink now starts it once it is fully built.
+        """
+        from anidb_client.link import AniDBListener
+
+        # Built without make_link, which is what normally installs the module
+        # logger; stop() logs on the way out.
+        monkeypatch.setattr(anidb_client, "log", logging.getLogger("anidb_client.test"), raising=False)
+
+        listener = AniDBListener(sender=None, myport=0, timeout=1)
+        try:
+            assert not listener.is_alive()
+        finally:
+            listener.stop()
+
+    def test_a_link_starts_its_listener(self, server, make_link):
+        link = make_link(server)
+
+        assert link._listener.is_alive()
+
+
+class TestSenderWakeup:
+    def test_a_queued_command_is_sent_without_waiting_for_a_poll(self, server, make_link):
+        """The sender waits to be woken rather than polling an empty queue.
+
+        Measured across several round trips, each of which leaves the sender idle
+        again before the next is queued. A polling sender costs up to IDLE_TICK per
+        command -- so this many of them would take on the order of a second and a
+        half. Being woken costs nothing, and what is left is the harness's own
+        20ms poll in `_await`.
+
+        UPTIME rather than PING: PING is sent immediately by request() and never
+        reaches the queue this test is about.
+        """
+        server.on("AUTH", AUTH_OK)
+        server.on("UPTIME", "208 34400")
+        link = make_link(server)
+        link.reauthenticate()
+        _await(lambda: link._authed.is_set(), message="never authenticated")
+
+        rounds = 15
+        started = time.monotonic()
+        for _ in range(rounds):
+            got = []
+            link.request(anidb_client.commands.UptimeCommand(), got.append)
+            # Bound explicitly: `got` is rebound each iteration, and a bare closure
+            # over it is what B023 warns about even though this one is consumed
+            # before the next pass.
+            _await(lambda pending=got: pending, message="UPTIME callback never fired")
+        elapsed = time.monotonic() - started
+
+        budget = rounds * AniDBLink.IDLE_TICK / 3
+        assert elapsed < budget, f"{rounds} round trips took {elapsed:.2f}s; a polling sender is the likely cause"
+
+
+class TestCallbackIsolation:
+    def test_a_slow_callback_does_not_stall_the_next_reply(self, server, make_link):
+        """Each reply's callback runs on its own thread.
+
+        If they ran on the receive loop, one callback that blocks would stop every
+        later reply from being read at all -- the same permanent hang as a dead
+        listener, arrived at from the other direction.
+        """
+        server.on("AUTH", AUTH_OK)
+        server.on("PING", "300 PONG")
+        link = make_link(server)
+        link.reauthenticate()
+        _await(lambda: link._authed.is_set(), message="never authenticated")
+
+        blocked = threading.Event()
+        release = threading.Event()
+        second = []
+
+        def slow(_resp):
+            blocked.set()
+            release.wait(5)
+
+        link.request(anidb_client.commands.PingCommand(), slow)
+        _await(lambda: blocked.is_set(), message="the first callback never ran")
+
+        try:
+            link.request(anidb_client.commands.PingCommand(), second.append)
+            _await(lambda: second, message="a blocked callback stalled the receive loop")
+        finally:
+            release.set()
