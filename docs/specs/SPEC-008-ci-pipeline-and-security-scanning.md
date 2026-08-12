@@ -31,7 +31,7 @@ Most jobs run on branches, merge requests and tags alike, but never on the secur
 
 **Lint** runs ruff's linter and formatter check and codespell. It additionally emits a GitLab Code Quality report so findings render inline on the merge-request diff; the report is produced unconditionally and the gating checks that follow it are what actually fail the job.
 
-**Typecheck** runs mypy under the strictness ratchet described in SPEC-007.
+**Typecheck** runs mypy under the global strictness described in SPEC-007.
 
 **Test** runs the full suite with branch coverage against a **real PostgreSQL** stood up as a GitLab service — the same image and digest `docker-compose.yml` uses, so a local run and CI talk to the same server version. Coverage and JUnit results are published to the merge request.
 
