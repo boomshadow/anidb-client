@@ -12,6 +12,7 @@ import datetime
 
 import pytest
 import sqlalchemy
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from anidb_client.db import (
@@ -89,7 +90,7 @@ class TestSchema:
     def test_init_db_returns_a_usable_session_factory(self, tmp_path):
         factory = init_db(f"sqlite:///{tmp_path}/cache.db")
         with factory() as s:
-            assert s.query(AnimeTable).count() == 0
+            assert s.scalar(select(func.count()).select_from(AnimeTable)) == 0
 
     def test_init_db_opens_in_memory_sqlite(self):
         """In-memory SQLite is the obvious choice for a caller's own test suite.
@@ -100,7 +101,7 @@ class TestSchema:
         """
         factory = init_db("sqlite://")
         with factory() as s:
-            assert s.query(AnimeTable).count() == 0
+            assert s.scalar(select(func.count()).select_from(AnimeTable)) == 0
 
 
 class TestEngineConfiguration:
@@ -135,7 +136,7 @@ class TestEngineConfiguration:
 
         factory = init_db(f"sqlite:///{tmp_path}/cache.db")
         with factory() as s:
-            assert s.query(AnimeTable).count() == 0
+            assert s.scalar(select(func.count()).select_from(AnimeTable)) == 0
         factory.kw["bind"].dispose()
 
     def test_an_in_memory_cache_keeps_the_mode_it_can_have(self):
@@ -143,7 +144,7 @@ class TestEngineConfiguration:
         factory = init_db("sqlite://")
         with factory() as s:
             assert s.connection().exec_driver_sql("PRAGMA journal_mode").scalar() == "memory"
-            assert s.query(AnimeTable).count() == 0
+            assert s.scalar(select(func.count()).select_from(AnimeTable)) == 0
 
     def test_foreign_keys_are_enforced_by_the_database(self, session):
         """Not merely declared. SQLite ignores them unless each connection opts in."""
@@ -197,7 +198,7 @@ class TestRoundTrips:
         session.add(_anime())
         session.commit()
 
-        stored = session.query(AnimeTable).one()
+        stored = session.scalars(select(AnimeTable)).one()
         assert stored.aid == 6187
         assert stored.nr_of_episodes == 50
         assert stored.type == "TV Series"
@@ -224,7 +225,7 @@ class TestRoundTrips:
             )
         )
         session.commit()
-        assert session.query(EpisodeTable).one().title_eng == "Erin and the Egg Thieves"
+        assert session.scalars(select(EpisodeTable)).one().title_eng == "Erin and the Egg Thieves"
 
     def test_episode_kanji_title_survives_a_round_trip(self, session):
         """Titles are Unicode columns; AniDB returns kanji for most series."""
@@ -242,7 +243,7 @@ class TestRoundTrips:
             )
         )
         session.commit()
-        assert session.query(EpisodeTable).one().title_kanji == "獣の奏者 エリン"
+        assert session.scalars(select(EpisodeTable)).one().title_kanji == "獣の奏者 エリン"
 
     def test_file_round_trips_with_its_mylist_state(self, session):
         session.add(
@@ -259,7 +260,7 @@ class TestRoundTrips:
         )
         session.commit()
 
-        stored = session.query(FileTable).one()
+        stored = session.scalars(select(FileTable)).one()
         assert stored.mylist_state == "on hdd"
         assert stored.size == 734003200
 
@@ -268,19 +269,19 @@ class TestRoundTrips:
         big = 8 * 1024**3
         session.add(FileTable(aid=1, eid=1, is_generic=False, size=big, last_update_dice=NOW))
         session.commit()
-        assert session.query(FileTable).one().size == big
+        assert session.scalars(select(FileTable)).one().size == big
 
     def test_group_round_trips(self, session):
         session.add(GroupTable(gid=1, name="Some Group", short="SG", last_update_dice=NOW))
         session.commit()
-        assert session.query(GroupTable).one().short == "SG"
+        assert session.scalars(select(GroupTable)).one().short == "SG"
 
 
 class TestEnumConstraints:
     def test_a_valid_mylist_state_is_accepted(self, session):
         session.add(FileTable(aid=1, eid=1, is_generic=False, mylist_state="deleted", last_update_dice=NOW))
         session.commit()
-        assert session.query(FileTable).one().mylist_state == "deleted"
+        assert session.scalars(select(FileTable)).one().mylist_state == "deleted"
 
     def test_an_out_of_range_enum_value_writes_but_cannot_be_read_back(self, session):
         """The enum is checked on the way out of the database, not on the way in.
@@ -301,15 +302,15 @@ class TestEnumConstraints:
 
         session.expunge_all()
         with pytest.raises(LookupError, match="not among the defined enum values"):
-            session.query(FileTable).one()
+            session.scalars(select(FileTable)).one()
 
     def test_a_valid_relation_type_is_accepted(self, session):
         session.add(_anime(aid=1))
         session.commit()
-        anime = session.query(AnimeTable).one()
+        anime = session.scalars(select(AnimeTable)).one()
         session.add(AnimeRelationTable(anime_pk=anime.pk, related_aid=2, relation_type="sequel"))
         session.commit()
-        assert session.query(AnimeRelationTable).one().relation_type == "sequel"
+        assert session.scalars(select(AnimeRelationTable)).one().relation_type == "sequel"
 
 
 class TestTheVocabularyIsStoredByValue:
@@ -338,7 +339,8 @@ class TestTheVocabularyIsStoredByValue:
         session.add(FileTable(aid=2, eid=2, is_generic=False, mylist_state=MylistState.ON_HDD, last_update_dice=NOW))
         session.commit()
 
-        assert [f.mylist_state for f in session.query(FileTable).order_by(FileTable.aid)] == ["on hdd", "on hdd"]
+        stored = session.scalars(select(FileTable).order_by(FileTable.aid))
+        assert [f.mylist_state for f in stored] == ["on hdd", "on hdd"]
 
     def test_a_value_read_back_is_a_member(self, session):
         """Which is what lets the converters hand members straight to the schema."""
@@ -346,7 +348,7 @@ class TestTheVocabularyIsStoredByValue:
         session.commit()
         session.expunge_all()
 
-        assert session.query(FileTable).one().mylist_state is MylistState.DELETED
+        assert session.scalars(select(FileTable)).one().mylist_state is MylistState.DELETED
 
 
 class TestRelationships:
@@ -354,19 +356,19 @@ class TestRelationships:
         """Orphaned relation rows would resurrect as phantom entries on re-fetch."""
         session.add(_anime(aid=1))
         session.commit()
-        anime = session.query(AnimeTable).one()
+        anime = session.scalars(select(AnimeTable)).one()
         session.add(AnimeRelationTable(anime_pk=anime.pk, related_aid=2, relation_type="sequel"))
         session.commit()
-        assert session.query(AnimeRelationTable).count() == 1
+        assert session.scalar(select(func.count()).select_from(AnimeRelationTable)) == 1
 
         session.delete(anime)
         session.commit()
-        assert session.query(AnimeRelationTable).count() == 0
+        assert session.scalar(select(func.count()).select_from(AnimeRelationTable)) == 0
 
     def test_anime_exposes_its_relations(self, session):
         session.add(_anime(aid=1))
         session.commit()
-        anime = session.query(AnimeTable).one()
+        anime = session.scalars(select(AnimeTable)).one()
         session.add(AnimeRelationTable(anime_pk=anime.pk, related_aid=2, relation_type="prequel"))
         session.commit()
         session.refresh(anime)
@@ -390,12 +392,12 @@ class TestUpdateHelper:
     def test_update_sets_the_given_attributes(self, session):
         session.add(_anime(aid=1))
         session.commit()
-        anime = session.query(AnimeTable).one()
+        anime = session.scalars(select(AnimeTable)).one()
 
         anime.update(nr_of_episodes=51, year="2010")
         session.commit()
 
-        stored = session.query(AnimeTable).one()
+        stored = session.scalars(select(AnimeTable)).one()
         assert (stored.nr_of_episodes, stored.year) == (51, "2010")
 
     def test_update_sets_the_given_attributes_on_an_episode(self, session):
@@ -403,34 +405,34 @@ class TestUpdateHelper:
             EpisodeTable(aid=1, eid=2, length=25, votes=0, epno="1", type="regular", updated=NOW, last_update_dice=NOW)
         )
         session.commit()
-        episode = session.query(EpisodeTable).one()
+        episode = session.scalars(select(EpisodeTable)).one()
 
         episode.update(length=24, title_eng="A Title")
         session.commit()
 
-        stored = session.query(EpisodeTable).one()
+        stored = session.scalars(select(EpisodeTable)).one()
         assert (stored.length, stored.title_eng) == (24, "A Title")
 
     def test_update_sets_the_given_attributes_on_a_file(self, session):
         session.add(FileTable(aid=1, eid=1, is_generic=False, last_update_dice=NOW))
         session.commit()
-        file = session.query(FileTable).one()
+        file = session.scalars(select(FileTable)).one()
 
         file.update(mylist_state="on hdd", mylist_viewed=True)
         session.commit()
 
-        stored = session.query(FileTable).one()
+        stored = session.scalars(select(FileTable)).one()
         assert (stored.mylist_state, stored.mylist_viewed) == ("on hdd", True)
 
     def test_update_sets_the_given_attributes_on_a_group(self, session):
         session.add(GroupTable(gid=1, name="Some Group", short="SG", last_update_dice=NOW))
         session.commit()
-        group = session.query(GroupTable).one()
+        group = session.scalars(select(GroupTable)).one()
 
         group.update(name="Renamed Group", votes=7)
         session.commit()
 
-        stored = session.query(GroupTable).one()
+        stored = session.scalars(select(GroupTable)).one()
         assert (stored.name, stored.votes) == ("Renamed Group", 7)
 
 
@@ -444,7 +446,7 @@ class TestRepr:
     def test_anime_repr(self, session):
         session.add(_anime(aid=6187))
         session.commit()
-        assert "6187" in repr(session.query(AnimeTable).one())
+        assert "6187" in repr(session.scalars(select(AnimeTable)).one())
 
     def test_episode_repr(self, session):
         ep = EpisodeTable(aid=1, eid=2, length=25, votes=0, epno="1", type="regular", updated=NOW, last_update_dice=NOW)

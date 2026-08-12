@@ -14,6 +14,7 @@ what the cache holds afterwards.
 import datetime
 
 import pytest
+from sqlalchemy import select
 
 from tests import factories
 from tests.objectlayer import FakeResponse
@@ -55,7 +56,7 @@ def generic_file(anidb, session):
     session.commit()
 
     f = anidb.File(anime=6187, episode="5")
-    f.db_data = session.query(FileTable).one()
+    f.db_data = session.scalars(select(FileTable)).one()
     f._is_generic = True
     return f
 
@@ -80,7 +81,7 @@ class TestRemoveFromMylist:
         with anidb.get_session() as check:
             from anidb_client.db import FileTable
 
-            stored = check.query(FileTable).one()
+            stored = check.scalars(select(FileTable)).one()
             assert stored.lid is None
             assert stored.mylist_state is None
             assert stored.mylist_viewed is None
@@ -138,7 +139,7 @@ class TestRemoveFromMylist:
         session.add(factories.make_file(aid=6187, eid=96480, fid=None, lid=None, is_generic=True))
         session.commit()
         ranged = anidb.File(anime=6187, episode=anidb.Episode(eid=96480))
-        ranged.db_data = session.query(FileTable).one()
+        ranged.db_data = session.scalars(select(FileTable)).one()
         ranged._is_generic = True
         assert ranged._multiep is None, "the fallback under test is only reached while this is unset"
 
@@ -170,7 +171,7 @@ class TestRemoveFromMylist:
         session.add(factories.make_file(aid=6187, eid=96461, fid=None, lid=None, is_generic=True))
         session.commit()
         f = anidb.File(path=str(path))
-        f.db_data = session.query(FileTable).one()
+        f.db_data = session.scalars(select(FileTable)).one()
         f._anime = anidb.Anime(6187)
         f._episode = anidb.Episode(eid=96461)
         f._is_generic = True
@@ -269,7 +270,7 @@ class TestUpdateMylist:
         # seeds `_multiep` from the argument, which short-circuits the property
         # this test is about.
         ranged = anidb.File(anime=6187, episode=anidb.Episode(eid=96480))
-        ranged.db_data = session.query(FileTable).one()
+        ranged.db_data = session.scalars(select(FileTable)).one()
         ranged._is_generic = True
 
         link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))
@@ -307,7 +308,7 @@ class TestUpdateMylist:
         with anidb.get_session() as check:
             from anidb_client.db import FileTable
 
-            assert check.query(FileTable).one().lid == 7788
+            assert check.scalars(select(FileTable)).one().lid == 7788
 
     def test_the_entries_field_is_preferred_over_entrycnt(self, cached_file, link, anidb):
         """Two spellings of the same field; the first one named wins, as before."""
@@ -317,7 +318,7 @@ class TestUpdateMylist:
         with anidb.get_session() as check:
             from anidb_client.db import FileTable
 
-            assert check.query(FileTable).one().lid == 4321
+            assert check.scalars(select(FileTable)).one().lid == 4321
 
     def test_a_reply_naming_neither_count_field_completes(self, cached_file, link):
         """A hang, before. The count was assigned back over `res` itself, so when
@@ -341,7 +342,7 @@ class TestUpdateMylist:
         with anidb.get_session() as check:
             from anidb_client.db import FileTable
 
-            assert check.query(FileTable).one().lid is None, "nothing to read means nothing to store"
+            assert check.scalars(select(FileTable)).one().lid is None, "nothing to read means nothing to store"
 
     def test_a_single_entry_reply_does_not_overwrite_the_lid(self, cached_file, link, anidb):
         """One entry means the number is a count, not an lid. Storing it would
@@ -352,4 +353,4 @@ class TestUpdateMylist:
         with anidb.get_session() as check:
             from anidb_client.db import FileTable
 
-            assert check.query(FileTable).one().lid is None
+            assert check.scalars(select(FileTable)).one().lid is None
