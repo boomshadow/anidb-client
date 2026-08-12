@@ -100,6 +100,11 @@ tasks:
       - "{{.RUN}} {{.UV}} python .claude/skills/spec/scripts/generate_index.py --check"
       - "{{.RUN}} {{.UV}} python .claude/skills/adr/scripts/generate_index.py --check"
 
+  schema-snapshot:
+    desc: Regenerate the DDL snapshots in tests/schema_snapshots (read the diff -- it is the schema change)
+    cmds:
+      - "{{.RUN}} {{.UV}} python -m tests.schema_snapshot"
+
   lock:
     desc: Re-resolve and update uv.lock (honours the 45-day soak)
     cmds:

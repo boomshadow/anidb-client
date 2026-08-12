@@ -26,7 +26,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from anidb_client.db import AnimeRelationTable, AnimeTable, Base, FileTable, init_db
-from tests import factories
+from tests import factories, schema_snapshot
 
 pytestmark = pytest.mark.postgres
 
@@ -54,6 +54,64 @@ def pg_session(pg_engine):
     factory = sessionmaker(bind=pg_engine, expire_on_commit=False)
     with factory() as s:
         yield s
+
+
+class TestSchemaSnapshot:
+    """The PostgreSQL half of the snapshot described in `tests/schema_snapshot.py`.
+
+    Its SQLite twin is a unit test and runs everywhere. This half lives here because
+    everything the two snapshots disagree about is a PostgreSQL-only construct --
+    `BIGINT` where SQLite takes the `with_variant` branch, and the constrained
+    vocabularies as real `CREATE TYPE` enums -- and because only here can the
+    rendering be held against a server that accepted it.
+    """
+
+    def test_the_rendered_ddl_matches_the_snapshot(self, pg_engine):
+        """Compiled through the live engine's dialect, not a bare one.
+
+        Which is the difference worth having a server for: the dialect a connected
+        engine carries knows the server's version and its psycopg2 driver, so this
+        is the DDL PostgreSQL was actually sent rather than the DDL the dialect
+        module renders in the abstract.
+        """
+        actual = schema_snapshot.render_schema(pg_engine.dialect)
+        difference = schema_snapshot.diff_against_snapshot("postgresql", actual)
+        assert not difference, (
+            "The PostgreSQL schema no longer matches its snapshot.\n\n"
+            f"{difference}\n"
+            "If the change was intended, run `task schema-snapshot` and commit the "
+            "result -- and say in the commit message why the schema changed, since "
+            "the cache has no migration story and every user rebuilds."
+        )
+
+    def test_the_server_holds_every_vocabulary_the_snapshot_declares(self, pg_engine):
+        """Closes the loop between what is rendered and what was created.
+
+        The snapshot pins the `CREATE TYPE` statements, but a statement is only a
+        claim until a server executes it. This reads the labels back out of
+        `pg_enum` -- in `enumsortorder`, which is the stored order and part of the
+        type's identity -- for every vocabulary, not just the one
+        TestNativeEnums samples.
+        """
+        expected = {
+            str(column.type.name): [str(m.value) for m in column.type.enum_class]
+            for table in Base.metadata.sorted_tables
+            for column in table.columns
+            if isinstance(column.type, sqlalchemy.Enum)
+        }
+        with pg_engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT typname, enumlabel FROM pg_enum "
+                    "JOIN pg_type ON pg_type.oid = pg_enum.enumtypid "
+                    "ORDER BY typname, enumsortorder"
+                )
+            )
+            actual: dict[str, list[str]] = {}
+            for typname, label in rows:
+                actual.setdefault(typname, []).append(label)
+
+        assert {name: actual.get(name) for name in expected} == expected
 
 
 class TestNativeEnums:
