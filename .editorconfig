@@ -26,6 +26,13 @@ indent_style = space
 indent_size = 4
 indent_style = space
 
+# The generated DDL snapshots (tests/schema_snapshots). SQLAlchemy renders with a
+# tab and a trailing space per column; the generator normalises both to this, so an
+# editor opening one of these files does not rewrite it into a test failure.
+[*.sql]
+indent_size = 4
+indent_style = space
+
 # Fixture data captured from the AniDB wire protocol is byte-significant: trailing
 # whitespace and final newlines are part of the payload being asserted against.
 [tests/fixtures/**]
