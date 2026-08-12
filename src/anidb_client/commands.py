@@ -19,19 +19,14 @@ from anidb_client.errors import AniDBIncorrectParameterError
 
 
 class Command:
-    queue = {None: None}
-
     def __init__(self, command, **parameters):
         self.command = command
         self.parameters = parameters
-        self.db = None
         self.raw = self.flatten(command, parameters)
-        self.fresh_cache = False
-        self.cached = False
         self.retries = 2
 
     def __repr__(self):
-        return f"Command({repr(self.tag)},{repr(self.command)}) {repr(self.parameters)}\n{self.raw_data()}\n"
+        return f"Command({self.tag!r},{self.command!r}) {self.parameters!r}\n{self.raw_data()}\n"
 
     def authorize(self, session):
         self.session = session
@@ -82,7 +77,7 @@ class AuthCommand(Command):
             "enc": enc,
             "mtu": mtu,
         }
-        Command.__init__(self, "AUTH", **parameters)
+        super().__init__("AUTH", **parameters)
 
     def handle_timeout(self, link):
         link.set_banned(code=604, reason=b"API not responding")
@@ -90,20 +85,20 @@ class AuthCommand(Command):
 
 class LogoutCommand(Command):
     def __init__(self):
-        Command.__init__(self, "LOGOUT")
+        super().__init__("LOGOUT")
 
 
 # third run (at the same time as second)
 class PushCommand(Command):
     def __init__(self, notify, msg, buddy=None):
         parameters = {"notify": notify, "msg": msg, "buddy": buddy}
-        Command.__init__(self, "PUSH", **parameters)
+        super().__init__("PUSH", **parameters)
 
 
 class PushAckCommand(Command):
     def __init__(self, nid):
         parameters = {"nid": nid}
-        Command.__init__(self, "PUSHACK", **parameters)
+        super().__init__("PUSHACK", **parameters)
 
 
 class NotifyAddCommand(Command):
@@ -111,30 +106,30 @@ class NotifyAddCommand(Command):
         if not (aid or gid) or (aid and gid):
             raise AniDBIncorrectParameterError("You must provide aid OR gid for NOTIFICATIONADD command")
         parameters = {"aid": aid, "gid": gid, "type": type, "priority": priority}
-        Command.__init__(self, "NOTIFICATIONADD", **parameters)
+        super().__init__("NOTIFICATIONADD", **parameters)
 
 
 class NotifyCommand(Command):
     def __init__(self, buddy=None):
         parameters = {"buddy": buddy}
-        Command.__init__(self, "NOTIFY", **parameters)
+        super().__init__("NOTIFY", **parameters)
 
 
 class NotifyListCommand(Command):
     def __init__(self):
-        Command.__init__(self, "NOTIFYLIST")
+        super().__init__("NOTIFYLIST")
 
 
 class NotifyGetCommand(Command):
     def __init__(self, type, id):
         parameters = {"type": type, "id": id}
-        Command.__init__(self, "NOTIFYGET", **parameters)
+        super().__init__("NOTIFYGET", **parameters)
 
 
 class NotifyAckCommand(Command):
     def __init__(self, type, id):
         parameters = {"type": type, "id": id}
-        Command.__init__(self, "NOTIFYACK", **parameters)
+        super().__init__("NOTIFYACK", **parameters)
 
 
 class BuddyAddCommand(Command):
@@ -142,37 +137,37 @@ class BuddyAddCommand(Command):
         if not (uid or uname) or (uid and uname):
             raise AniDBIncorrectParameterError("You must provide <u(id|name)> for BUDDYADD command")
         parameters = {"uid": uid, "uname": uname.lower()}
-        Command.__init__(self, "BUDDYADD", **parameters)
+        super().__init__("BUDDYADD", **parameters)
 
 
 class BuddyDelCommand(Command):
     def __init__(self, uid):
         parameters = {"uid": uid}
-        Command.__init__(self, "BUDDYDEL", **parameters)
+        super().__init__("BUDDYDEL", **parameters)
 
 
 class BuddyAcceptCommand(Command):
     def __init__(self, uid):
         parameters = {"uid": uid}
-        Command.__init__(self, "BUDDYACCEPT", **parameters)
+        super().__init__("BUDDYACCEPT", **parameters)
 
 
 class BuddyDenyCommand(Command):
     def __init__(self, uid):
         parameters = {"uid": uid}
-        Command.__init__(self, "BUDDYDENY", **parameters)
+        super().__init__("BUDDYDENY", **parameters)
 
 
 class BuddyListCommand(Command):
     def __init__(self, startat):
         parameters = {"startat": startat}
-        Command.__init__(self, "BUDDYLIST", **parameters)
+        super().__init__("BUDDYLIST", **parameters)
 
 
 class BuddyStateCommand(Command):
     def __init__(self, startat):
         parameters = {"startat": startat}
-        Command.__init__(self, "BUDDYSTATE", **parameters)
+        super().__init__("BUDDYSTATE", **parameters)
 
 
 # first run
@@ -181,7 +176,7 @@ class AnimeCommand(Command):
         if not (aid or aname):
             raise AniDBIncorrectParameterError("You must provide <a(id|name)> for ANIME command")
         parameters = {"aid": aid, "aname": aname, "amask": amask}
-        Command.__init__(self, "ANIME", **parameters)
+        super().__init__("ANIME", **parameters)
 
 
 class EpisodeCommand(Command):
@@ -189,7 +184,7 @@ class EpisodeCommand(Command):
         if not (eid or ((aname or aid) and epno)) or (aname and aid) or (eid and (aname or aid or epno)):
             raise AniDBIncorrectParameterError("You must provide <eid XOR a(id|name)+epno> for EPISODE command")
         parameters = {"eid": eid, "aid": aid, "aname": aname, "epno": epno}
-        Command.__init__(self, "EPISODE", **parameters)
+        super().__init__("EPISODE", **parameters)
 
 
 class FileCommand(Command):
@@ -206,6 +201,22 @@ class FileCommand(Command):
         fmask=None,
         amask=None,
     ):
+        # Four commands below guard their parameters with an expression of this
+        # shape, and it is worth reading once rather than four times.
+        #
+        # AniDB lets the same file be named several ways -- by its own id, by
+        # size+ed2k, by anime+group+episode -- and accepts exactly one of them.
+        # The expression says that as: one clause requiring some group to be
+        # complete, then one clause per group requiring that nothing from any
+        # *other* group was passed alongside it, then the id-versus-name pairs
+        # that are two spellings of one value.
+        #
+        # It reads badly and it is deliberately left alone. Restating it as a
+        # count of "which groups were supplied" is not faithful: MYLISTADD has a
+        # fifth path (aid + generic + epno) that shares parameters with the
+        # anime+group one, so the groups overlap and cannot simply be counted.
+        # These guards are what stop a malformed command reaching an API that
+        # bans clients, so they are changed only with a reason better than tidiness.
         if (
             not (fid or (size and ed2k) or ((aid or aname) and (gid or gname) and epno))
             or (fid and (size or ed2k or aid or aname or gid or gname or epno))
@@ -229,7 +240,7 @@ class FileCommand(Command):
             "fmask": fmask,
             "amask": amask,
         }
-        Command.__init__(self, "FILE", **parameters)
+        super().__init__("FILE", **parameters)
 
 
 class GroupCommand(Command):
@@ -237,7 +248,7 @@ class GroupCommand(Command):
         if not (gid or gname) or (gid and gname):
             raise AniDBIncorrectParameterError("You must provide <g(id|name)> for GROUP command")
         parameters = {"gid": gid, "gname": gname}
-        Command.__init__(self, "GROUP", **parameters)
+        super().__init__("GROUP", **parameters)
 
 
 class GroupstatusCommand(Command):
@@ -245,7 +256,7 @@ class GroupstatusCommand(Command):
         if not aid:
             raise AniDBIncorrectParameterError("You must provide aid for GROUPSTATUS command")
         parameters = {"aid": aid, "status": status}
-        Command.__init__(self, "GROUPSTATUS", **parameters)
+        super().__init__("GROUPSTATUS", **parameters)
 
 
 class ProducerCommand(Command):
@@ -253,7 +264,7 @@ class ProducerCommand(Command):
         if not (pid or pname) or (pid and pname):
             raise AniDBIncorrectParameterError("You must provide <p(id|name)> for PRODUCER command")
         parameters = {"pid": pid, "pname": pname}
-        Command.__init__(self, "PRODUCER", **parameters)
+        super().__init__("PRODUCER", **parameters)
 
 
 class MyListCommand(Command):
@@ -281,7 +292,7 @@ class MyListCommand(Command):
             "gname": gname,
             "epno": epno,
         }
-        Command.__init__(self, "MYLIST", **parameters)
+        super().__init__("MYLIST", **parameters)
 
 
 class MyListAddCommand(Command):
@@ -337,7 +348,7 @@ class MyListAddCommand(Command):
             "storage": storage,
             "other": other,
         }
-        Command.__init__(self, "MYLISTADD", **parameters)
+        super().__init__("MYLISTADD", **parameters)
 
 
 class MyListDelCommand(Command):
@@ -365,12 +376,12 @@ class MyListDelCommand(Command):
             "size": size,
             "ed2k": ed2k,
         }
-        Command.__init__(self, "MYLISTDEL", **parameters)
+        super().__init__("MYLISTDEL", **parameters)
 
 
 class MyListStatsCommand(Command):
     def __init__(self):
-        Command.__init__(self, "MYLISTSTATS")
+        super().__init__("MYLISTSTATS")
 
 
 class VoteCommand(Command):
@@ -378,18 +389,18 @@ class VoteCommand(Command):
         if not (id or name) or (id and name):
             raise AniDBIncorrectParameterError("You must provide <(id|name)> for VOTE command")
         parameters = {"type": type, "id": id, "name": name, "value": value, "epno": epno}
-        Command.__init__(self, "VOTE", **parameters)
+        super().__init__("VOTE", **parameters)
 
 
 class RandomAnimeCommand(Command):
     def __init__(self, type):
         parameters = {"type": type}
-        Command.__init__(self, "RANDOMANIME", **parameters)
+        super().__init__("RANDOMANIME", **parameters)
 
 
 class PingCommand(Command):
     def __init__(self):
-        Command.__init__(self, "PING")
+        super().__init__("PING")
 
 
 # second run
@@ -397,7 +408,7 @@ class EncryptCommand(Command):
     def __init__(self, user, apipassword, type):
         self.apipassword = apipassword
         parameters = {"user": user.lower(), "type": type}
-        Command.__init__(self, "ENCRYPT", **parameters)
+        super().__init__("ENCRYPT", **parameters)
 
     def handle_timeout(self, link):
         link.set_banned(code=604, reason=b"API not responding")
@@ -409,7 +420,7 @@ class EncodingCommand(Command):
         # command serialised as "ENCODING name=<class 'type'>" and ignored its
         # only parameter entirely.
         parameters = {"name": name}
-        Command.__init__(self, "ENCODING", **parameters)
+        super().__init__("ENCODING", **parameters)
 
 
 class SendMsgCommand(Command):
@@ -419,20 +430,20 @@ class SendMsgCommand(Command):
                 "Title must not be longer than 50 chars and body must not be longer than 900 chars for SENDMSG command"
             )
         parameters = {"to": to.lower(), "title": title, "body": body}
-        Command.__init__(self, "SENDMSG", **parameters)
+        super().__init__("SENDMSG", **parameters)
 
 
 class UserCommand(Command):
     def __init__(self, user):
         parameters = {"user": user}
-        Command.__init__(self, "USER", **parameters)
+        super().__init__("USER", **parameters)
 
 
 class UptimeCommand(Command):
     def __init__(self):
-        Command.__init__(self, "UPTIME")
+        super().__init__("UPTIME")
 
 
 class VersionCommand(Command):
     def __init__(self):
-        Command.__init__(self, "VERSION")
+        super().__init__("VERSION")
