@@ -360,7 +360,7 @@ class AniDBListener(threading.Thread):
             except TimeoutError:
                 self._handle_timeouts()
                 continue
-            except (OSError, AttributeError):
+            except OSError, AttributeError:
                 # AttributeError covers stop() setting self.sock to None between
                 # the loop check and the call above.
                 if self._stopping.is_set() or self.sock is None:

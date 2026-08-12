@@ -1,13 +1,13 @@
 ---
 title: "CI Pipeline and Security Scanning"
-description: "The GitLab CI pipeline for anidb-client across six stages: validate (lockfile freshness plus spec/ADR INDEX freshness), test (ruff, mypy, codespell, pytest against a real PostgreSQL service and a separate run on the oldest supported interpreter), build (the wheel and sdist that publish later uploads), security (shared ci-templates Semgrep SAST, Grype dependency scanning and the .grype.yaml exception audit, with a daily rescan schedule), drift-detection (the merge-request-only anchor-watch gate), and publish (tag-only PyPI upload over OIDC trusted publishing with a tag-versus-wheel version check). Explains why container scanning is deliberately absent."
+description: "The GitLab CI pipeline for anidb-client across six stages: validate (lockfile freshness plus spec/ADR INDEX freshness), test (ruff, mypy, codespell, pytest against a real PostgreSQL service), build (the wheel and sdist that publish later uploads), security (shared ci-templates Semgrep SAST, Grype dependency scanning and the .grype.yaml exception audit, with a daily rescan schedule), drift-detection (the merge-request-only anchor-watch gate), and publish (tag-only PyPI upload over OIDC trusted publishing with a tag-versus-wheel version check). Explains why container scanning is deliberately absent."
 status: accepted
-tags: [ci, gitlab-ci, pipeline, stages, validate, lockfile, index-freshness, lint, ruff, mypy, codespell, pytest, postgres-service, oldest-python, build, wheel, sdist, security-scanning, semgrep, sast, grype, dependency-scanning, exception-audit, ci-templates, soak, schedule, rescan, drift-detection, anchor-watch, anchored-development, publish, pypi, trusted-publishing, oidc, tags, renovate]
+tags: [ci, gitlab-ci, pipeline, stages, validate, lockfile, index-freshness, lint, ruff, mypy, codespell, pytest, postgres-service, build, wheel, sdist, security-scanning, semgrep, sast, grype, dependency-scanning, exception-audit, ci-templates, soak, schedule, rescan, drift-detection, anchor-watch, anchored-development, publish, pypi, trusted-publishing, oidc, tags, renovate]
 ---
 
 # CI Pipeline and Security Scanning
 
-The pipeline exists to make a release trustworthy: everything that reaches PyPI has been linted, typed, spell-checked, tested against a real database and on the oldest interpreter the package claims to support, scanned for known vulnerabilities, and — on the way in — checked for documentation drift. This spec describes the pipeline's behavior; `.gitlab-ci.yml` is the line of truth for how it is wired.
+The pipeline exists to make a release trustworthy: everything that reaches PyPI has been linted, typed, spell-checked, tested against a real database, scanned for known vulnerabilities, and — on the way in — checked for documentation drift. This spec describes the pipeline's behavior; `.gitlab-ci.yml` is the line of truth for how it is wired.
 
 ## Pipeline shape
 
@@ -37,7 +37,7 @@ Most jobs run on branches, merge requests and tags alike, but never on the secur
 
 That job then runs the PostgreSQL-marked tests a second time on their own. The marked tests skip silently when no server is reachable, which would make the job quietly weaker than it looks; the second run fails if they did not actually execute.
 
-**Oldest-supported interpreter.** The jobs above run on the current Python. A separate job runs the suite on the oldest interpreter the package's metadata claims to support, because without it a syntax form or stdlib call available only on newer versions would ship and break that floor.
+**There is no oldest-interpreter job.** One used to run here, because the package supported a range of interpreters and the jobs above exercised only the newest of them. The declared floor is now the same interpreter every other job already runs, so a separate job would exercise nothing the others do not. It belongs here again the day the floor and the interpreter CI runs on stop being the same thing.
 
 ## Build
 

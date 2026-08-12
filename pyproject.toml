@@ -2,7 +2,7 @@
 name = "anidb-client"
 description = "Object-oriented UDP client library for AniDB"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14.5"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "Jacob Tirey", email = "jacob@tirey.io" }]
@@ -12,9 +12,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Database :: Front-Ends",
     "Topic :: Multimedia :: Video",
@@ -92,7 +89,10 @@ packages = ["src/anidb_client"]
 include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.ruff]
-# target-version is inferred from project.requires-python (>=3.11).
+# Declared, not inferred from requires-python: this value decides which rewrites
+# UP/FURB propose and whether the formatter emits 3.14-only syntax, so it is
+# worth stating outright rather than leaving to inference.
+target-version = "py314"
 # line-length 120: roomy for modern displays while still allowing side-by-side
 # editing; E501 stays enforced as a guardrail.
 line-length = 120
@@ -103,7 +103,7 @@ select = ["E", "F", "I", "UP", "B", "C4", "SIM", "FURB"]
 ignore = []
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 files = ["src"]
 # Lenient by default, strict per module below. The codebase arrived with no
 # annotations at all, so blanket strictness would mean ~870 errors and a blanket
