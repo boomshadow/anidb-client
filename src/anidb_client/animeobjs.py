@@ -24,6 +24,7 @@ import random
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -68,7 +69,9 @@ class AniDBObj:
         self._illegal_object = False
         self._updated = threading.Event()
         self._updating = threading.Lock()
-        self._timezone = datetime.timezone(datetime.timedelta(hours=0))
+        # datetime.UTC, not a hand-built zero offset. Same object, and it says
+        # what it means.
+        self._timezone = datetime.UTC
         self.db_data = None
 
     def _to_timezoneaware(self, obj):
@@ -160,8 +163,11 @@ class AniDBObj:
             if random.randint(1, 100) <= refresh_probability:
                 self.update(block=block)
 
-    def _send_anidb_update_req(self):
-        raise Exception("Not implemented")
+    def _send_anidb_update_req(self, prio=False):
+        # NotImplementedError, not a bare Exception: `except Exception` around a
+        # call site would swallow a missing override as though it were a runtime
+        # failure. Every subclass overrides this; the signature matches theirs.
+        raise NotImplementedError
 
     def _close_db_session(self, session):
         session.close()
@@ -470,7 +476,7 @@ class Anime(AniDBObj):
             req = urllib.request.Request(url, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=anidb_client.HTTP_TIMEOUT) as f:
-                    res = json.loads(f.read())
+                    res = json.load(f)
             except urllib.error.HTTPError as e:
                 # 429 is tested before the catch-all. It used to be tested after
                 # `if e.code != 404: return []`, which 429 satisfies -- so the
@@ -525,7 +531,7 @@ class Anime(AniDBObj):
 
     def __repr__(self):
         return "Anime(title='{}', aid={})".format(
-            super(AniDBObj, self).__getattribute__("_title"), super(AniDBObj, self).__getattribute__("_aid")
+            object.__getattribute__(self, "_title"), object.__getattribute__(self, "_aid")
         )
 
 
@@ -731,9 +737,9 @@ class Episode(AniDBObj):
 
     def __repr__(self):
         return "Episode(anime={}, episode_number='{}', eid={})".format(
-            super(AniDBObj, self).__getattribute__("_anime"),
-            super(AniDBObj, self).__getattribute__("_episode_number"),
-            super(AniDBObj, self).__getattribute__("_eid"),
+            object.__getattribute__(self, "_anime"),
+            object.__getattribute__(self, "_episode_number"),
+            object.__getattribute__(self, "_eid"),
         )
 
 
@@ -1235,14 +1241,14 @@ class File(AniDBObj):
         self._updating.release()
 
     def __repr__(self):
-        db_data = super(AniDBObj, self).__getattribute__("db_data")
-        path = super(AniDBObj, self).__getattribute__("_path")
+        db_data = object.__getattribute__(self, "db_data")
+        path = object.__getattribute__(self, "_path")
         watched = db_data.mylist_viewdate if db_data else None
         filename = os.path.basename(path) if path else None
         return "File(filename='{}', episode={}, generic={}, watched={})".format(
             filename,
-            super(AniDBObj, self).__getattribute__("_episode"),
-            super(AniDBObj, self).__getattribute__("_is_generic"),
+            object.__getattribute__(self, "_episode"),
+            object.__getattribute__(self, "_is_generic"),
             watched,
         )
 
@@ -1738,5 +1744,5 @@ class Group(AniDBObj):
 
     def __repr__(self):
         return "Group(gid='{}', name='{}')".format(
-            super(AniDBObj, self).__getattribute__("_gid"), super(AniDBObj, self).__getattribute__("_name")
+            object.__getattribute__(self, "_gid"), object.__getattribute__(self, "_name")
         )
