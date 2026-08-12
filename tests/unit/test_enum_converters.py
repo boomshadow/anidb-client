@@ -18,7 +18,7 @@ import logging
 
 import pytest
 
-from anidb_client import mapper
+from anidb_client import db, mapper
 
 
 @pytest.fixture
@@ -104,6 +104,38 @@ class TestKnownCodesAreUnaffected:
 
         assert convert("") is None
         assert convert(None) is None
+
+
+VOCABULARIES = [
+    ("mylist_state_map", db.MylistState),
+    ("mylist_filestate_map", db.MylistFileState),
+    ("episode_type_map", db.EpisodeType),
+    ("anime_relation_map", db.AnimeRelationType),
+    ("group_relation_map", db.GroupRelationType),
+]
+
+
+@pytest.mark.parametrize(("table", "vocabulary"), VOCABULARIES, ids=[t for t, _ in VOCABULARIES])
+class TestTheWireTablesSelectFromTheSchemaVocabulary:
+    """The coupling this suite exists to enforce, now enforced by construction.
+
+    These five vocabularies used to be written out twice -- here as the values of
+    mapper's conversion tables, and again as bare strings in db.py's Enum()
+    columns. Nothing tied them together, so adding a value to one and not the
+    other produced a row the database rejects or a wire code converting to a
+    string no column accepts, and only at runtime.
+
+    Now mapper selects from the schema's enums rather than restating them. These
+    two assertions are cheap and they are what fails if someone puts a bare string
+    back into a table.
+    """
+
+    def test_every_mapped_value_is_a_member(self, table, vocabulary):
+        assert all(isinstance(v, vocabulary) for v in getattr(mapper, table).values())
+
+    def test_every_member_is_reachable_from_some_wire_code(self, vocabulary, table):
+        """A vocabulary entry no code maps to is dead -- either a typo or a gap."""
+        assert set(getattr(mapper, table).values()) == set(vocabulary)
 
 
 def test_every_field_named_in_a_mylist_reply_has_a_converter():

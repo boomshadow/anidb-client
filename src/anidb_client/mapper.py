@@ -17,6 +17,13 @@
 import datetime
 
 import anidb_client
+from anidb_client.db import (
+    AnimeRelationType,
+    EpisodeType,
+    GroupRelationType,
+    MylistFileState,
+    MylistState,
+)
 
 _blacklist = ("unused", "retired", "reserved", "not_implemented")
 
@@ -34,9 +41,10 @@ def _enum_converter(table, field):
     unrecognised code an expected event rather than a corrupt one. It degrades to
     None, and says so once, rather than deadlocking the caller.
 
-    Note that listing a new value in the table here is not on its own enough to
-    start storing it: the matching column in db.py constrains the same set, so a
-    genuinely new value needs a schema change alongside.
+    Admitting a genuinely new code therefore starts in db.py, not here: add the
+    member to the vocabulary, which is the schema change, and then point a wire
+    code at it in the table below. There is no way round that ordering -- these
+    tables hold members, so naming one that does not exist fails at import.
     """
 
     def convert(value):
@@ -80,19 +88,27 @@ anime_map_a_converters = {
     "parody_count": int,
 }
 
-mylist_state_map = {"0": "unknown", "1": "on hdd", "2": "on cd", "3": "deleted"}
+# AniDB's wire codes on the left, the schema's vocabulary on the right. The
+# right-hand side is db.py's -- these tables select from a vocabulary rather than
+# restating one, which is what keeps the two files from drifting apart.
+mylist_state_map = {
+    "0": MylistState.UNKNOWN,
+    "1": MylistState.ON_HDD,
+    "2": MylistState.ON_CD,
+    "3": MylistState.DELETED,
+}
 
 mylist_filestate_map = {
-    "0": "normal/original",
-    "1": "corrupted version/invalid crc",
-    "2": "self edited",
-    "10": "self ripped",
-    "11": "on dvd",
-    "12": "on vhs",
-    "13": "on tv",
-    "14": "in theaters",
-    "15": "streamed",
-    "100": "other",
+    "0": MylistFileState.NORMAL_ORIGINAL,
+    "1": MylistFileState.CORRUPTED,
+    "2": MylistFileState.SELF_EDITED,
+    "10": MylistFileState.SELF_RIPPED,
+    "11": MylistFileState.ON_DVD,
+    "12": MylistFileState.ON_VHS,
+    "13": MylistFileState.ON_TV,
+    "14": MylistFileState.IN_THEATERS,
+    "15": MylistFileState.STREAMED,
+    "100": MylistFileState.OTHER,
 }
 
 file_map_f_converters = {
@@ -116,7 +132,14 @@ file_map_f_converters = {
     "mylist_other": lambda x: x or None,
 }
 
-episode_type_map = {"1": "regular", "2": "special", "3": "credit", "4": "trailer", "5": "parody", "6": "other"}
+episode_type_map = {
+    "1": EpisodeType.REGULAR,
+    "2": EpisodeType.SPECIAL,
+    "3": EpisodeType.CREDIT,
+    "4": EpisodeType.TRAILER,
+    "5": EpisodeType.PARODY,
+    "6": EpisodeType.OTHER,
+}
 
 episode_map_converters = {
     "eid": int,
@@ -146,22 +169,24 @@ mylist_map_converters = {
     "mylist_other": lambda x: x or None,
 }
 
+# Several wire codes collapse onto one vocabulary entry -- AniDB distinguishes
+# shades of "alternative setting" that the schema does not.
 anime_relation_map = {
-    "1": "sequel",
-    "2": "prequel",
-    "11": "same setting",
-    "12": "alternative setting",
-    "21": "alternative setting",
-    "22": "alternative setting",
-    "31": "alternative version",
-    "32": "alternative version",
-    "41": "music video",
-    "42": "character",
-    "51": "side story",
-    "52": "parent story",
-    "61": "summary",
-    "62": "full story",
-    "100": "other",
+    "1": AnimeRelationType.SEQUEL,
+    "2": AnimeRelationType.PREQUEL,
+    "11": AnimeRelationType.SAME_SETTING,
+    "12": AnimeRelationType.ALTERNATIVE_SETTING,
+    "21": AnimeRelationType.ALTERNATIVE_SETTING,
+    "22": AnimeRelationType.ALTERNATIVE_SETTING,
+    "31": AnimeRelationType.ALTERNATIVE_VERSION,
+    "32": AnimeRelationType.ALTERNATIVE_VERSION,
+    "41": AnimeRelationType.MUSIC_VIDEO,
+    "42": AnimeRelationType.CHARACTER,
+    "51": AnimeRelationType.SIDE_STORY,
+    "52": AnimeRelationType.PARENT_STORY,
+    "61": AnimeRelationType.SUMMARY,
+    "62": AnimeRelationType.FULL_STORY,
+    "100": AnimeRelationType.OTHER,
 }
 
 group_map_converters = {
@@ -177,19 +202,21 @@ group_map_converters = {
     "last_activity": lambda x: datetime.datetime.fromtimestamp(int(x)) if x and int(x) else None,
 }
 
+# Codes 1-6 are the relation as seen from this group; 101-106 are the same
+# relations seen from the other end, which is why each has an inverse here.
 group_relation_map = {
-    "1": "participant in",
-    "2": "parent of",
-    "3": "lost part",
-    "4": "merged from",
-    "5": "now known as",
-    "6": "other",
-    "101": "includes",
-    "102": "child of",
-    "103": "split from",
-    "104": "merged into",
-    "105": "formerly",
-    "106": "other",
+    "1": GroupRelationType.PARTICIPANT_IN,
+    "2": GroupRelationType.PARENT_OF,
+    "3": GroupRelationType.LOST_PART,
+    "4": GroupRelationType.MERGED_FROM,
+    "5": GroupRelationType.NOW_KNOWN_AS,
+    "6": GroupRelationType.OTHER,
+    "101": GroupRelationType.INCLUDES,
+    "102": GroupRelationType.CHILD_OF,
+    "103": GroupRelationType.SPLIT_FROM,
+    "104": GroupRelationType.MERGED_INTO,
+    "105": GroupRelationType.FORMERLY,
+    "106": GroupRelationType.OTHER,
 }
 
 roman_numbering = {
@@ -402,7 +429,10 @@ def _getBitChain(attrmap, wanted):
     bit = 0
     for index, field in enumerate(attrmap):
         if field in wanted and field not in _blacklist:
-            bit = bit ^ (1 << len(attrmap) - index - 1)
+            # OR, not XOR. Each position is visited once, so the two agreed here,
+            # but XOR says "toggle" where the intent is "set" -- and it would have
+            # cleared a bit rather than setting it had a name ever repeated.
+            bit |= 1 << (len(attrmap) - index - 1)
 
     # Zero-padded to one hex digit per four fields. Formatted directly rather than
     # via hex() + lstrip("0x"): lstrip removes any leading "0" and "x" characters,
@@ -414,10 +444,8 @@ def _getBitChain(attrmap, wanted):
 
 def _getCodes(attrmap, bitChain):
     """Returns a list with the corresponding fields as set in the bitChain (hex string)"""
-    codeList = []
-    bitChain = int(bitChain, 16)
+    bits = int(bitChain, 16)
     mapLength = len(attrmap)
-    for i in reversed(range(mapLength)):
-        if bitChain & (2**i):
-            codeList.append(attrmap[mapLength - i - 1])
-    return codeList
+    # Walking the map forwards and the bits downwards is the same traversal the
+    # index arithmetic used to spell out, and yields the fields in map order.
+    return [field for index, field in enumerate(attrmap) if bits & (1 << (mapLength - index - 1))]

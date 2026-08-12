@@ -79,6 +79,28 @@ class TestNativeEnums:
                 )
             )
 
+    def test_the_native_type_carries_anidbs_wording_not_the_member_names(self, pg_engine):
+        """`CREATE TYPE ... AS ENUM ('on hdd', ...)`, not ('ON_HDD', ...).
+
+        The vocabularies are Python StrEnums, and SQLAlchemy's default is to
+        persist a Python enum by member name -- which here would put ON_HDD into
+        the type definition and leave every existing cache unreadable. The
+        `values_callable` in db.py is what prevents that, and this is the
+        assertion that notices if it is removed: a StrEnum member compares equal
+        to its value, so the round-trip tests pass either way.
+        """
+        with pg_engine.connect() as conn:
+            labels = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT enumlabel FROM pg_enum JOIN pg_type ON pg_type.oid = pg_enum.enumtypid "
+                        "WHERE typname = 'mylist_state_enum'"
+                    )
+                )
+            }
+        assert labels == {"unknown", "on hdd", "on cd", "deleted"}
+
     def test_a_valid_enum_value_round_trips(self, pg_session):
         pg_session.add(
             FileTable(

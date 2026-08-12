@@ -23,6 +23,7 @@ from anidb_client.db import (
     FileTable,
     GroupRelationTable,
     GroupTable,
+    MylistState,
     init_db,
 )
 
@@ -214,6 +215,43 @@ class TestEnumConstraints:
         session.add(AnimeRelationTable(anime_pk=anime.pk, related_aid=2, relation_type="sequel"))
         session.commit()
         assert session.query(AnimeRelationTable).one().relation_type == "sequel"
+
+
+class TestTheVocabularyIsStoredByValue:
+    """The columns hold AniDB's wording, not the enum member names.
+
+    SQLAlchemy's default for a Python enum is to persist `member.name`, which
+    would put ON_HDD on disk and in PostgreSQL's `CREATE TYPE`. `values_callable`
+    in db.py overrides that. Nothing else in the suite would notice if it were
+    dropped -- a StrEnum member compares equal to its value either way, so every
+    assertion elsewhere would still pass while the stored vocabulary silently
+    changed and every existing cache stopped reading back.
+    """
+
+    def test_the_column_holds_anidbs_wording(self, session):
+        session.add(FileTable(aid=1, eid=1, is_generic=False, mylist_state=MylistState.ON_HDD, last_update_dice=NOW))
+        session.commit()
+
+        # Straight past the ORM: this is what is actually on disk.
+        stored = session.connection().exec_driver_sql("select mylist_state from file").scalar()
+
+        assert stored == "on hdd"
+
+    def test_a_member_and_its_string_are_interchangeable_on_the_way_in(self, session):
+        """Callers hold plain strings; the schema must keep accepting them."""
+        session.add(FileTable(aid=1, eid=1, is_generic=False, mylist_state="on hdd", last_update_dice=NOW))
+        session.add(FileTable(aid=2, eid=2, is_generic=False, mylist_state=MylistState.ON_HDD, last_update_dice=NOW))
+        session.commit()
+
+        assert [f.mylist_state for f in session.query(FileTable).order_by(FileTable.aid)] == ["on hdd", "on hdd"]
+
+    def test_a_value_read_back_is_a_member(self, session):
+        """Which is what lets the converters hand members straight to the schema."""
+        session.add(FileTable(aid=1, eid=1, is_generic=False, mylist_state="deleted", last_update_dice=NOW))
+        session.commit()
+        session.expunge_all()
+
+        assert session.query(FileTable).one().mylist_state is MylistState.DELETED
 
 
 class TestRelationships:
