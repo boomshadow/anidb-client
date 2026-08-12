@@ -16,7 +16,7 @@ import pytest
 
 import anidb_client
 import anidb_client.commands
-from anidb_client.errors import AniDBAuthFailedError, AniDBBannedError
+from anidb_client.errors import AniDBAuthFailedError, AniDBBannedError, AniDBCommandTimeoutError
 from anidb_client.link import AniDBLink
 from anidb_client.ratelimit import RateLimiter
 from tests.fake_anidb import FakeAniDBServer
@@ -333,6 +333,95 @@ class TestFailedAuthentication:
             message="an unanswered encryption handshake never settled",
         )
         assert not link._authed.is_set()
+
+
+class TestCommandOutcome:
+    """Every request settles, and says which way it went.
+
+    A callback can only report success: there is no callback for a reply that
+    never arrives. So a caller could not tell "AniDB has no such anime" from "we
+    were banned and gave up", and on the second it waited on a signal nothing was
+    going to send.
+    """
+
+    def test_a_reply_settles_the_command_that_asked_for_it(self, server, make_link):
+        server.on("PING", "300 PONG")
+        link = make_link(server)
+
+        future = link.request(anidb_client.commands.PingCommand(), lambda _resp: None)
+
+        assert future.result(timeout=5).rescode == "300"
+
+    def test_the_callback_has_already_run_when_the_outcome_arrives(self, server, make_link):
+        """Ordering, not decoration.
+
+        The callback is what writes the reply into the cache. A caller released
+        before that has finished would read the cache and find the answer it was
+        just told had arrived missing from it.
+        """
+        server.on("PING", "300 PONG")
+        link = make_link(server)
+        handled = threading.Event()
+
+        def slow_callback(_resp):
+            time.sleep(0.2)
+            handled.set()
+
+        future = link.request(anidb_client.commands.PingCommand(), slow_callback)
+        future.result(timeout=5)
+
+        assert handled.is_set(), "the outcome arrived before the callback finished"
+
+    def test_a_command_that_is_never_answered_fails_its_caller(self, server, make_link):
+        """The reported hang, reduced to one command.
+
+        AniDB stops answering. The command is retried, the budget runs out, and
+        the caller is told -- rather than waiting on `_updated.wait()` for the
+        life of the process.
+        """
+        server.on("PING", lambda req: None)
+        link = make_link(server)
+
+        future = link.request(anidb_client.commands.PingCommand(), lambda _resp: None)
+
+        with pytest.raises(AniDBCommandTimeoutError):
+            future.result(timeout=20)
+
+    def test_an_unanswered_command_reaches_the_wire_a_bounded_number_of_times(self, server, make_link):
+        """What the API sees while all that is going on.
+
+        A service that bans clients for asking too often counts requests, so the
+        bound that matters is this one. It used to be unbounded: the budget was
+        restored every time it ran out.
+        """
+        server.on("PING", lambda req: None)
+        link = make_link(server)
+
+        future = link.request(anidb_client.commands.PingCommand(), lambda _resp: None)
+        with contextlib.suppress(AniDBCommandTimeoutError):
+            future.result(timeout=20)
+        threading.Event().wait(0.5)
+
+        sent = len(server.requests_for("PING"))
+        assert sent == anidb_client.commands.Command.MAX_ATTEMPTS, f"PING reached AniDB {sent} times"
+
+    def test_a_callback_that_raises_fails_the_command(self, server, make_link):
+        """A reply that arrives and is then mishandled is still no answer.
+
+        The handler ran on a thread nobody joins, so an exception in it was
+        invisible at the time and left the caller waiting on a reply that had in
+        fact arrived.
+        """
+        server.on("PING", "300 PONG")
+        link = make_link(server)
+
+        def broken(_resp):
+            raise ValueError("callback is broken")
+
+        future = link.request(anidb_client.commands.PingCommand(), broken)
+
+        with pytest.raises(ValueError, match="callback is broken"):
+            future.result(timeout=5)
 
 
 class TestListenerRobustness:

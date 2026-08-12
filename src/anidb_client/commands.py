@@ -16,9 +16,10 @@
 # along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future
 from typing import TYPE_CHECKING
 
-from anidb_client.errors import AniDBIncorrectParameterError
+from anidb_client.errors import AniDBCommandTimeoutError, AniDBIncorrectParameterError
 
 if TYPE_CHECKING:
     from anidb_client.link import AniDBLink
@@ -40,11 +41,25 @@ class Command:
     callback: Callable[[Response], None]
     started: float | None
 
+    # How many times a command may be put on the wire before the transport calls
+    # the API unavailable. This is the whole budget, not a per-round allowance
+    # that is handed back: the previous code decremented a counter, and on
+    # reaching zero backed off, *reset the counter to its starting value* and
+    # re-sent -- so a command that could never be answered was re-sent for the
+    # life of the process. Slower each round, but forever.
+    MAX_ATTEMPTS = 3
+
     def __init__(self, command: str, **parameters: CommandParameter) -> None:
         self.command = command
         self.parameters: dict[str, CommandParameter] = parameters
         self.raw = self.flatten(command, parameters)
-        self.retries = 2
+        # Sends so far. Only ever counts up.
+        self.attempts = 0
+        # This command's outcome, for whoever asked for it. A callback alone can
+        # only report success -- there is no callback for a reply that never
+        # arrives -- so a caller had no way to tell "no such anime" from "we were
+        # banned and gave up", and blocked forever on the second.
+        self.future: Future[Response] = Future()
 
     def __repr__(self) -> str:
         return f"Command({self.tag!r},{self.command!r}) {self.parameters!r}\n{self.raw_data()}\n"
@@ -60,6 +75,27 @@ class Command:
     def handle(self, resp: Response) -> None:
         self.resp = resp
         self.callback(resp)
+
+    def succeed(self, resp: Response) -> None:
+        """Report the reply to whoever is waiting on this command.
+
+        Called after the callback has run, so that a caller released by this has
+        the cache write the callback performed already visible to it.
+        """
+        if not self.future.done():
+            self.future.set_result(resp)
+
+    def fail(self, error: Exception) -> None:
+        """Report that no reply is coming.
+
+        Guarded because more than one path can reach a conclusion about the same
+        command -- a reply landing as the timeout sweep claims it, most obviously.
+        Settling twice raises InvalidStateError, and these paths run on the
+        listener thread, where an unhandled exception stops the socket being read
+        at all.
+        """
+        if not self.future.done():
+            self.future.set_exception(error)
 
     def flatten(self, command: str, parameters: Mapping[str, CommandParameter]) -> str:
         tmp = []
@@ -77,13 +113,15 @@ class Command:
         return self.raw
 
     def handle_timeout(self, link: AniDBLink) -> None:
-        if self.retries > 0:
-            self.retries -= 1
+        if self.attempts < self.MAX_ATTEMPTS:
             link.request(self, self.callback, prio=True)
-        else:
-            link.set_banned(code=604, reason=b"API not responding")
-            self.retries = 2
-            link.request(self, self.callback, prio=True)
+            return
+        # Out of attempts. Give up on this command *and* back off, in that order:
+        # backing off first would leave whoever is waiting on this command blocked
+        # for the length of the back-off before being told the answer is not
+        # coming, which is a decision already made.
+        self.fail(AniDBCommandTimeoutError(f"{self.command} went unanswered after {self.attempts} attempts"))
+        link.set_banned(code=604, reason=b"API not responding")
 
 
 # first run
