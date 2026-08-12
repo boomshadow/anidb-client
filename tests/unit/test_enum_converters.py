@@ -117,9 +117,8 @@ def test_every_field_named_in_a_mylist_reply_has_a_converter():
     """
     from anidb_client.responses import MylistResponse
 
-    response = MylistResponse.__new__(MylistResponse)
-    MylistResponse.__init__(response, cmd=None, restag=None, rescode="221", resstr="", datalines=[])
-
-    missing = [f for f in response.codetail if f != "date" and f not in mapper.mylist_map_converters]
+    # Read straight off the class. This used to need __new__ plus a hand-called
+    # __init__, because codetail was only assigned on the instance.
+    missing = [f for f in MylistResponse.codetail if f != "date" and f not in mapper.mylist_map_converters]
 
     assert not missing, f"MYLIST fields with no converter, which would hang the caller: {missing}"
