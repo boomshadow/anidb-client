@@ -73,7 +73,12 @@ anidb_api_version = 3
 # transfer, so it ends a stalled connection but not a pathologically slow one.
 HTTP_TIMEOUT = 30
 
-log = None
+# Typed as a Logger though it starts as None: init() is the only entry point to
+# this library and sets it before anything that logs can be reached, so annotating
+# it optional would put a None check on every logging call to describe a state
+# they cannot be in. mapper.py, whose converters a caller's own test can reach
+# before init(), guards explicitly and has a test for it.
+log: logging.Logger = None  # type: ignore[assignment]
 _anidb = None
 _sessionmaker = None
 fanart_key = None

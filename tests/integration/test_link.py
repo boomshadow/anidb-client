@@ -9,6 +9,7 @@ import contextlib
 import logging
 import threading
 import time
+from time import monotonic
 
 import pytest
 
@@ -234,6 +235,45 @@ class TestListenerRobustness:
 
         threading.Event().wait(0.3)
         assert link._listener.is_alive()
+
+    def test_the_timeout_sweep_survives_a_command_re_queued_while_it_ran(self, server, make_link, monkeypatch):
+        """`started` is None between a re-queue and the next send.
+
+        The sweep runs in two passes -- collect the expired tags, then pop each
+        one -- and request() sets `started` back to None. A re-queue landing in
+        that window, from the sender thread or an application thread, leaves the
+        second pass comparing None to a float. That raised TypeError on the
+        listener thread, which ends the listener; nothing then reads the socket
+        and every caller waits on a reply that can no longer arrive.
+
+        Forced here by clearing `started` inside pop_command, which is precisely
+        the interleaving: expired at collection time, re-queued by the time it is
+        claimed. A command that has not been sent has not timed out either, so it
+        belongs in the same branch as one that started before the last reply --
+        put back, not handed to handle_timeout.
+        """
+        link = make_link(server)
+        listener = link._listener
+        command = anidb_client.commands.PingCommand()
+        command.tag = "T700"
+        command.callback = lambda _resp: None
+        command.started = monotonic() - listener.timeout - 1
+        listener.queue_command(command)
+
+        real_pop = listener.pop_command
+
+        def pop_and_requeue(tag):
+            claimed = real_pop(tag)
+            if claimed is not None:
+                claimed.started = None
+            return claimed
+
+        monkeypatch.setattr(listener, "pop_command", pop_and_requeue)
+
+        listener._handle_timeouts()
+
+        assert listener.is_alive(), "listener died sweeping a command re-queued mid-sweep"
+        assert command in [cmd for _tag, cmd in listener.pending_commands()], "the re-queued command was dropped"
 
 
 class TestTagAllocation:
