@@ -121,6 +121,7 @@ enable_error_code = ["ignore-without-code"]
 [[tool.mypy.overrides]]
 module = [
     "anidb_client.db",
+    "anidb_client.anames",
     "anidb_client.commands",
     "anidb_client.errors",
     "anidb_client.fileinfo",
