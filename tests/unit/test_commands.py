@@ -26,7 +26,7 @@ from anidb_client.commands import (
     SendMsgCommand,
     VoteCommand,
 )
-from anidb_client.errors import AniDBIncorrectParameterError
+from anidb_client.errors import AniDBCommandTimeoutError, AniDBIncorrectParameterError
 
 
 class TestSerialisation:
@@ -216,47 +216,107 @@ class TestParameterValidation:
         assert SendMsgCommand("someone", "x" * 50, "y" * 900).command == "SENDMSG"
 
 
+class FakeLink:
+    """Records what a command asks the transport to do on a timeout."""
+
+    def __init__(self):
+        self.events = []
+
+    def request(self, command, callback, prio=False):
+        self.events.append(("request", prio))
+        # The real transport counts an attempt when the command reaches the
+        # socket, not when it is queued. Standing in for that here is what makes
+        # the budget in these tests the same budget the transport enforces.
+        command.attempts += 1
+        return command.future
+
+    def set_banned(self, code, reason=None):
+        self.events.append(("banned", code))
+
+
 class TestRetryPolicy:
-    def test_a_command_starts_with_two_retries(self):
-        assert PingCommand().retries == 2
+    """The budget is spent, not renewed.
 
-    def test_handle_timeout_requeues_and_decrements(self):
-        calls = []
+    The previous policy decremented a counter, and on reaching zero backed off,
+    **restored the counter** and re-sent. So a command AniDB would never answer
+    was re-sent for the life of the process -- slower each round, because the
+    back-off grew, but with no branch anywhere that stopped. A caller waiting on
+    it waited forever, which is the reported hang.
+    """
 
-        class FakeLink:
-            def request(self, command, callback, prio=False):
-                calls.append((command, prio))
+    def test_a_command_starts_with_no_attempts_spent(self):
+        assert PingCommand().attempts == 0
 
+    def test_a_timeout_inside_the_budget_is_retried(self):
+        cmd = PingCommand()
+        cmd.callback = None
+        cmd.attempts = 1
+        link = FakeLink()
+
+        cmd.handle_timeout(link)
+
+        assert link.events == [("request", True)]
+        assert not cmd.future.done(), "a command still being retried has no outcome yet"
+
+    def test_the_budget_runs_out(self):
+        """The branch that did not exist: after the last attempt, stop.
+
+        Both halves matter. The command fails, so its caller is told rather than
+        left waiting; and the transport backs off, so the next command is not
+        sent into an API that has just failed to answer three of them.
+        """
+        cmd = PingCommand()
+        cmd.callback = None
+        cmd.attempts = Command.MAX_ATTEMPTS
+        link = FakeLink()
+
+        cmd.handle_timeout(link)
+
+        assert ("request", True) not in link.events, "a spent command was sent again"
+        assert link.events == [("banned", 604)]
+        with pytest.raises(AniDBCommandTimeoutError):
+            cmd.future.result(timeout=0)
+
+    def test_the_caller_is_told_before_the_back_off_begins(self):
+        """Order matters, because backing off means sleeping.
+
+        The decision to give up has already been made by the time the back-off
+        starts. Telling the caller afterwards would hold it for the length of a
+        back-off -- half an hour and up -- to deliver an answer that was ready
+        immediately.
+        """
+        cmd = PingCommand()
+        cmd.callback = None
+        cmd.attempts = Command.MAX_ATTEMPTS
+        settled = []
+
+        class SlowBanLink(FakeLink):
             def set_banned(self, code, reason=None):
-                calls.append(("banned", code))
+                settled.append(cmd.future.done())
+                super().set_banned(code, reason)
 
+        cmd.handle_timeout(SlowBanLink())
+
+        assert settled == [True], "the caller was still waiting when the back-off started"
+
+    def test_a_command_retried_to_exhaustion_reaches_the_wire_a_bounded_number_of_times(self):
+        """End to end over the whole budget: it terminates, and it terminates soon.
+
+        Driven through the same counting the transport does, so this is the real
+        number of times AniDB would be asked -- the number that matters to a
+        service that bans clients for asking too often.
+        """
         cmd = PingCommand()
         cmd.callback = None
         link = FakeLink()
 
-        cmd.handle_timeout(link)
-        assert cmd.retries == 1
-        assert calls[-1] == (cmd, True)
+        link.request(cmd, None)  # the first send
+        rounds = 0
+        while not cmd.future.done():
+            rounds += 1
+            assert rounds <= 10, "handle_timeout never reached a terminal branch"
+            cmd.handle_timeout(link)
 
-    def test_exhausted_retries_back_off_before_requeueing(self):
-        """After the last retry the link is told to back off, not just retried again.
-
-        This is what stops a dead API turning into an unbounded retry loop that
-        would itself look like abuse.
-        """
-        events = []
-
-        class FakeLink:
-            def request(self, command, callback, prio=False):
-                events.append("request")
-
-            def set_banned(self, code, reason=None):
-                events.append(f"banned:{code}")
-
-        cmd = PingCommand()
-        cmd.callback = None
-        cmd.retries = 0
-        cmd.handle_timeout(FakeLink())
-
-        assert events == ["banned:604", "request"]
-        assert cmd.retries == 2, "retry budget is restored for the next attempt"
+        sends = [event for event in link.events if event[0] == "request"]
+        assert len(sends) == Command.MAX_ATTEMPTS
+        assert cmd.attempts == Command.MAX_ATTEMPTS

@@ -125,6 +125,11 @@ class AniDBLink(threading.Thread):
         # Latched on purpose: re-sending credentials AniDB has already rejected is
         # one of the surest ways to turn a refusal into a ban.
         self._auth_fatal: AniDBAuthFailedError | None = None
+        # Set once the transport has concluded it cannot work at all. Written by
+        # the sender as it gives up and read by anyone queueing afterwards, so a
+        # request made after the transport died fails immediately instead of
+        # joining a queue nothing will ever drain. Only ever goes None -> error.
+        self._dead: Exception | None = None
 
         self._api_key = api_key
 
@@ -350,19 +355,14 @@ class AniDBLink(threading.Thread):
                 continue
 
             anidb_client.log.debug(f"sending command {command.command} with tag {command.tag}")
-            if self._authed.is_set() or command.command in ("AUTH", "ENCRYPT", "PING"):
-                self._send_command(command)
-            else:
+            if not (self._authed.is_set() or command.command in ("AUTH", "ENCRYPT", "PING")):
                 self.reauthenticate()
                 try:
                     self._await_auth()
                 except AniDBAuthFailedError as e:
-                    # No session is ever coming. The command must not be left in
-                    # the table of commands awaiting a reply either: it has no
-                    # send time, so the timeout sweep skips it, and it would sit
-                    # there unanswered and unswept for the life of the process.
+                    # No session is ever coming.
                     anidb_client.log.error(f"Dropping {command.command} ({command.tag}): {e}")
-                    self._listener.pop_command(command.tag)
+                    self._fail_command(command, e)
                     if command.command == "LOGOUT":
                         break
                     continue
@@ -377,10 +377,55 @@ class AniDBLink(threading.Thread):
                     anidb_client.log.warning(f"Requeueing {command.command} ({command.tag}): {e}")
                     self._enqueue(command, prio=True)
                     continue
+
+            try:
                 self._send_command(command)
+            except AniDBInternalError as e:
+                # The transport itself is gone -- the listener has stopped, so
+                # nothing will read a reply to anything. This used to escape and
+                # end the sender thread, which released nobody: every command
+                # already queued had no send time, the timeout sweep skips those,
+                # and every caller waited on a reply that could not be read even
+                # if it arrived. The check said "kill the main thread if the
+                # listener dies" and killed the one thread that could have.
+                anidb_client.log.error(f"Transport has failed; abandoning every command in flight: {e}")
+                self._dead = e
+                self._fail_command(command, e)
+                self._abort_pending(e)
+                break
+            except AniDBError as e:
+                anidb_client.log.error(f"Cannot send {command.command} ({command.tag}): {e}")
+                self._fail_command(command, e)
+                continue
 
             if command.command == "LOGOUT":
                 break
+
+    def _fail_command(self, command: Command, error: Exception) -> None:
+        """Drop a command and tell whoever asked for it.
+
+        Unregistering matters as much as failing: a command that never went out
+        has no send time, and the timeout sweep skips those, so one left in the
+        table would sit there unanswered and unswept for the life of the process.
+        """
+        self._listener.pop_command(command.tag)
+        command.fail(error)
+
+    def _abort_pending(self, error: Exception) -> None:
+        """Fail everything outstanding, queued or awaiting a reply.
+
+        The containment rule in its strongest form: when the transport concludes
+        it can no longer work, that conclusion has to reach every caller it was
+        working for. Silence is the one outcome a caller cannot act on.
+        """
+        with self._queue_cv:
+            queued = list(self._queue)
+            self._queue.clear()
+        for command in queued:
+            self._fail_command(command, error)
+        for tag, command in self._listener.pending_commands():
+            if self._listener.pop_command(tag) is not None:
+                command.fail(error)
 
     def _send_command(self, command: Command) -> None:
         self._rate_limiter.wait()
@@ -405,6 +450,10 @@ class AniDBLink(threading.Thread):
         command.authorize(session)
         self._rate_limiter.record_send()
         command.started = monotonic()
+        # Counted here rather than in request(), which is also the re-queue path:
+        # what the budget bounds is how many times this command reaches AniDB, not
+        # how many times it went round the queue.
+        command.attempts += 1
         data = command.raw_data().encode("utf-8")
         # One read, handed to encrypt() so the test and the use cannot disagree.
         cipher = self._listener.cipher
@@ -429,16 +478,34 @@ class AniDBLink(threading.Thread):
                 self._enqueue(command, prio=True)
             self.set_banned(code=999, reason=b"Network unavailable")
 
-    def request(self, command: Command, callback: Callable[[Response], None], prio: bool = False) -> None:
+    def request(self, command: Command, callback: Callable[[Response], None], prio: bool = False) -> Future[Response]:
+        """Queue a command and hand back its outcome.
+
+        The returned future settles when the reply has been handled, or fails when
+        the transport concludes no reply is coming. Callers that only want the
+        side effect the callback performs may ignore it; callers that need to know
+        whether it happened cannot get that from a callback, because the case that
+        matters is the one where no callback ever runs.
+
+        Re-queueing an existing command reuses its future -- the caller is waiting
+        on the request, not on any one attempt at it.
+        """
         command.started = None
         command.callback = callback
         command.tag = self._new_tag()
+        if self._dead is not None:
+            # Nothing drains the queue any more. Say so now rather than accepting
+            # the command and letting its caller wait out a timeout for an answer
+            # that was never possible.
+            command.fail(self._dead)
+            return command.future
         self._listener.queue_command(command)
         anidb_client.log.debug(f"Queued command {command.command} with tag {command.tag}")
         if command.command in ("ENCRYPT", "AUTH", "PING"):
             self._send_command(command)
-            return
+            return command.future
         self._enqueue(command, prio=prio)
+        return command.future
 
     @property
     def session(self) -> str | None:
@@ -698,9 +765,29 @@ class AniDBListener(threading.Thread):
                 self.stop()
 
             self._last_receive = monotonic()
-            resp_thread = threading.Thread(target=resp.handle)
+            resp_thread = threading.Thread(target=self._deliver, args=(cmd, resp))
             resp_thread.daemon = True
             resp_thread.start()
+
+    def _deliver(self, cmd: Command, resp: Response) -> None:
+        """Run a reply's callback, then settle the command it answers.
+
+        In that order, so a caller released by the outcome finds the callback's
+        work -- the cache write, in practice -- already done.
+
+        A callback that raises used to end here as an unhandled exception in a
+        thread nobody joins: logged by the interpreter at shutdown, invisible at
+        the time, and leaving whoever asked for the command waiting on a reply
+        that had in fact arrived and been mishandled. It is the same hang as a
+        reply that never came, from the other direction.
+        """
+        try:
+            resp.handle()
+        except Exception as e:
+            anidb_client.log.exception(f"Handler for {cmd.command} ({cmd.tag}) failed")
+            cmd.fail(e)
+            return
+        cmd.succeed(resp)
 
     def _is_successful_handshake(self, cmd: Command, resp: Response) -> bool:
         """True if this AUTH or ENCRYPT reply succeeded and may reach its handler.
