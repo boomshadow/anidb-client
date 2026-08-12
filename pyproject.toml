@@ -150,9 +150,11 @@ skip_covered = false
 # once the adopted upstream-fork fixes brought their own tests -- mapper.py to 100%
 # and animeobjs.py to 61%, and 75 once the correctness fixes brought tests for the
 # fanart HTTP error paths, the optional FILE state field and the real anilist parse
-# loop (anames.py 50% -> 67%). Set a little under the measured figure so an
-# unrelated change does not fail the build on rounding.
-fail_under = 75
+# loop (anames.py 50% -> 67%), and 78 once the engine configuration and the cache
+# session lifecycle brought their own tests -- db.py 96% -> 99% and animeobjs.py
+# 66% -> 72%. Set a little under the measured figure so an unrelated change does
+# not fail the build on rounding.
+fail_under = 78
 exclude_also = [
     "if __name__ == .__main__.:",
     "raise NotImplementedError",
