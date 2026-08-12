@@ -50,7 +50,10 @@ def captured_url(monkeypatch):
 
 def write_netrc(tmp_path, machine="dbhost", login="dbuser", password="s3cret"):
     path = tmp_path / "netrc"
-    path.write_text(f"machine {machine}\n  login {login}\n  password {password}\n")
+    # login=None writes an entry with no login line at all, which netrc permits and
+    # which reads back as an empty username.
+    login_line = f"  login {login}\n" if login is not None else ""
+    path.write_text(f"machine {machine}\n{login_line}  password {password}\n")
     path.chmod(0o600)
     return str(path)
 
@@ -127,6 +130,19 @@ class TestWhenNothingShouldChange:
 
         assert url.password is None
         assert url.username == "someoneelse"
+
+    def test_an_entry_with_no_login_is_left_alone(self, run_init):
+        """A password belonging to no user is not a credential for this URL.
+
+        netrc permits `machine X password Y` with no login, and the rule here is
+        that the password is only supplied when it belongs to the user the URL
+        names. An entry with no login belongs to no user -- it previously matched
+        a URL that also named none, and rebuilt it with an empty username.
+        """
+        url = run_init("postgresql://dbhost:5432/anidb_cache", login=None)
+
+        assert url.password is None
+        assert url.username is None
 
     def test_a_host_with_no_netrc_entry_is_left_alone(self, run_init):
         url = run_init("postgresql://dbuser@otherhost:5432/anidb_cache")
