@@ -16,6 +16,7 @@
 # along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 
 
+import datetime
 import enum
 from collections.abc import Iterable
 from typing import Any
@@ -23,7 +24,6 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     Boolean,
-    Column,
     Date,
     DateTime,
     Enum,
@@ -37,7 +37,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import ArgumentError, OperationalError
-from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 import anidb_client
 
@@ -137,9 +137,20 @@ class Base(DeclarativeBase):
     previously imported from the deprecated sqlalchemy.ext.declarative, which
     emitted MovedIn20Warning on import.)
 
-    Columns stay in the legacy `Column(...)` style rather than being migrated to
-    `mapped_column()`; that migration would touch every model and is not needed for
-    the schema to be type-checked.
+    Columns are declared `Mapped[T]` / `mapped_column(...)`. The annotation is what
+    a type checker reads off a row -- `str`, not `Column[str]` -- which is the whole
+    reason for the style: under the legacy form every read was a column object and
+    every direct assignment an error, so callers routed writes through a setattr
+    helper and annotated reads `Any` to get past the checker. Those workarounds are
+    gone.
+
+    **Nullability is stated, never inferred.** SQLAlchemy will take it from the
+    annotation -- `Mapped[str | None]` implying NULL -- and that is deliberately not
+    relied on here: every `mapped_column()` passes `nullable=` outright, so the DDL
+    is decided by one thing rather than by two that can disagree. This cache has no
+    migration story (SPEC-003), so a nullability that changed because an annotation
+    was edited would cost every user a rebuild. The DDL snapshot in
+    `tests/schema_snapshots/` is what proves it did not.
     """
 
 
@@ -271,46 +282,48 @@ def init_db(url: str, pool_size: int = DEFAULT_POOL_SIZE) -> sessionmaker[Sessio
 class AnimeTable(Base):
     __tablename__ = "anime"
 
-    pk = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
-    aid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False, unique=True)
+    pk: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    aid: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=False, unique=True)
     # TODO dateflags?
-    year = Column(String(16), nullable=False)
-    type = Column(String(16), nullable=False)
+    year: Mapped[str] = mapped_column(String(16), nullable=False)
+    type: Mapped[str] = mapped_column(String(16), nullable=False)
 
-    nr_of_episodes = Column(Integer, nullable=False)
-    highest_episode_number = Column(Integer, nullable=False)
-    special_ep_count = Column(Integer, nullable=False)
-    air_date = Column(Date, nullable=True)
-    end_date = Column(Date, nullable=True)
-    url = Column(String(512), nullable=True)
-    picname = Column(String(128), nullable=True)
+    nr_of_episodes: Mapped[int] = mapped_column(Integer, nullable=False)
+    highest_episode_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    special_ep_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    air_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    end_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    picname: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    rating = Column(Float, nullable=True)
-    vote_count = Column(Integer, nullable=False)
-    temp_rating = Column(Float, nullable=True)
-    temp_vote_count = Column(Integer, nullable=False)
-    average_review_rating = Column(Float, nullable=True)
-    review_count = Column(Integer, nullable=False)
-    is_18_restricted = Column(Boolean, nullable=False)
+    rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vote_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    temp_rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    temp_vote_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    average_review_rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    review_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_18_restricted: Mapped[bool] = mapped_column(Boolean, nullable=False)
 
-    ann_id = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
-    allcinema_id = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
-    animenfo_id = Column(String(64), nullable=True)
-    anidb_updated = Column(DateTime(timezone=False), nullable=False)
+    ann_id: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
+    allcinema_id: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
+    animenfo_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    anidb_updated: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=False), nullable=False)
 
-    special_count = Column(Integer, nullable=False)
-    credit_count = Column(Integer, nullable=False)
-    other_count = Column(Integer, nullable=False)
-    trailer_count = Column(Integer, nullable=False)
-    parody_count = Column(Integer, nullable=False)
+    special_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    credit_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    other_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    trailer_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    parody_count: Mapped[int] = mapped_column(Integer, nullable=False)
 
     # TODO: ANIMEDESC
-    # description = Column(Unicode(8194), nullable=True)
+    # description: Mapped[str | None] = mapped_column(Unicode(8194), nullable=True)
 
-    updated = Column(DateTime(timezone=True), nullable=False)
-    last_update_dice = Column(DateTime(timezone=True), nullable=False)
+    updated: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_update_dice: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
-    relations = relationship("AnimeRelationTable", backref="anime", cascade="all, delete")
+    relations: Mapped[list[AnimeRelationTable]] = relationship(
+        "AnimeRelationTable", backref="anime", cascade="all, delete"
+    )
 
     def update(self, **kwargs: Any) -> None:
         for key, attr in kwargs.items():
@@ -327,10 +340,12 @@ class AnimeTable(Base):
 class AnimeRelationTable(Base):
     __tablename__ = "anime_relation"
 
-    pk = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
-    anime_pk = Column(BigInteger().with_variant(Integer, "sqlite"), ForeignKey("anime.pk"), nullable=False)
-    related_aid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False)
-    relation_type: Column[str] = Column(
+    pk: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    anime_pk: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), ForeignKey("anime.pk"), nullable=False
+    )
+    related_aid: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=False)
+    relation_type: Mapped[AnimeRelationType] = mapped_column(
         Enum(AnimeRelationType, values_callable=_values, name="anime_relation_type_enum"),
         nullable=False,
     )
@@ -356,21 +371,25 @@ class AnimeRelationTable(Base):
 class EpisodeTable(Base):
     __tablename__ = "episode"
 
-    pk = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
-    aid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False, index=True)
-    eid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False, unique=True, index=True)
-    length = Column(Integer, nullable=False)
-    rating = Column(Float, nullable=True)
-    votes = Column(Integer, nullable=False)
-    epno = Column(String(8), nullable=False)
-    title_eng = Column(String(512), nullable=True)
-    title_romaji = Column(String(512), nullable=True)
-    title_kanji = Column(Unicode(512), nullable=True)
-    aired = Column(Date(), nullable=True)
-    type: Column[str] = Column(Enum(EpisodeType, values_callable=_values, name="episode_type_enum"), nullable=False)
+    pk: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    aid: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=False, index=True)
+    eid: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), nullable=False, unique=True, index=True
+    )
+    length: Mapped[int] = mapped_column(Integer, nullable=False)
+    rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    votes: Mapped[int] = mapped_column(Integer, nullable=False)
+    epno: Mapped[str] = mapped_column(String(8), nullable=False)
+    title_eng: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    title_romaji: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    title_kanji: Mapped[str | None] = mapped_column(Unicode(512), nullable=True)
+    aired: Mapped[datetime.date | None] = mapped_column(Date(), nullable=True)
+    type: Mapped[EpisodeType] = mapped_column(
+        Enum(EpisodeType, values_callable=_values, name="episode_type_enum"), nullable=False
+    )
 
-    updated = Column(DateTime(timezone=True), nullable=False)
-    last_update_dice = Column(DateTime(timezone=True), nullable=False)
+    updated: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_update_dice: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     def update(self, **kwargs: Any) -> None:
         for key, attr in kwargs.items():
@@ -386,55 +405,58 @@ class EpisodeTable(Base):
 class FileTable(Base):
     __tablename__ = "file"
 
-    pk = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
-    path = Column(Unicode(512), nullable=True)
-    size = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
-    ed2khash = Column(String(64), nullable=True)
-    mtime = Column(DateTime(timezone=False), nullable=True)
-    aid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False, index=True)
-    gid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
-    eid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False, index=True)
-    fid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=True, index=True)
-    is_deprecated = Column(Boolean, nullable=True)
-    is_generic = Column(Boolean, nullable=False)
-    part = Column(Integer, nullable=True)
+    pk: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    path: Mapped[str | None] = mapped_column(Unicode(512), nullable=True)
+    size: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
+    ed2khash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mtime: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    aid: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=False, index=True)
+    gid: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
+    eid: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=False, index=True)
+    fid: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True, index=True)
+    is_deprecated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    is_generic: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    part: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # state
-    crc_ok = Column(Boolean, nullable=True)
-    file_version = Column(Integer, nullable=True)
-    censored = Column(Boolean, nullable=True)
+    crc_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    file_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    censored: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
-    length_in_seconds = Column(Integer, nullable=True)
-    description = Column(String(512), nullable=True)
-    aired_date = Column(Date, nullable=True)
+    length_in_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    description: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    aired_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
 
-    mylist_state: Column[str] = Column(
+    mylist_state: Mapped[MylistState | None] = mapped_column(
         Enum(MylistState, values_callable=_values, name="mylist_state_enum"), nullable=True
     )
-    mylist_filestate: Column[str] = Column(
+    mylist_filestate: Mapped[MylistFileState | None] = mapped_column(
         Enum(MylistFileState, values_callable=_values, name="mylist_filestate_enum"),
         nullable=True,
     )
-    mylist_viewed = Column(Boolean, nullable=True)
-    mylist_viewdate = Column(DateTime(timezone=False), nullable=True)
-    mylist_storage = Column(String(128), nullable=True)
-    mylist_source = Column(String(128), nullable=True)
-    mylist_other = Column(String(128), nullable=True)
-    lid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
+    mylist_viewed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    mylist_viewdate: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    mylist_storage: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    mylist_source: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    mylist_other: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lid: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
 
-    updated = Column(DateTime(timezone=True), nullable=True)
-    last_update_dice = Column(DateTime(timezone=True), nullable=False)
+    updated: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_update_dice: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     def update(self, **kwargs: Any) -> None:
         for key, attr in kwargs.items():
             setattr(self, key, attr)
 
     def __repr__(self) -> str:
-        path = None
-        if self.path:
-            path = self.path.encode("utf-8")
+        # Encoded on purpose: this repr goes into log messages, and a path is whatever
+        # the filesystem holds, so it is rendered as an escaped byte string rather than
+        # as characters a log consumer may not be able to write. `!r` says that is
+        # intended -- formatting bytes gives the same text either way, and without it a
+        # type checker rightly asks whether the b'...' was meant.
+        path = self.path.encode("utf-8") if self.path else None
         return (
-            f"<FileTable(pk={self.pk}, path={path}, mylist_state={self.mylist_state}, "
+            f"<FileTable(pk={self.pk}, path={path!r}, mylist_state={self.mylist_state}, "
             f"mylist_viewed={self.mylist_viewed}, updated={self.updated})>"
         )
 
@@ -442,28 +464,33 @@ class FileTable(Base):
 class GroupTable(Base):
     __tablename__ = "group"
 
-    pk = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
-    gid = Column(BigInteger().with_variant(Integer, "sqlite"), index=True)
-    rating = Column(BigInteger().with_variant(Integer, "sqlite"))
-    votes = Column(BigInteger().with_variant(Integer, "sqlite"))
-    acount = Column(BigInteger().with_variant(Integer, "sqlite"))
-    fcount = Column(BigInteger().with_variant(Integer, "sqlite"))
-    name = Column(Unicode(248), nullable=False)
-    short = Column(Unicode(64), nullable=False, index=True)
-    irc_channel = Column(String(32))
-    irc_server = Column(String(32))
-    url = Column(String(248))
-    picname = Column(String(32))
-    founded = Column(DateTime(timezone=False))
-    disbanded = Column(DateTime(timezone=False))
-    dateflag = Column(Integer())
-    last_release = Column(DateTime(timezone=False))
-    last_activity = Column(DateTime(timezone=False))
+    # Everything optional here was optional before by omission -- a bare `Column(...)`
+    # is nullable -- and now says so. Same DDL; one fewer thing a reader has to know
+    # the default of.
+    pk: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    gid: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True, index=True)
+    rating: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
+    votes: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
+    acount: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
+    fcount: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
+    name: Mapped[str] = mapped_column(Unicode(248), nullable=False)
+    short: Mapped[str] = mapped_column(Unicode(64), nullable=False, index=True)
+    irc_channel: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    irc_server: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    url: Mapped[str | None] = mapped_column(String(248), nullable=True)
+    picname: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    founded: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    disbanded: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    dateflag: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    last_release: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    last_activity: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
 
-    relations = relationship("GroupRelationTable", backref="group", cascade="all, delete")
+    relations: Mapped[list[GroupRelationTable]] = relationship(
+        "GroupRelationTable", backref="group", cascade="all, delete"
+    )
 
-    updated = Column(DateTime(timezone=True), nullable=True)
-    last_update_dice = Column(DateTime(timezone=True), nullable=False)
+    updated: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_update_dice: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     def update(self, **kwargs: Any) -> None:
         for key, attr in kwargs.items():
@@ -476,10 +503,12 @@ class GroupTable(Base):
 class GroupRelationTable(Base):
     __tablename__ = "group_relation"
 
-    pk = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
-    group_pk = Column(BigInteger().with_variant(Integer, "sqlite"), ForeignKey("group.pk"), nullable=False)
-    related_gid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False)
-    relation_type: Column[str] = Column(
+    pk: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    group_pk: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), ForeignKey("group.pk"), nullable=False
+    )
+    related_gid: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=False)
+    relation_type: Mapped[GroupRelationType] = mapped_column(
         Enum(GroupRelationType, values_callable=_values, name="group_relation_type_enum"),
         nullable=False,
     )

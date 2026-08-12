@@ -515,13 +515,8 @@ class Anime(AniDBObj):
                     self.db_data.relations = new_relations
                 else:
                     new = AnimeTable(**ainfo)
-                    # Through the row's own update() helper: these columns are declared in the
-                    # legacy Column() style (see db.py's Base), so assigning to them directly is
-                    # opaque to a type checker in a way setattr is not.
-                    new.update(
-                        updated=datetime.datetime.now(self._timezone),
-                        last_update_dice=datetime.datetime.now(self._timezone),
-                    )
+                    new.updated = datetime.datetime.now(self._timezone)
+                    new.last_update_dice = datetime.datetime.now(self._timezone)
                     new.relations = relations
                     # commit to sql database
                     sess.add(new)
@@ -894,13 +889,8 @@ class Episode(AniDBObj):
                     self.db_data.updated = datetime.datetime.now(self._timezone)
                 else:
                     new = EpisodeTable(**einfo)
-                    # Through the row's own update() helper: these columns are declared in the
-                    # legacy Column() style (see db.py's Base), so assigning to them directly is
-                    # opaque to a type checker in a way setattr is not.
-                    new.update(
-                        updated=datetime.datetime.now(self._timezone),
-                        last_update_dice=datetime.datetime.now(self._timezone),
-                    )
+                    new.updated = datetime.datetime.now(self._timezone)
+                    new.last_update_dice = datetime.datetime.now(self._timezone)
                     sess.add(new)
 
                 if new:
@@ -1307,13 +1297,8 @@ class File(AniDBObj):
                     self.db_data.updated = datetime.datetime.now(self._timezone)
                 else:
                     new = FileTable(**finfo)
-                    # Through the row's own update() helper: these columns are declared in the
-                    # legacy Column() style (see db.py's Base), so assigning to them directly is
-                    # opaque to a type checker in a way setattr is not.
-                    new.update(
-                        updated=datetime.datetime.now(self._timezone),
-                        last_update_dice=datetime.datetime.now(self._timezone),
-                    )
+                    new.updated = datetime.datetime.now(self._timezone)
+                    new.last_update_dice = datetime.datetime.now(self._timezone)
                     sess.add(new)
 
                 if new:
@@ -1363,23 +1348,13 @@ class File(AniDBObj):
                     existing = sess.query(FileTable).filter_by(lid=finfo["lid"]).all()
                     if not existing:
                         new = FileTable(**finfo)
-                        # Through the row's own update() helper: these columns are declared in the
-                        # legacy Column() style (see db.py's Base), so assigning to them directly is
-                        # opaque to a type checker in a way setattr is not.
-                        new.update(
-                            updated=datetime.datetime.now(self._timezone),
-                            last_update_dice=datetime.datetime.now(self._timezone),
-                        )
+                        new.updated = datetime.datetime.now(self._timezone)
+                        new.last_update_dice = datetime.datetime.now(self._timezone)
                         sess.add(new)
                     else:
                         obj = existing[0]
-                        # Through the row's own update() helper: these columns are declared in the
-                        # legacy Column() style (see db.py's Base), so assigning to them directly is
-                        # opaque to a type checker in a way setattr is not.
-                        obj.update(
-                            updated=datetime.datetime.now(self._timezone),
-                            last_update_dice=datetime.datetime.now(self._timezone),
-                        )
+                        obj.updated = datetime.datetime.now(self._timezone)
+                        obj.last_update_dice = datetime.datetime.now(self._timezone)
                         obj.update(**finfo)
                     self._db_commit(sess)
                     self._mylist_updated.set()
@@ -1405,13 +1380,8 @@ class File(AniDBObj):
                     self.db_data.updated = datetime.datetime.now(self._timezone)
                 else:
                     new = FileTable(**finfo)
-                    # Through the row's own update() helper: these columns are declared in the
-                    # legacy Column() style (see db.py's Base), so assigning to them directly is
-                    # opaque to a type checker in a way setattr is not.
-                    new.update(
-                        updated=datetime.datetime.now(self._timezone),
-                        last_update_dice=datetime.datetime.now(self._timezone),
-                    )
+                    new.updated = datetime.datetime.now(self._timezone)
+                    new.last_update_dice = datetime.datetime.now(self._timezone)
                     anidb_client.log.debug(f"Adding mylist info: {finfo}")
                     sess.add(new)
 
@@ -1595,9 +1565,7 @@ class File(AniDBObj):
             with self._db_session() as sess:
                 res = sess.query(FileTable).filter_by(eid=self.episode.eid).all()
                 self._db_commit(sess)
-            # `Any`: db.py declares its columns in the legacy Column() style, so a
-            # read off a row is a Column[...] to a checker rather than the value.
-            mylist_entries: list[Any] = [x for x in res if x.lid]
+            mylist_entries = [x for x in res if x.lid]
             if mylist_entries:
                 for entry in mylist_entries:
                     other_file = File(lid=entry.lid)
@@ -1955,13 +1923,8 @@ class Group(AniDBObj):
                 self.db_data.relations = new_relations
             else:
                 new = GroupTable(**ginfo)
-                # Through the row's own update() helper: these columns are declared in the
-                # legacy Column() style (see db.py's Base), so assigning to them directly is
-                # opaque to a type checker in a way setattr is not.
-                new.update(
-                    updated=datetime.datetime.now(self._timezone),
-                    last_update_dice=datetime.datetime.now(self._timezone),
-                )
+                new.updated = datetime.datetime.now(self._timezone)
+                new.last_update_dice = datetime.datetime.now(self._timezone)
                 sess.add(new)
                 self.db_data = new
 
