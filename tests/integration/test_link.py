@@ -362,7 +362,7 @@ class TestDecryptionOfUnencryptedPackets:
 
         link = make_link(server)
         listener = link._listener
-        listener._cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
+        listener.cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
 
         with pytest.raises(ValueError):
             listener.decrypt(b"555 BANNED\n" + b" " * 5)
@@ -371,7 +371,7 @@ class TestDecryptionOfUnencryptedPackets:
         from Crypto.Cipher import AES
 
         link = make_link(server)
-        link._listener._cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
+        link._listener.cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
 
         with pytest.raises(ValueError):
             link._listener.decrypt(b"")
@@ -382,6 +382,69 @@ class TestDecryptionOfUnencryptedPackets:
 
         link = make_link(server)
         listener = link._listener
-        listener._cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
+        cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
+        listener.cipher = cipher
 
-        assert listener.decrypt(listener.encrypt(b"200 sess1234 LOGIN ACCEPTED")) == b"200 sess1234 LOGIN ACCEPTED"
+        packet = listener.encrypt(b"200 sess1234 LOGIN ACCEPTED", cipher)
+
+        assert listener.decrypt(packet) == b"200 sess1234 LOGIN ACCEPTED"
+
+
+class TestSharedTransportState:
+    """The session key and the cipher are written by the listener thread and read
+    by the sender thread on every command.
+
+    Both now sit behind accessors that take a lock, so a command cannot be
+    authorized with a session that was cleared between the check and the use, and
+    the pair cannot be observed half-cleared.
+    """
+
+    def test_the_session_reads_back_through_the_accessor(self, server, make_link):
+        link = make_link(server)
+        link.set_session("abc123")
+
+        assert link.session == "abc123"
+
+    def test_reauthenticate_clears_session_and_cipher_together(self, server, make_link, monkeypatch):
+        """A half-cleared state is a command encrypted with a key the server has
+        forgotten, or an unencrypted command on a session that requires one.
+
+        `_reauthenticate` is stubbed out so this tests the clearing alone rather
+        than the round trip that follows it.
+        """
+        from Crypto.Cipher import AES
+
+        link = make_link(server)
+        link.set_session("abc123")
+        link._listener.cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
+        monkeypatch.setattr(link, "_reauthenticate", lambda: None)
+
+        link.reauthenticate()
+
+        assert link.session is None
+        assert link._listener.cipher is None
+
+    def test_decrypting_with_no_cipher_is_a_value_error(self, server, make_link):
+        """ValueError specifically. run() suppresses exactly that and falls back to
+        reading the packet as plaintext -- which is what a packet arriving after the
+        session dropped actually is. Any other type ends the listener thread, and a
+        listener that has stopped reading is a permanent hang for every caller.
+        """
+        link = make_link(server)
+
+        with pytest.raises(ValueError):
+            link._listener.decrypt(b"555 BANNED\n")
+
+    def test_encrypt_uses_the_cipher_it_is_handed(self, server, make_link):
+        """It takes the cipher as an argument rather than reading it back, so the
+        caller's `if cipher` test and this use are guaranteed to be the same read.
+        There is no vanished-cipher case on the send path to handle."""
+        from Crypto.Cipher import AES
+
+        link = make_link(server)
+        cipher = AES.new(b"0123456789abcdef", AES.MODE_ECB)
+
+        encrypted = link._listener.encrypt(b"PING\n", cipher)
+
+        assert link._listener.cipher is None, "encrypt must not depend on the stored cipher"
+        assert len(encrypted) % 16 == 0

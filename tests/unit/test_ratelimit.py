@@ -5,6 +5,8 @@ directly rather than inferring it from transport behaviour. The clock and sleep
 are injected, so a half-hour ban back-off is asserted in microseconds.
 """
 
+import threading
+
 from anidb_client.ratelimit import RateLimiter
 
 
@@ -164,3 +166,32 @@ class TestSendAccounting:
         """The transport uses this to decide on keepalives; it must not read as 0."""
         limiter, _ = make()
         assert limiter.seconds_since_last_send() > RateLimiter.IDLE_RESET
+
+
+class TestThreadSafety:
+    """The limiter is touched by both transport threads: the sender calls wait()
+    and record_send(), the listener calls register_ban() and clear_ban() as replies
+    arrive. Every counter is read-modify-write, so each is locked.
+    """
+
+    def test_the_lock_is_not_held_across_the_sleep(self):
+        """A ban back-off is measured in half-hours. Holding the lock for the
+        length of one would stop the listener reporting the next ban at all, so the
+        delay is computed under the lock and slept for outside it.
+
+        The injected sleep stands in for that half hour, and a second thread stands
+        in for the listener arriving during it.
+        """
+        reported = threading.Event()
+
+        def sleeping(_seconds):
+            worker = threading.Thread(target=lambda: (limiter.register_ban(), reported.set()))
+            worker.start()
+            worker.join(timeout=2)
+
+        limiter = RateLimiter(monotonic=lambda: 0.0, sleep=sleeping)
+        limiter.register_ban()
+
+        limiter.wait()
+
+        assert reported.is_set(), "the listener could not touch the limiter while the sender was backing off"

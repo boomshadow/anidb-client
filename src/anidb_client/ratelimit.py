@@ -26,9 +26,17 @@ rather than an error reply.
 The clock and the sleep function are injectable so the policy can be tested
 without a suite that takes half an hour, and without a banned-state test blocking
 for the full half-hour back-off.
+
+**This class is touched from two threads.** The sender thread calls `wait()` and
+`record_send()`; the listener thread calls `register_ban()` and `clear_ban()` as
+replies arrive. Every counter here is read-modify-write, so each is guarded by a
+lock -- but the lock is never held across a sleep. A ban back-off is measured in
+half-hours, and holding the lock for one would stop the listener from being able
+to report the next ban at all.
 """
 
 import logging
+import threading
 import time as _time
 from collections.abc import Callable
 
@@ -66,25 +74,34 @@ class RateLimiter:
         self._monotonic = monotonic or _time.monotonic
         self._sleep = sleep or _time.sleep
         self._log = log
+        self._lock = threading.Lock()
         self._last_send = 0.0
         self._sent_in_burst = 0
         self._ban_multiplier = 0
 
     @property
     def is_banned(self) -> bool:
-        return self._ban_multiplier > 0
+        with self._lock:
+            return self._ban_multiplier > 0
 
     @property
     def ban_multiplier(self) -> int:
-        return self._ban_multiplier
+        with self._lock:
+            return self._ban_multiplier
+
+    def _seconds_since_last_send(self) -> float:
+        """Caller holds the lock. The public form below takes it."""
+        return self._monotonic() - self._last_send
 
     def seconds_since_last_send(self) -> float:
-        return self._monotonic() - self._last_send
+        with self._lock:
+            return self._seconds_since_last_send()
 
     def record_send(self) -> None:
         """Called once a command has actually been handed to the socket."""
-        self._sent_in_burst += 1
-        self._last_send = self._monotonic()
+        with self._lock:
+            self._sent_in_burst += 1
+            self._last_send = self._monotonic()
 
     def register_ban(self) -> int:
         """Record a ban or server-busy reply and return the new multiplier.
@@ -92,34 +109,49 @@ class RateLimiter:
         Doubles per consecutive ban, so a server that stays unhappy is backed away
         from rather than hammered at a fixed interval, up to MAX_BAN_MULTIPLIER.
         """
-        self._ban_multiplier = 1 if not self._ban_multiplier else min(self._ban_multiplier * 2, self.MAX_BAN_MULTIPLIER)
-        return self._ban_multiplier
+        with self._lock:
+            self._ban_multiplier = (
+                1 if not self._ban_multiplier else min(self._ban_multiplier * 2, self.MAX_BAN_MULTIPLIER)
+            )
+            return self._ban_multiplier
 
     def clear_ban(self) -> None:
         """Called on a successful authentication: whatever it was, it has passed."""
-        self._ban_multiplier = 0
+        with self._lock:
+            self._ban_multiplier = 0
+
+    def _ban_delay(self) -> float:
+        """Seconds of ban back-off owed right now, or 0.
+
+        Separate from `wait()` so the lock is released before the sleep it implies.
+        """
+        with self._lock:
+            if not self._ban_multiplier:
+                return 0.0
+            return float(self.BAN_BASE_DELAY * self._ban_multiplier)
 
     def delay_for_next_send(self) -> float:
         """Seconds to wait before the next command may go out.
 
         Excludes any ban back-off, which `wait()` applies first and separately.
         """
-        age = self.seconds_since_last_send()
-        if age > self.IDLE_RESET:
-            self._sent_in_burst = 0
-            base = 0.0
-        elif self._sent_in_burst < self.FREE_BURST:
-            base = self.BURST_DELAY
-        else:
-            base = self.STEADY_DELAY
+        with self._lock:
+            age = self._seconds_since_last_send()
+            if age > self.IDLE_RESET:
+                self._sent_in_burst = 0
+                base = 0.0
+            elif self._sent_in_burst < self.FREE_BURST:
+                base = self.BURST_DELAY
+            else:
+                base = self.STEADY_DELAY
         # Time already spent since the last packet counts towards the delay, so an
         # application that is slow in its own right is not paced twice.
         return base - age
 
     def wait(self) -> None:
         """Block until it is acceptable to send the next command."""
-        if self.is_banned:
-            ban_delay = self.BAN_BASE_DELAY * self._ban_multiplier
+        ban_delay = self._ban_delay()
+        if ban_delay:
             if self._log:
                 self._log.warning(f"API not available, will wait for {ban_delay / 60} minutes")
             self._sleep(ban_delay)

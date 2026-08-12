@@ -1,8 +1,8 @@
 ---
 title: "UDP Session and Rate Limiting"
-description: "Behavioral expectations for anidb-client's AniDB UDP transport: session establishment with optional AES-encrypted sessions, the sender and listener thread pair, tag-based correlation of replies to commands over an unordered datagram protocol, outbound pacing (a short burst then a slower steady rate) that keeps a client from being IP-banned, exponential ban back-off with a ceiling, session-loss detection and re-authentication, command timeout and retry, NAT keepalive, and the rule that a library never terminates its host process."
+description: "Behavioral expectations for anidb-client's AniDB UDP transport: session establishment with optional AES-encrypted sessions, the sender and listener thread pair and the shared state they reach through locked accessors, tag-based correlation of replies to commands over an unordered datagram protocol, monotonic timing for every interval it measures, outbound pacing (a short burst then a slower steady rate) that keeps a client from being IP-banned, exponential ban back-off with a ceiling, session-loss detection and re-authentication, command timeout and retry, NAT keepalive, and the rule that a library never terminates its host process."
 status: accepted
-tags: [udp, transport, session, authentication, encryption, aes, rate-limiting, pacing, ban, backoff, flood-protection, tags, correlation, timeout, retry, reauthentication, nat, keepalive, threads, logout, response-codes]
+tags: [udp, transport, session, authentication, encryption, aes, rate-limiting, pacing, ban, backoff, flood-protection, tags, correlation, timeout, retry, reauthentication, nat, keepalive, threads, thread-safety, locking, shared-state, monotonic-clock, logout, response-codes]
 ---
 
 # UDP Session and Rate Limiting
@@ -38,6 +38,17 @@ UDP guarantees no ordering, so a reply carries a tag naming the command it answe
 
 A reply arriving with no tag at all is not a reply to anything: it is the server volunteering something, and in practice it is a ban notice. Those are read for their response code and acted on directly.
 
+## Shared state across threads
+
+The transport runs two threads of its own — one sending, one listening — and is called from whatever thread the application uses. Every piece of state written by one and read by another is reached through an accessor that takes a lock, rather than being touched directly.
+
+- **The table of commands awaiting a reply**, inserted into by the sender and read, popped and iterated by the listener. Iterating a dict another thread is inserting into raises, and raising here ends the listener — after which nothing reads the socket and every caller waits on a reply that can no longer arrive.
+- **The session key**, written when authentication succeeds and cleared when the session is lost. Code that tests it and then uses it must read it *once*: testing that a session exists and then reading it again to authorize a command lets the session be cleared in between, and the command goes out authorized with nothing.
+- **The cipher** for an encrypted session, established by the encryption handshake and dropped with the session. It is cleared in the same critical section as the session key, because a half-cleared pair is either a command encrypted with a key the server has forgotten, or an unencrypted command on a session that requires one.
+- **The pacing counters** — the burst allowance, the last-send time and the ban multiplier — every one of which is read-modify-write, and which the sender and the listener touch at the same time.
+
+That last lock is **never held across a sleep**. A ban back-off is measured in half-hours, and holding the lock for the length of one would stop the listener being able to report the next ban at all.
+
 ## Pacing
 
 The pacing policy is the thing that keeps a client out of trouble, so it is stated here explicitly rather than being inferable from whether a request happened to go out.
@@ -61,6 +72,8 @@ Every command in flight is watched. When one goes unanswered past the transport 
 - If replies from the server have arrived more recently than this command was sent, the API is alive and something else is happening — most likely a re-authentication in progress. The command is re-queued at the front.
 - Otherwise the command has genuinely timed out. It is retried a bounded number of times, and once those are spent the transport treats the API as unavailable and backs off before trying again.
 
+Every interval the transport measures — how long a command has been in flight, how recently a reply arrived, how long to pace or back off — is read from a **monotonic** clock rather than the wall clock. The wall clock can be stepped by a time sync or an operator: a backward step makes every command in flight look newly sent, and a forward step expires them all at once.
+
 Authentication and the encryption handshake do not retry this way. A timeout on either means the API is not answering at all, so the transport backs off immediately rather than re-sending credentials into silence.
 
 ## Failure containment
@@ -75,4 +88,4 @@ Two rules bound how badly the transport may fail, both learned the hard way:
 
 - **Line of truth (external):** the AniDB UDP API definition, which owns the command grammar, response codes, and the flood-protection thresholds this spec paces against. `src/anidb_client/commands.py` transcribes the command set and its parameter-combination rules; `src/anidb_client/responses.py` transcribes the response-code table.
 - **Related specs:** SPEC-001 (the object layer whose attribute reads trigger these fetches); SPEC-003 (the cache that exists to keep this transport idle); SPEC-006 (credentials, the encryption key, the client identity and the outgoing port).
-- **Tests:** pacing and back-off are tested against an injected clock in `tests/unit/test_ratelimit.py`, so a banned-state test does not block for the real back-off. Command construction and its parameter validation live in `tests/unit/test_commands.py`, response parsing and the code table in `tests/unit/test_responses.py` and `tests/unit/test_response_field_selection.py`. End-to-end session behavior runs against the fake server in `tests/fake_anidb.py` from `tests/integration/test_link.py`. The HTTP-side timeouts are covered in `tests/unit/test_http_timeouts.py`. The waiter-release guarantee is pinned from the response-handling side in `tests/unit/test_file_response_decoding.py`, where a reply that parses but cannot be decoded must still release everything waiting on it.
+- **Tests:** pacing and back-off are tested against an injected clock in `tests/unit/test_ratelimit.py`, so a banned-state test does not block for the real back-off; the same file pins that the pacing lock is not held across that sleep, by having the injected sleep stand in for the back-off while another thread reports the next ban. The locked session and cipher accessors, and the fact that they are cleared together, are covered in `tests/integration/test_link.py`. Command construction and its parameter validation live in `tests/unit/test_commands.py`, response parsing and the code table in `tests/unit/test_responses.py` and `tests/unit/test_response_field_selection.py`. End-to-end session behavior runs against the fake server in `tests/fake_anidb.py` from `tests/integration/test_link.py`. The HTTP-side timeouts are covered in `tests/unit/test_http_timeouts.py`. The waiter-release guarantee is pinned from the response-handling side in `tests/unit/test_file_response_decoding.py`, where a reply that parses but cannot be decoded must still release everything waiting on it.
