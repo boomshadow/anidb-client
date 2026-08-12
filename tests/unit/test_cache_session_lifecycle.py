@@ -82,8 +82,11 @@ class TestErrorBranchesEndToEnd:
         pool = _pool(anidb)
         before = pool.checkedout()
 
+        # Injected at `Session.scalars`, which is the call the lookup actually makes
+        # and which is handed the session directly. It used to be `Query.first`, back
+        # when the read went through the legacy query API.
         monkeypatch.setattr(
-            sqlalchemy.orm.Query, "first", lambda self, *a, **kw: _fail_with_the_connection_in_hand(self.session)
+            sqlalchemy.orm.Session, "scalars", lambda self, *a, **kw: _fail_with_the_connection_in_hand(self)
         )
 
         assert anime.in_mylist is None

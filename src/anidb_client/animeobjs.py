@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any, override
 
 import sqlalchemy
@@ -448,7 +448,7 @@ class Anime(AniDBObj):
 
     def _get_db_data(self) -> None:
         with self._db_session() as sess:
-            res = sess.query(AnimeTable).filter_by(aid=self.aid).all()
+            res = sess.scalars(sqlalchemy.select(AnimeTable).filter_by(aid=self.aid)).all()
             if len(res) > 0:
                 self.db_data = res[0]
 
@@ -542,7 +542,9 @@ class Anime(AniDBObj):
             return self._in_mylist
         try:
             with self._db_session() as sess:
-                res = sess.query(FileTable).filter(FileTable.aid == self._aid, FileTable.lid.is_not(None)).first()
+                res = sess.scalars(
+                    sqlalchemy.select(FileTable).where(FileTable.aid == self._aid, FileTable.lid.is_not(None))
+                ).first()
             self._in_mylist = bool(res)
         except sqlalchemy.exc.OperationalError as e:
             anidb_client.log.error(f"Failed to get mylist status of {self} from database: {e}")
@@ -796,7 +798,9 @@ class Episode(AniDBObj):
             return self._in_mylist
         try:
             with self._db_session() as sess:
-                res = sess.query(FileTable).filter(FileTable.eid == self.eid, FileTable.lid.is_not(None)).first()
+                res = sess.scalars(
+                    sqlalchemy.select(FileTable).where(FileTable.eid == self.eid, FileTable.lid.is_not(None))
+                ).first()
             self._in_mylist = bool(res)
         except sqlalchemy.exc.OperationalError as e:
             anidb_client.log.error(f"Failed to get mylist status of {self} from database: {e}")
@@ -838,16 +842,14 @@ class Episode(AniDBObj):
     def _get_db_data(self) -> None:
         with self._db_session() as sess:
             if self._eid:
-                res = sess.query(EpisodeTable).filter_by(eid=self._eid).all()
+                res = sess.scalars(sqlalchemy.select(EpisodeTable).filter_by(eid=self._eid)).all()
             else:
-                res = (
-                    sess.query(EpisodeTable)
-                    .filter(
+                res = sess.scalars(
+                    sqlalchemy.select(EpisodeTable).where(
                         EpisodeTable.aid == _required(self._anime, "anime").aid,
                         EpisodeTable.epno.ilike(self.episode_number),
                     )
-                    .all()
-                )
+                ).all()
             if len(res) > 0:
                 self.db_data = res[0]
                 anidb_client.log.debug(f"Found db_data for episode: {self.db_data}")
@@ -1129,25 +1131,29 @@ class File(AniDBObj):
 
     def _get_db_data(self) -> None:
         with self._db_session() as sess:
-            res = None
+            # Sequence rather than list: `scalars().all()` answers one, and two of the
+            # branches below replace it with a list of their own.
+            res: Sequence[FileTable] | None = None
             if self._fid:
-                res = sess.query(FileTable).filter_by(fid=self._fid).all()
+                res = sess.scalars(sqlalchemy.select(FileTable).filter_by(fid=self._fid)).all()
             elif self._lid:
-                res = sess.query(FileTable).filter_by(lid=self._lid).all()
+                res = sess.scalars(sqlalchemy.select(FileTable).filter_by(lid=self._lid)).all()
             elif self._path:
-                res = sess.query(FileTable).filter_by(path=self._path).all()
+                res = sess.scalars(sqlalchemy.select(FileTable).filter_by(path=self._path)).all()
                 if res and res[0].size != self._size:
                     sess.delete(res[0])
                     self._db_commit(sess)
                     res = []
                 if not res:
-                    res = sess.query(FileTable).filter_by(size=self._size, ed2khash=self.ed2khash).all()
+                    res = sess.scalars(
+                        sqlalchemy.select(FileTable).filter_by(size=self._size, ed2khash=self.ed2khash)
+                    ).all()
             elif _required(self._episode, "episode").eid:
-                res = (
-                    sess.query(FileTable)
-                    .filter_by(aid=_required(self._anime, "anime").aid, eid=_required(self._episode, "episode").eid)
-                    .all()
-                )
+                res = sess.scalars(
+                    sqlalchemy.select(FileTable).filter_by(
+                        aid=_required(self._anime, "anime").aid, eid=_required(self._episode, "episode").eid
+                    )
+                ).all()
                 if res and len(res) > 0:
                     res = [x for x in res if x.lid]
             if res and len(res) > 0:
@@ -1345,7 +1351,7 @@ class File(AniDBObj):
                         finfo["is_generic"] = True
 
                     # there is something in mylist; but it's not us :/
-                    existing = sess.query(FileTable).filter_by(lid=finfo["lid"]).all()
+                    existing = sess.scalars(sqlalchemy.select(FileTable).filter_by(lid=finfo["lid"])).all()
                     if not existing:
                         new = FileTable(**finfo)
                         new.updated = datetime.datetime.now(self._timezone)
@@ -1563,7 +1569,7 @@ class File(AniDBObj):
         if not self.lid:
             # avoid a lookup call if we have a file in our database
             with self._db_session() as sess:
-                res = sess.query(FileTable).filter_by(eid=self.episode.eid).all()
+                res = sess.scalars(sqlalchemy.select(FileTable).filter_by(eid=self.episode.eid)).all()
                 self._db_commit(sess)
             mylist_entries = [x for x in res if x.lid]
             if mylist_entries:
@@ -1934,13 +1940,13 @@ class Group(AniDBObj):
     def _get_db_data(self) -> None:
         with self._db_session() as sess:
             if self._gid:
-                res = sess.query(GroupTable).filter_by(gid=self._gid).all()
+                res = sess.scalars(sqlalchemy.select(GroupTable).filter_by(gid=self._gid)).all()
             else:
-                res = (
-                    sess.query(GroupTable)
-                    .filter(sqlalchemy.or_(GroupTable.name.ilike(self._name), GroupTable.short.ilike(self._name)))
-                    .all()
-                )
+                res = sess.scalars(
+                    sqlalchemy.select(GroupTable).where(
+                        sqlalchemy.or_(GroupTable.name.ilike(self._name), GroupTable.short.ilike(self._name))
+                    )
+                ).all()
             if len(res) > 0:
                 self.db_data = res[0]
                 anidb_client.log.debug(f"Found db_data for group: {self.db_data}")
