@@ -45,6 +45,8 @@ Matched numbers are normalised into AniDB's episode vocabulary: specials, openin
 
 A filename can name a range, and the library expands it: two endpoints of the same kind become every episode between them. Where a range is found in the filename, it is trusted only if it contains the episode the cache already believes the file to be — otherwise the filename is assumed wrong and the cached episode stands alone.
 
+A cached episode number can itself be a range, which is how AniDB records a single file covering several episodes, and that is expanded the same way. However a file's episode set is arrived at — from a range in the filename, from a ranged episode number, or from the single episode it turns out to be — it is a list of episode **numbers as text**, the same form `Episode.episode_number` carries and the same form the mylist commands put on the wire. Containment (SPEC-001) and the mylist add loop both read that set, so a representation that differed by route would make them disagree about the same file.
+
 Multi-episode support is genuinely partial, and the boundary is worth stating: **filename parsing supports it, the AniDB file API does not.** A real file in AniDB covering several episodes reports one, and the episode set is not cached. It is reliable for generic entries, where the library owns the whole record, and unreliable for files AniDB knows.
 
 A file may also be a *part* of an episode rather than a whole one, detected from the filename and recorded so that external-id mapping (SPEC-005) can distinguish "part 2 of a movie" from "episode 2 of a series".

@@ -64,7 +64,7 @@ The objects implement the comparisons that make collection use natural, and each
 - Two `Anime` are equal when their anime ids match. `episode in anime` is true when the episode belongs to that anime.
 - Two `Episode` are equal by episode id, falling back to mylist id and then to episode number when one side has not resolved an id yet.
 - Two `File` are equal when their file ids match; two generic files (SPEC-004) are equal when they cover the same episode. Two distinct real files are never equal — including when neither has a file id.
-- `len(file)` is the number of episodes the file covers, and `episode in file` tests membership in that set.
+- `len(file)` is the number of episodes the file covers, and `episode in file` tests membership in that set. The comparison is against episode numbers as text (SPEC-004), which is the only reason it can answer at all — a set built in some other representation would compare unequal to every episode and report false without erroring.
 
 **Equality** against an unrelated type returns `NotImplemented`, so Python falls back to identity comparison rather than the object claiming an answer it does not have.
 
