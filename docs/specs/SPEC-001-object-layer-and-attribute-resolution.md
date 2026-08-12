@@ -1,8 +1,8 @@
 ---
 title: "Object Layer and Attribute Resolution"
-description: "Behavioral expectations for the anidb-client object layer: how Anime, Episode, File and Group objects are constructed from a title, an id or a path, how reading an attribute lazily resolves from cache and only then from the AniDB API, how an object AniDB does not recognise becomes an illegal object rather than hanging its caller, the update() forced refresh, transitive relation walking, and the equality and containment semantics the objects offer."
+description: "Behavioral expectations for the anidb-client object layer: how Anime, Episode, File and Group objects are constructed from a title, an id or a path, how reading an attribute lazily resolves from cache and only then from the AniDB API, how an object AniDB does not recognise becomes an illegal object rather than hanging its caller, how a fetch that cannot be answered at all raises the reason rather than returning None or blocking, with every wait bounded, the update() forced refresh, transitive relation walking, and the equality and containment semantics the objects offer."
 status: accepted
-tags: [object-layer, anime, episode, file, group, attribute-resolution, lazy-loading, illegal-object, relations, related-anime, update, equality, containment, public-api]
+tags: [object-layer, anime, episode, file, group, attribute-resolution, lazy-loading, illegal-object, relations, related-anime, update, equality, containment, public-api, timeout, error-reporting]
 ---
 
 # Object Layer and Attribute Resolution
@@ -32,7 +32,19 @@ Reading an attribute resolves in this order, stopping at the first that can answ
 
 An attribute that is unknown to the object after all three answers `None` rather than raising. This is deliberate: the AniDB API returns different field sets under different conditions, and a caller reading a field the API did not supply gets an absence, not an error.
 
-Concurrent reads of the same object do not produce concurrent fetches. A read arriving while a fetch is already in flight waits for that fetch and then reads its result.
+`None` is an **answer**, and it must not be confused with the absence of one. It means AniDB was asked and did not supply the field. It does not mean the question could not be put — see below.
+
+### A fetch that cannot be answered
+
+A read that needs the network can fail, and when it does the caller is **told**, by an exception naming what went wrong: banned, timed out, refused, the transport gone.
+
+This is the one place the object layer raises where it otherwise returns `None`, and the distinction is the whole point. `None` says *AniDB has no value for that*; an exception says *we could not ask*. A caller can act on either — stop asking, or back off and come back — and can act on neither if both look the same. Reporting a ban as `None` would be a lie, and reporting it as silence, which is what the library used to do, gave the caller nothing to act on at all: the read simply never returned, the process stayed alive and idle, and there was no result, no error and no exit code to distinguish it from work still in progress.
+
+**Every wait is bounded.** The bound is the caller's patience and is deliberately shorter than the transport's own persistence: the transport may still be backing off when the caller is told, and it should be, because backing off is what keeps the client welcome. If the request does eventually succeed, its reply still reaches the cache and is there for the next read.
+
+Concurrent reads of the same object do not produce concurrent fetches. A read arriving while a fetch is already in flight waits for that fetch and then reads its result. A fetch that fails releases that exclusion on its way out — an object left marked as permanently fetching would answer every later refresh by doing nothing at all, which is the original hang wearing a different coat.
+
+A fetch nobody is blocked on has nobody to raise to. It still fails and is still logged; what it must not do is take down the thread of whoever happened to trigger it.
 
 ### Forced refresh
 
@@ -82,4 +94,4 @@ Fanart is a separate source with separate preconditions; see SPEC-005.
 
 - **Line of truth (self-enforcing):** `src/anidb_client/db.py` — the cache schema whose rows back every attribute read. `anidb_client.__all__` in `src/anidb_client/__init__.py` — the package's declared public surface.
 - **Related specs:** SPEC-003 (when a cached value counts as fresh, and what the cache stores); SPEC-002 (the transport that a fetch goes out over, and its pacing); SPEC-004 (`File` construction from a path, and mylist operations); SPEC-005 (title matching, external ids and fanart); SPEC-006 (`init()`, which must run before any object is constructed).
-- **Tests:** the object layer is exercised through the fixture in `tests/objectlayer.py` against the fake server in `tests/fake_anidb.py`. Attribute-resolution behavior lives in `tests/unit/test_attribute_resolution.py` (falsy cached values, relation reads), illegal-object and not-found paths in `tests/unit/test_notfound_paths.py`, and the fixture's own guarantees in `tests/unit/test_objectlayer_fixture.py`. A relation whose type or related id cannot be read is covered in `tests/unit/test_enum_converters.py`, alongside the converter-side half of the same failure class. Equality and containment are covered in `tests/unit/test_file_identity.py`, and the rule that a field the API did not supply resolves to an absence rather than an error — for the optional parts of a FILE reply — in `tests/unit/test_file_response_decoding.py`.
+- **Tests:** the object layer is exercised through the fixture in `tests/objectlayer.py` against the fake server in `tests/fake_anidb.py`. Attribute-resolution behavior lives in `tests/unit/test_attribute_resolution.py` (falsy cached values, relation reads), illegal-object and not-found paths in `tests/unit/test_notfound_paths.py` -- whose `TestNoReplyAtAll` covers the case no callback can reach, where there is no reply at all: the reason reaches the caller as an exception naming it, the object is not left locked as permanently fetching, and a fetch nobody is waiting on fails quietly, and the fixture's own guarantees in `tests/unit/test_objectlayer_fixture.py`. A relation whose type or related id cannot be read is covered in `tests/unit/test_enum_converters.py`, alongside the converter-side half of the same failure class. Equality and containment are covered in `tests/unit/test_file_identity.py`, and the rule that a field the API did not supply resolves to an absence rather than an error — for the optional parts of a FILE reply — in `tests/unit/test_file_response_decoding.py`.

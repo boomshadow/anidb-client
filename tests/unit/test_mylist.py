@@ -16,6 +16,7 @@ import datetime
 import pytest
 from sqlalchemy import select
 
+from anidb_client.errors import AniDBBannedError, AniDBCommandTimeoutError
 from tests import factories
 from tests.objectlayer import FakeResponse
 
@@ -354,3 +355,53 @@ class TestUpdateMylist:
             from anidb_client.db import FileTable
 
             assert check.scalars(select(FileTable)).one().lid is None
+
+
+class TestMylistWritesThatCannotReachAniDB:
+    """A write that quietly fails is worse than a read that quietly fails.
+
+    A read that gives up costs a stale value. A mylist write that gives up leaves
+    the caller believing it changed someone's collection records when it did not
+    -- and, before this, leaves it believing that forever, because the call never
+    returned at all.
+
+    Distinct from a rejection *by* AniDB, which is still logged rather than
+    raised: that request arrived and was answered, and the answer was no.
+    """
+
+    def test_a_banned_add_raises(self, cached_file, link):
+        link.fails("MYLISTADD", AniDBBannedError("555 BANNED"))
+
+        with pytest.raises(AniDBBannedError):
+            cached_file.update_mylist(state="on hdd")
+
+    def test_an_unanswered_add_raises(self, cached_file, link):
+        link.fails("MYLISTADD", AniDBCommandTimeoutError("MYLISTADD went unanswered"))
+
+        with pytest.raises(AniDBCommandTimeoutError):
+            cached_file.update_mylist(state="on hdd")
+
+    def test_a_banned_removal_raises(self, cached_file, link):
+        link.fails("MYLISTDEL", AniDBBannedError("555 BANNED"))
+
+        with pytest.raises(AniDBBannedError):
+            cached_file.remove_from_mylist()
+
+    def test_a_banned_removal_of_a_generic_file_raises_on_the_first_episode(self, generic_file, link):
+        """The per-episode loop must stop, not carry on into a banned API.
+
+        Each iteration is another request, and continuing to send them after
+        being told to stop is the behaviour that lengthens a ban.
+        """
+        link.fails("MYLISTDEL", AniDBBannedError("555 BANNED"))
+
+        with pytest.raises(AniDBBannedError):
+            generic_file.remove_from_mylist()
+
+        assert len(link.requests_for("MYLISTDEL")) == 1
+
+    def test_a_rejection_by_anidb_is_still_not_an_error(self, cached_file, link, caplog):
+        """The line between "AniDB said no" and "we never asked"."""
+        link.on("MYLISTADD", FakeResponse("320"))
+
+        cached_file.update_mylist(state="on hdd")

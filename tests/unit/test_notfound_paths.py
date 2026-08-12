@@ -1,17 +1,23 @@
 """Tests for what happens when AniDB says it does not have something.
 
 These paths were the least exercised in the library and the most dangerous when
-wrong. The object layer waits on a `threading.Event` with no timeout, and only a
-callback sets it -- so any callback that returns, or raises, before signalling
-does not degrade, it deadlocks the calling application permanently.
+wrong. A callback that returns, or raises, before signalling does not degrade the
+result -- it strands whoever asked for it.
 
-Each test here asserts the completion event is set. That is the invariant: a
+Most tests here assert the completion event is set. That is the invariant: a
 callback may fail, may mark the object illegal, may store nothing -- but it must
 always signal that it is finished.
+
+`TestNoReplyAtAll` covers the other half, and the one the reported incident took:
+no callback runs at all, because there is no reply. Nothing sets the event
+because nothing was ever going to. That case cannot be fixed by being careful
+inside callbacks; it needs the request itself to carry a failure, and the wait on
+it to be bounded.
 """
 
 import pytest
 
+from anidb_client.errors import AniDBBannedError, AniDBCommandTimeoutError
 from tests import factories
 from tests.objectlayer import FakeResponse
 
@@ -135,3 +141,68 @@ class TestCallbacksAlwaysSignal:
                     offenders.append(f"{node.name}: return at line {ret} precedes any completion signal")
 
         assert offenders == [], "; ".join(offenders)
+
+
+class TestNoReplyAtAll:
+    """The incident, from the caller's side.
+
+    AniDB answered `555 BANNED`, so no callback ever ran, so nothing set the
+    event the object layer was waiting on. `Anime(5587)` never returned. The
+    process stayed alive and idle, wrote nothing, produced no exit code, and had
+    to be killed -- and to the caller that was indistinguishable from work still
+    in progress.
+
+    Each of these gives the transport's answer as "there will not be one", which
+    is the case a recording double that only ever invokes callbacks cannot reach.
+    """
+
+    def test_a_banned_request_raises_instead_of_hanging(self, anidb, link):
+        link.fails("ANIME", AniDBBannedError("555 BANNED"))
+
+        with pytest.raises(AniDBBannedError):
+            _ = anidb.Anime(6187).year
+
+    def test_a_timed_out_request_raises_instead_of_hanging(self, anidb, link):
+        link.fails("ANIME", AniDBCommandTimeoutError("ANIME went unanswered"))
+
+        with pytest.raises(AniDBCommandTimeoutError):
+            _ = anidb.Anime(6187).year
+
+    def test_the_reason_reaches_the_caller_unchanged(self, anidb, link):
+        """Not just "something went wrong": which thing, so a caller can act.
+
+        A ban means back off and try later; a not-found means stop asking. The
+        object layer used to be able to express neither -- an unknown attribute
+        answers None, and a ban answered nothing at all.
+        """
+        link.fails("EPISODE", AniDBBannedError("555 BANNED"))
+
+        with pytest.raises(AniDBBannedError, match="555 BANNED"):
+            _ = anidb.Episode(eid=96461).title
+
+    def test_a_failed_request_does_not_leave_the_object_locked(self, anidb, link):
+        """The lock is taken by update() and released by the thread doing the work.
+
+        Released in a finally, or the first failure leaves the object marked as
+        permanently updating -- after which every later update() takes the "one is
+        already running" branch and returns without doing anything, and the object
+        never refreshes again for the life of the process.
+        """
+        link.fails("ANIME", AniDBBannedError("555 BANNED"))
+        anime = anidb.Anime(6187)
+
+        with pytest.raises(AniDBBannedError):
+            anime.update(block=True)
+
+        assert anime._updating.acquire(False), "the update lock was never released"
+        anime._updating.release()
+
+    def test_a_request_nobody_is_waiting_on_does_not_raise(self, anidb, link):
+        """A non-blocking update has no caller to raise to.
+
+        It still fails, and the transport still logs it; what it must not do is
+        take down the thread of whoever happened to trigger it.
+        """
+        link.fails("ANIME", AniDBBannedError("555 BANNED"))
+
+        anidb.Anime(6187).update(block=False)
