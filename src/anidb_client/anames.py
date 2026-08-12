@@ -150,12 +150,6 @@ def update_anilist() -> None:
             anilist[aid]["map"] = {}
             for m in mappings.iter("mapping"):
                 attrs: AnilistEntry = dict(m.attrib)
-                for source in ("tmdb", "tvdb"):
-                    if source not in anilist[aid]["map"]:
-                        anilist[aid]["map"][source] = []
-                    if f"{source}season" not in attrs:
-                        continue
-
                 if m.text:
                     attrs["epmap"] = {}
                     episodes = m.text.strip(";").split(";")
@@ -180,7 +174,20 @@ def update_anilist() -> None:
                             newmap[anidb_ep] = (my_epno, part)
                     attrs["epmap"] = newmap
 
-                anilist[aid]["map"][source].append(attrs)
+                # File the mapping under the service its own season attribute
+                # names -- the same attribute _get_tv_episode() then requires of
+                # it, which is why both ends read the key out of one table. The
+                # Anime-Lists schema keeps the services apart, one <mapping> per
+                # service, but the file is community-maintained and the schema is
+                # documentation rather than a validated contract, so an element
+                # naming both is filed under both. One naming neither is filed
+                # nowhere: it describes no service, and the reader would skip it
+                # wherever it landed.
+                for source, keys in _tv_mappings.items():
+                    anilist[aid]["map"].setdefault(source, [])
+                    if keys["map_season"] not in attrs:
+                        continue
+                    anilist[aid]["map"][source].append(attrs)
 
         name = anime.find("name")
         anilist[aid]["name"] = name.text if name is not None else None

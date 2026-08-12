@@ -10,11 +10,9 @@ shape is unusually varied for something undocumented by tests -- an int, an
 `(episode, part)` tuple, a list of ints, or `(None, None)` -- and the README
 promises all of them.
 
-The mapping documents are supplied by the fixture, exactly as update_anilist()
-would have built them from Anime-Lists.
+The mapping documents are supplied by the fixture, which stubs the download and
+then runs the real `update_anilist()` over them.
 """
-
-import xml.etree.ElementTree as etree
 
 import pytest
 
@@ -22,16 +20,15 @@ from tests import factories
 
 
 class TestUpdateAnilistParsing:
-    """The real `update_anilist()` parse loop, which nothing else exercises.
+    """The `update_anilist()` parse loop, read at the table it builds.
 
-    Every other test here takes its mapping table from the fixture, which builds
-    the dict itself (`tests/factories.py`) rather than calling the production
-    loop. So the loop had no coverage at all -- which is how a deprecated
-    ElementTree truth test lived in it unnoticed. `if mappings:` is False for an
+    Every other test here reaches it through the fixture, which asks about one
+    episode at a time; these look at the whole table, because the loop's failures
+    have been in what it puts where rather than in any single lookup. It once
+    reimplemented an ElementTree truth test -- `if mappings:` is False for an
     element with no children, so a present-but-empty `<mapping-list/>` read as
-    absent; and ElementTree deprecated the truth test outright, which this
-    package's `filterwarnings` setting turns into an error the moment any test
-    reaches the line.
+    absent -- and it once filed every mapping, whatever service it named, under
+    `map["tvdb"]`.
     """
 
     POPULATED = """<anime-list>
@@ -48,18 +45,33 @@ class TestUpdateAnilistParsing:
       </anime>
     </anime-list>"""
 
+    TMDB_ONLY = """<anime-list>
+      <anime anidbid="6187" tmdbtv="79895">
+        <mapping-list><mapping anidbseason="1" tmdbseason="1">;1-5;</mapping></mapping-list>
+        <name>Toradora!</name>
+      </anime>
+    </anime-list>"""
+
+    BOTH_SERVICES = """<anime-list>
+      <anime anidbid="6187" tvdbid="79895" tmdbtv="46225">
+        <mapping-list>
+          <mapping anidbseason="1" tvdbseason="1">;1-1;</mapping>
+          <mapping anidbseason="1" tmdbseason="2">;1-5;</mapping>
+        </mapping-list>
+        <name>Toradora!</name>
+      </anime>
+    </anime-list>"""
+
+    NO_SERVICE = """<anime-list>
+      <anime anidbid="6187" tvdbid="79895">
+        <mapping-list><mapping anidbseason="1">;1-5;</mapping></mapping-list>
+        <name>Toradora!</name>
+      </anime>
+    </anime-list>"""
+
     @staticmethod
     def _parse(monkeypatch, xml_text):
-        import anidb_client.anames as anames
-
-        # Registered with monkeypatch so the module global is restored afterwards:
-        # update_anilist() rebinds it directly, which nothing else would undo.
-        monkeypatch.setattr(anames, "anilist", None)
-        monkeypatch.setattr(anames, "update_xml", lambda _url: "/ignored")
-        monkeypatch.setattr(anames, "_read_anidb_xml", lambda _path: etree.fromstring(xml_text))
-
-        anames.update_anilist()
-        return anames.anilist
+        return factories.install_anime_list(monkeypatch, xml_text)
 
     def test_a_populated_mapping_list_is_parsed(self, monkeypatch):
         anilist = self._parse(monkeypatch, self.POPULATED)
@@ -73,6 +85,35 @@ class TestUpdateAnilistParsing:
         anilist = self._parse(monkeypatch, self.EMPTY_MAPPING_LIST)
 
         assert anilist["1"]["map"] == {}
+
+    def test_a_tmdb_mapping_is_filed_under_tmdb(self, monkeypatch):
+        """The loop used to append to whichever source its inner loop ended on,
+        which was always `tvdb`. A TMDB-only document therefore built an empty
+        `map["tmdb"]` and a `map["tvdb"]` holding a mapping the TVDB reader then
+        skipped -- so the per-episode maps, the highest-priority of the three
+        mechanisms, were unreachable for TMDB and lookups fell through to the
+        anime-level default season silently."""
+        anilist = self._parse(monkeypatch, self.TMDB_ONLY)
+
+        assert anilist["6187"]["map"]["tvdb"] == []
+        assert anilist["6187"]["map"]["tmdb"][0]["epmap"] == {"1": "5"}
+
+    def test_each_service_gets_only_the_mappings_that_name_it(self, monkeypatch):
+        """Anime-Lists writes one `<mapping>` per service, so a document mapped at
+        both carries two -- and neither belongs in the other's list."""
+        anilist = self._parse(monkeypatch, self.BOTH_SERVICES)
+        maps = anilist["6187"]["map"]
+
+        assert [m["tvdbseason"] for m in maps["tvdb"]] == ["1"]
+        assert [m["tmdbseason"] for m in maps["tmdb"]] == ["2"]
+
+    def test_a_mapping_naming_no_service_is_filed_nowhere(self, monkeypatch):
+        """It describes no service, so there is no list it belongs in -- and the
+        reader requires the season attribute it lacks, so it would be skipped
+        wherever it landed. It used to land in `map["tvdb"]` by accident."""
+        anilist = self._parse(monkeypatch, self.NO_SERVICE)
+
+        assert anilist["6187"]["map"] == {"tvdb": [], "tmdb": []}
 
 
 @pytest.fixture
@@ -156,7 +197,8 @@ class TestSpecialNumbering:
 
 class TestTmdbUsesTheSameMachinery:
     def test_tmdb_mapping_is_absent_when_the_document_has_none(self, mapped, session):
-        """The fixture maps tvdb only, so tmdb must decline rather than reuse it.
+        """This anime is mapped at tvdb only, so tmdb must decline rather than
+        reuse it.
 
         Worth pinning: both sources go through one function parameterised by a
         key table, and the failure mode of getting that wrong is returning TVDB
@@ -164,6 +206,19 @@ class TestTmdbUsesTheSameMachinery:
         """
         ep = episode(mapped, session, aid=6187, epno="5", eid=900400)
         assert ep.tmdb_episode == (None, None)
+
+    def test_a_per_episode_tmdb_map_is_used(self, mapped, session):
+        """The end of the path the misfiling broke.
+
+        Anime 1 is mapped at both services, to a different season and episode at
+        each: tvdb says season 1 episode 1, tmdb says season 2 episode 5. While
+        every mapping was filed under tvdb this answered from the anime-level
+        fallback instead -- a different answer, arrived at silently.
+        """
+        ep = episode(mapped, session, aid=1, epno="1", eid=900401)
+
+        assert ep.tmdb_episode == (2, 5)
+        assert ep.tvdb_episode == (1, 1)
 
 
 class TestMoviePartHandling:
