@@ -33,7 +33,9 @@ documents — do not load every spec and ADR.
 
 `anidb-client` is a Python library: an object-oriented client for the AniDB UDP
 API, with an aggressive SQL cache in front of it. It is published to PyPI as a
-wheel. There is no service, no deployment, and no API of its own to serve — the
+wheel. It targets **Python 3.14 and nothing older** — `requires-python`, ruff's
+`target-version` and the pinned toolchain image all say so — and deliberately
+uses current syntax rather than a conservative subset (SPEC-007). There is no service, no deployment, and no API of its own to serve — the
 package's public surface (`anidb_client.__all__`) is what users consume.
 
 Two lines of truth sit above prose here, and they are not the same kind of thing:
@@ -171,6 +173,15 @@ If no drift is detected, report: "No drift detected."
   code or command parameter is describing an external contract. Do not report
   drift because the spec's protocol description is incomplete — only when it
   contradicts what this codebase actually does with it.
+- **Do not report modern syntax as invalid**: this package targets Python 3.14,
+  which is likely newer than your training data. Unfamiliar syntax is not
+  thereby wrong. PEP 758 in particular allows `except A, B:` **without**
+  parentheses when no `as` clause binds the exception — that is 3.14 syntax, not
+  the Python 2 `except E, e:` bind form, and ruff's own formatter *emits* it at
+  `target-version = "py314"`. More generally: `lint`, `typecheck` and `test` all
+  parse the same source you are reading, so a real syntax error could never have
+  reached you. Before calling anything a syntax error, ask what the interpreter
+  would have to have done for the diff to exist at all.
 - **Verify states, never infer histories**: A diff shows outcomes, not the
   commands that produced them. Never report that a process step (a skill,
   validator, or generator run) was skipped — that is unobservable from a diff.

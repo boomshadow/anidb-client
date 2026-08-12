@@ -962,7 +962,7 @@ class File(AniDBObj):
                     finfo["aid"] = anime.aid
                     finfo["eid"] = episodes[0].eid
                     finfo["is_generic"] = self._is_generic
-                except (IllegalAnimeObject, IndexError, TypeError):
+                except IllegalAnimeObject, IndexError, TypeError:
                     self._illegal_object = True
                     # Signal before returning. `_file_updated` is otherwise only set
                     # at the very end of this method, so bailing out here left every

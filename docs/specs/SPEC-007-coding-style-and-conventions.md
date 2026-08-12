@@ -1,8 +1,8 @@
 ---
 title: "Coding Style and Conventions"
-description: "House coding conventions for anidb-client: Docker-native development with no host Python toolchain, the Taskfile as the developer-command entry point, ruff for formatting and linting, the mypy per-module strictness ratchet, codespell, the pin-and-verify supply-chain posture (exact pins, hashed uv.lock, a 45-day soak declared to the resolver, a digest-pinned base image), the no-network testing discipline enforced by the suite itself rather than by the runner, and the ratcheting coverage floor."
+description: "House coding conventions for anidb-client: Docker-native development with no host Python toolchain, the Taskfile as the developer-command entry point, a current-rather-than-conservative interpreter floor restated to ruff, to mypy and in the pinned image tag rather than derived, ruff for formatting and linting, the mypy per-module strictness ratchet, codespell, the pin-and-verify supply-chain posture (exact pins, hashed uv.lock, a 45-day soak declared to the resolver, a digest-pinned base image), the no-network testing discipline enforced by the suite itself rather than by the runner, and the ratcheting coverage floor."
 status: accepted
-tags: [coding-style, conventions, python, ruff, mypy, ratchet, codespell, docker-native, taskfile, uv, uv-lock, supply-chain, pin-and-verify, soak, digest-pin, editorconfig, testing, network-guard, fake-server, coverage, coverage-floor, postgres-marker]
+tags: [coding-style, conventions, python, interpreter-floor, requires-python, target-version, ruff, mypy, ratchet, codespell, docker-native, taskfile, uv, uv-lock, supply-chain, pin-and-verify, soak, digest-pin, editorconfig, testing, network-guard, fake-server, coverage, coverage-floor, postgres-marker]
 ---
 
 # Coding Style and Conventions
@@ -14,6 +14,16 @@ This spec is the signpost for how code is written and checked here. The enforcin
 Everything runs inside a container. The host is expected to have Docker and [Task](https://taskfile.dev) and nothing else — no Python, no uv, no ruff, no pytest. Because this project is a library with no long-running service, the dev container is one-shot: commands run through `docker compose run --rm`, which the Taskfile wraps.
 
 The Taskfile is the line of truth for developer commands. `task --list` is the discoverable surface, and `task check` runs what CI runs. When a common operation appears, it gets a task.
+
+## The interpreter floor is current, not conservative
+
+`requires-python` names a recent Python rather than the oldest one the code would still run on. The trade is deliberate: supporting a range means either avoiding newer idioms or guarding them, and this package would rather read as current code. Raising the floor is a normal change here, not an event.
+
+That floor is **restated in three places rather than derived**, and knowing where they are is the point of this section.
+
+To ruff as `target-version` and to mypy as `python_version`: ruff infers it from `requires-python` when it is not declared, and the inferred value silently decides which rewrites the `UP` and `FURB` rules propose and whether the formatter emits syntax older interpreters cannot parse — behavior worth being able to see in the config rather than derive.
+
+And, least visibly, in the **tag of the pinned toolchain image**, which the `Dockerfile` and the CI pipeline both name. Nothing derives that tag from `requires-python`, so raising the floor means bumping the image in the same change or the two silently disagree. SPEC-008's reason for having no oldest-interpreter job rests entirely on those two agreeing.
 
 ## Formatting, linting and typing
 

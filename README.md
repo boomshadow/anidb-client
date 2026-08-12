@@ -36,7 +36,7 @@ deliberately **not** part of this package. `anidb-client` is a library.
 
 ## Requirements
 
-* Python 3.11 or newer
+* Python 3.14.5 or newer
 * A SQLAlchemy-compatible database for the cache:
   * SQLite (simplest; a file is all you need)
   * PostgreSQL
