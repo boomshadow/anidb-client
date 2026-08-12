@@ -1,8 +1,9 @@
 """Tests for the outbound pacing policy.
 
 This is the code that keeps a client from being banned, so it is worth testing
-directly rather than inferring it from transport behaviour. The clock and sleep
-are injected, so a half-hour ban back-off is asserted in microseconds.
+directly rather than inferring it from transport behaviour. The clock, the sleep
+and the jitter roll are all injected, so a half-hour back-off window is asserted
+in microseconds and exactly.
 """
 
 import threading
@@ -28,9 +29,15 @@ class FakeClock:
         self.now += seconds
 
 
-def make(clock=None):
+def make(clock=None, random=None):
+    """A limiter on a controlled clock, and by default an unjittered back-off.
+
+    `random=lambda: 1.0` means "the top of the jitter range", which makes the
+    back-off exactly the computed window and lets these tests assert on it. The
+    jitter itself has its own tests below.
+    """
     clock = clock or FakeClock()
-    return RateLimiter(monotonic=clock.monotonic, sleep=clock.sleep), clock
+    return RateLimiter(monotonic=clock.monotonic, sleep=clock.sleep, random=random or (lambda: 1.0)), clock
 
 
 class TestBurstThenSteadyRate:
@@ -100,23 +107,79 @@ class TestBanBackoff:
         limiter, _ = make()
         assert not limiter.is_banned
 
-    def test_the_first_ban_waits_the_base_delay(self):
+    def test_the_first_ban_closes_the_window_for_about_the_base_delay(self):
+        """A window on the clock, not a sleep.
+
+        Nothing waits this out. The sender asks whether the window is still open
+        and declines to send if it is, which is what keeps the listener reading
+        the socket while the back-off runs.
+        """
         limiter, clock = make()
         limiter.register_ban()
-        limiter.wait()
-        assert clock.slept[0] == RateLimiter.BAN_BASE_DELAY
+
+        assert clock.slept == [], "a ban must not be slept"
+        assert 0 < limiter.ban_remaining() <= RateLimiter.BAN_BASE_DELAY
 
     def test_consecutive_bans_double_the_wait(self):
         """Exponential, so a server that stays unhappy is backed away from."""
         limiter, _ = make()
         assert [limiter.register_ban() for _ in range(4)] == [1, 2, 4, 8]
 
-    def test_the_back_off_reflects_the_current_multiplier(self):
-        limiter, clock = make()
+    def test_the_window_reflects_the_current_multiplier(self):
+        limiter, _ = make(random=lambda: 1.0)
         limiter.register_ban()
         limiter.register_ban()
-        limiter.wait()
-        assert clock.slept[0] == RateLimiter.BAN_BASE_DELAY * 2
+
+        assert limiter.ban_remaining() == RateLimiter.BAN_BASE_DELAY * 2
+
+    def test_the_window_closes_once_it_has_elapsed(self):
+        limiter, clock = make(random=lambda: 1.0)
+        limiter.register_ban()
+
+        clock.advance(RateLimiter.BAN_BASE_DELAY)
+
+        assert limiter.ban_remaining() == 0
+
+    def test_an_elapsed_window_does_not_clear_the_ban(self):
+        """Only a successful authentication does.
+
+        Otherwise a client that comes back, is refused again and re-bans starts
+        from the base delay every time, and never actually backs further off.
+        """
+        limiter, clock = make(random=lambda: 1.0)
+        limiter.register_ban()
+        clock.advance(RateLimiter.BAN_BASE_DELAY)
+
+        assert limiter.is_banned
+        assert limiter.register_ban() == 2
+
+    def test_the_window_is_jittered(self):
+        """Ten cron processes banned together must not come back together.
+
+        The incident had exactly that: separate short-lived processes on one host,
+        each authenticating for itself. Without jitter they return in step, which
+        against a service that counts requests per client is a burst.
+        """
+        rolls = iter([0.0, 0.25, 1.0])
+        windows = []
+        for roll in rolls:
+            limiter, _ = make(random=lambda roll=roll: roll)
+            limiter.register_ban()
+            windows.append(limiter.ban_remaining())
+
+        assert len(set(windows)) == 3, f"the back-off did not vary: {windows}"
+
+    def test_jitter_never_shortens_the_back_off_to_nothing(self):
+        """The lowest roll must still be a real back-off.
+
+        Full jitter -- uniform from zero -- is the usual advice and is wrong here:
+        a client that rolls low comes back almost immediately, which is the one
+        thing not to do to a service that bans on request frequency.
+        """
+        limiter, _ = make(random=lambda: 0.0)
+        limiter.register_ban()
+
+        assert limiter.ban_remaining() >= RateLimiter.BAN_BASE_DELAY * RateLimiter.BAN_JITTER_FLOOR
 
     def test_a_successful_auth_clears_the_ban(self):
         """clear_ban is called from the auth handler: the back-off has served."""
@@ -125,6 +188,7 @@ class TestBanBackoff:
         limiter.clear_ban()
 
         assert not limiter.is_banned
+        assert limiter.ban_remaining() == 0
         limiter.wait()
         assert clock.slept == []
 
@@ -147,12 +211,11 @@ class TestBanBackoff:
         assert [limiter.register_ban() for _ in range(6)] == [1, 2, 4, 8, 8, 8]
 
     def test_the_longest_back_off_is_bounded(self):
-        limiter, clock = make()
+        limiter, _ = make(random=lambda: 1.0)
         for _ in range(20):
             limiter.register_ban()
-        limiter.wait()
 
-        assert clock.slept[0] == RateLimiter.BAN_BASE_DELAY * RateLimiter.MAX_BAN_MULTIPLIER
+        assert limiter.ban_remaining() == RateLimiter.BAN_BASE_DELAY * RateLimiter.MAX_BAN_MULTIPLIER
 
 
 class TestSendAccounting:
@@ -175,12 +238,14 @@ class TestThreadSafety:
     """
 
     def test_the_lock_is_not_held_across_the_sleep(self):
-        """A ban back-off is measured in half-hours. Holding the lock for the
-        length of one would stop the listener reporting the next ban at all, so the
-        delay is computed under the lock and slept for outside it.
+        """The pacing delay is computed under the lock and slept for outside it.
 
-        The injected sleep stands in for that half hour, and a second thread stands
-        in for the listener arriving during it.
+        Seconds rather than half-hours now that a ban is a window rather than a
+        sleep, but the property still has to hold: a sender paused between
+        commands must not be able to stop the listener reporting a ban.
+
+        The injected sleep stands in for that pause, and a second thread stands in
+        for the listener arriving during it.
         """
         reported = threading.Event()
 
