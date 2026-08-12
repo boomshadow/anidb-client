@@ -22,6 +22,7 @@ import threading
 import zlib
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import Future
 from time import monotonic
 from typing import Any
 
@@ -29,7 +30,14 @@ from Crypto.Cipher import AES
 
 import anidb_client.commands
 from anidb_client.commands import Command
-from anidb_client.errors import AniDBInternalError, AniDBMustAuthError
+from anidb_client.errors import (
+    AniDBAuthFailedError,
+    AniDBBannedError,
+    AniDBCommandTimeoutError,
+    AniDBError,
+    AniDBInternalError,
+    AniDBMustAuthError,
+)
 from anidb_client.ratelimit import RateLimiter
 from anidb_client.responses import Disposition, Response, ResponseResolver, disposition_for
 
@@ -43,6 +51,12 @@ class AniDBLink(threading.Thread):
     # How long the sender waits on an empty queue before checking whether the
     # session needs a keepalive.
     IDLE_TICK = 0.2
+
+    # Backstop on waiting for a handshake to settle, as a multiple of the
+    # transport timeout. The AUTH command's own timeout normally settles it well
+    # inside this; the multiplier exists so that a handshake which somehow
+    # settles neither way releases the sender instead of parking it forever.
+    AUTH_TIMEOUT_FACTOR = 3
 
     # Set when an ENCRYPT round trip completes; there is no unencrypted path
     # through _encryption_handler, so it is never assigned otherwise.
@@ -102,6 +116,15 @@ class AniDBLink(threading.Thread):
         # each take it in turn, which is close enough to nesting to be worth saying.
         self._auth_lock = threading.Lock()
         self._session: str | None = None
+        # The handshake currently in flight, if any. `_authed` is an Event, and an
+        # Event can only ever say "it worked" -- so when AniDB answered AUTH with a
+        # refusal there was no signal to give, and the sender waited on an
+        # authentication that had already been answered and dropped.
+        self._auth_attempt: Future[None] | None = None
+        # Set once authentication has failed for a reason retrying cannot change.
+        # Latched on purpose: re-sending credentials AniDB has already rejected is
+        # one of the surest ways to turn a refusal into a ban.
+        self._auth_fatal: AniDBAuthFailedError | None = None
 
         self._api_key = api_key
 
@@ -153,26 +176,109 @@ class AniDBLink(threading.Thread):
 
     def _reauthenticate(self) -> None:
         with self._auth_lock:
-            if self._authenticating.is_set() or self._authed.is_set():
+            if self._auth_fatal is not None or self._authenticating.is_set() or self._authed.is_set():
                 return
             self._authenticating.set()
+            self._auth_attempt = Future()
         if self._api_key:
             self._start_encrypted_session()
         else:
             self._send_auth()
 
+    def _settle_auth(self, error: AniDBError | None) -> None:
+        """Release whoever is waiting on the handshake, one way or the other.
+
+        Every path that ends an authentication attempt comes through here, which
+        is the whole point: an attempt that ends without settling its future is a
+        sender parked on a reply that has already been and gone.
+        """
+        with self._auth_lock:
+            attempt, self._auth_attempt = self._auth_attempt, None
+        if attempt is None or attempt.done():
+            return
+        if error is None:
+            attempt.set_result(None)
+        else:
+            attempt.set_exception(error)
+
     def _auth_handler(self, resp: Response) -> None:
         # Authentication succeeded, so whatever the back-off was for has passed.
         self._rate_limiter.clear_ban()
-        addr = resp.attrs["address"]
-        _ip, port = addr.split(":")
-        if int(port) != self._myport:
+        # .get, not a subscript. AniDB only returns the address when AUTH asked
+        # for it with nat=1, and a reply that parsed without the field raised
+        # KeyError here -- on a response thread, where it was invisible, and
+        # before anything had been signalled.
+        addr = resp.attrs.get("address", "")
+        _ip, _sep, port = addr.rpartition(":")
+        if port.isdigit() and int(port) != self._myport:
             self._do_ping = True
             anidb_client.log.info(f"NAT detected: will send PING every {self._nat_ping_interval} seconds")
         with self._auth_lock:
             self._authed.set()
             self._authenticating.clear()
+        self._settle_auth(None)
         anidb_client.log.info(f"Logged in to AniDB with session {self.session}")
+
+    def auth_failed(self, rescode: str, reason: str) -> None:
+        """Report that a handshake round trip came back as anything but success.
+
+        Called from the listener thread, which is the only one that sees the
+        reply, and from a handshake command's timeout. It settles the waiting
+        sender rather than leaving it on an Event that nothing will ever set.
+
+        Whether another attempt is worth making is decided from the response
+        table: a code that means the server is unhappy -- busy, down, banning us
+        for now -- backs off and may be retried later. Anything else is a refusal
+        of these credentials or this client identity, which no amount of retrying
+        will change, so it is latched and no further AUTH is sent.
+        """
+        error: AniDBError
+        if disposition_for(rescode) is not Disposition.NORMAL:
+            error = AniDBBannedError(f"AniDB refused authentication: {rescode} {reason}")
+            # register_ban() rather than set_banned(): this runs on the listener
+            # thread, and set_banned() re-authenticates, which would send AUTH --
+            # and pay the back-off sleep -- from the thread that has to keep
+            # reading the socket. The sender re-authenticates on its next command
+            # and waits out the back-off there, where waiting is free.
+            self._rate_limiter.register_ban()
+            anidb_client.log.error(f"Backing off: {error}")
+        else:
+            error = AniDBAuthFailedError(f"AniDB refused authentication and retrying will not help: {rescode} {reason}")
+            anidb_client.log.error(str(error))
+        with self._auth_lock:
+            if isinstance(error, AniDBAuthFailedError):
+                self._auth_fatal = error
+            self._authed.clear()
+            self._authenticating.clear()
+            self._session = None
+            self._listener.cipher = None
+        self._settle_auth(error)
+
+    def _await_auth(self) -> None:
+        """Block until the handshake settles, raising if it settled as a failure.
+
+        Was `self._authed.wait()` with no timeout and no failure case, which is
+        the second half of the reported hang: the first half dropped the reply,
+        this half waited for it forever.
+        """
+        deadline = monotonic() + self.timeout * self.AUTH_TIMEOUT_FACTOR
+        while True:
+            with self._auth_lock:
+                if self._auth_fatal is not None:
+                    raise self._auth_fatal
+                if self._authed.is_set():
+                    return
+                attempt = self._auth_attempt
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise AniDBCommandTimeoutError("Timed out waiting for authentication")
+            if attempt is None:
+                # Nothing in flight and not authenticated: an attempt settled
+                # without authenticating us. Waiting longer cannot change that.
+                raise AniDBMustAuthError("Authentication did not complete")
+            # Raises whatever failed the attempt, or returns and the loop above
+            # confirms the session really is up before any command goes out.
+            attempt.result(timeout=remaining)
 
     def _new_tag(self) -> str:
         """Return the next correlation tag, cycling T001..T999.
@@ -248,7 +354,29 @@ class AniDBLink(threading.Thread):
                 self._send_command(command)
             else:
                 self.reauthenticate()
-                self._authed.wait()
+                try:
+                    self._await_auth()
+                except AniDBAuthFailedError as e:
+                    # No session is ever coming. The command must not be left in
+                    # the table of commands awaiting a reply either: it has no
+                    # send time, so the timeout sweep skips it, and it would sit
+                    # there unanswered and unswept for the life of the process.
+                    anidb_client.log.error(f"Dropping {command.command} ({command.tag}): {e}")
+                    self._listener.pop_command(command.tag)
+                    if command.command == "LOGOUT":
+                        break
+                    continue
+                except AniDBError as e:
+                    # The handshake may still work later -- the API was busy, or
+                    # did not answer. Put the command back rather than losing it;
+                    # it stays registered under the same tag, and the back-off
+                    # registered by the failure decides when the next attempt goes
+                    # out. There is nothing to log out of if we never got in.
+                    if command.command == "LOGOUT":
+                        break
+                    anidb_client.log.warning(f"Requeueing {command.command} ({command.tag}): {e}")
+                    self._enqueue(command, prio=True)
+                    continue
                 self._send_command(command)
 
             if command.command == "LOGOUT":
@@ -550,7 +678,12 @@ class AniDBListener(threading.Thread):
                 continue
             resp = resolved.resolve(cmd)
             resp.parse()
+            if cmd.command in ("AUTH", "ENCRYPT") and not self._is_successful_handshake(cmd, resp):
+                self._last_receive = monotonic()
+                continue
             if resp.rescode in ("200", "201"):
+                # Safe to subscript: the check above returned True only for a
+                # handshake reply that carries this field.
                 self._sender.set_session(resp.attrs["sesskey"])
             elif resp.rescode in ("501", "506", "403"):
                 if cmd.command == "LOGOUT":
@@ -568,6 +701,29 @@ class AniDBListener(threading.Thread):
             resp_thread = threading.Thread(target=resp.handle)
             resp_thread.daemon = True
             resp_thread.start()
+
+    def _is_successful_handshake(self, cmd: Command, resp: Response) -> bool:
+        """True if this AUTH or ENCRYPT reply succeeded and may reach its handler.
+
+        A whitelist of the codes that mean success, rather than a list of the ones
+        that mean failure. The failure list is the thing that cannot be kept
+        complete -- and when it was incomplete, a refusal fell through to the
+        success handler, whose first act was to read a field only a successful
+        reply carries. That raised on this thread, nothing was signalled, and the
+        sender waited forever on a handshake that had already been answered.
+
+        The required field is checked too, not just the code: a success code
+        without its session key or salt is not something the handlers below can
+        use, and finding that out by raising inside them is exactly the failure
+        this exists to prevent.
+        """
+        if cmd.command == "AUTH":
+            if resp.rescode in ("200", "201") and resp.attrs.get("sesskey"):
+                return True
+        elif resp.rescode == "209" and resp.attrs.get("salt"):
+            return True
+        self._sender.auth_failed(resp.rescode, resp.resstr)
+        return False
 
     def _handle_timeouts(self) -> None:
         willpop = []
