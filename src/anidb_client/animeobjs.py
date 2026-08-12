@@ -830,7 +830,14 @@ class File(AniDBObj):
 
         if "-" in self.episode.episode_number:
             start, stop = self.episode.episode_number.split("-")
-            self._multiep = range(int(start), int(stop) + 1)
+            # Strings, like every other branch of this property. This was a bare
+            # `range`, so a ranged file's episode numbers were ints while an
+            # ordinary file's were strings -- and `__contains__` compares against
+            # `Episode.episode_number`, which is a string, so `episode in file`
+            # answered False for every episode of exactly the files it exists to
+            # describe. The mylist add and delete loops put the same values on the
+            # wire, where they went out as ints on this branch alone.
+            self._multiep = [str(x) for x in range(int(start), int(stop) + 1)]
             return self._multiep
 
         if self.path:

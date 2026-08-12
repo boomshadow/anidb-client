@@ -186,6 +186,34 @@ class TestUpdateMylist:
         epnos = [p["epno"] for p in link.params_for("MYLISTADD")]
         assert epnos == ["5", "6"]
 
+    def test_a_ranged_generic_file_sends_string_episode_numbers(self, anidb, session, link):
+        """The add loop reads the `multiep` property, not the cached attribute.
+
+        Its multi-episode branch used to answer with a `range`, so this one path
+        put ints on the wire where every other path -- including the sibling test
+        above, which sets the attribute directly and so never reaches the property
+        -- puts strings. AniDB records a file spanning several episodes as a single
+        episode row with a ranged epno, so this is the ordinary shape for the case,
+        not an edge.
+        """
+        from anidb_client.db import FileTable
+
+        session.add(factories.make_anime(aid=6187))
+        session.add(factories.make_episode(aid=6187, eid=96480, epno="5-7"))
+        session.add(factories.make_file(aid=6187, eid=96480, fid=None, lid=None, is_generic=True))
+        session.commit()
+        # Built from an Episode object rather than an epno string: the string form
+        # seeds `_multiep` from the argument, which short-circuits the property
+        # this test is about.
+        ranged = anidb.File(anime=6187, episode=anidb.Episode(eid=96480))
+        ranged.db_data = session.query(FileTable).one()
+        ranged._is_generic = True
+
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))
+        ranged.update_mylist(state="on hdd")
+
+        assert [p["epno"] for p in link.params_for("MYLISTADD")] == ["5", "6", "7"]
+
     def test_a_generic_add_is_marked_generic(self, generic_file, link):
         """Without generic=1 AniDB rejects an add for a file it has no record of."""
         link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))

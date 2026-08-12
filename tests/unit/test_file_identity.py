@@ -110,3 +110,58 @@ class TestMultiepDefault:
         first, _second = two_files
 
         assert first.multiep == ["5"]
+
+
+@pytest.fixture
+def ranged_file(anidb, session):
+    """A file whose episode number is itself a range, as AniDB records them.
+
+    A single file covering episodes 5 to 7 gets one episode row with epno "5-7";
+    `multiep` is what expands that back into the individual numbers.
+    """
+    session.add(factories.make_anime(aid=6187))
+    session.add(factories.make_episode(aid=6187, eid=96470, epno="5-7"))
+    session.add(factories.make_file(aid=6187, eid=96470, fid=12350))
+    session.commit()
+    return anidb.File(fid=12350)
+
+
+class TestARangedFilesEpisodeNumbers:
+    """The multi-episode branch used to answer with a `range` of ints.
+
+    Every other branch of `multiep` produces a list of strings, and the two are
+    not interchangeable: `Episode.episode_number` is a string, `"5" in range(5, 8)`
+    is False rather than an error, and the mylist commands put whatever they are
+    given straight on the wire. So the one branch that exists to describe a file
+    spanning several episodes was the one that answered wrongly about them.
+    """
+
+    def test_the_range_is_expanded_into_strings(self, ranged_file):
+        assert ranged_file.multiep == ["5", "6", "7"]
+
+    def test_every_branch_of_the_property_agrees_on_its_type(self, ranged_file, anidb, session):
+        """A property with two return types is the defect, not the range itself."""
+        session.add(factories.make_episode(aid=6187, eid=96473, epno="9"))
+        session.add(factories.make_file(aid=6187, eid=96473, fid=12351))
+        session.commit()
+        single = anidb.File(fid=12351)
+
+        assert {type(x) for x in ranged_file.multiep} == {str}
+        assert {type(x) for x in single.multiep} == {str}
+
+    def test_each_episode_of_the_range_is_in_the_file(self, ranged_file, anidb, session):
+        """What `__contains__` exists to answer, and answered False for.
+
+        `"6" in range(5, 8)` does not raise -- range falls back to iteration and
+        no int equals a string -- so this returned False silently.
+        """
+        session.add(factories.make_episode(aid=6187, eid=96471, epno="6"))
+        session.commit()
+
+        assert anidb.Episode(eid=96471) in ranged_file
+
+    def test_an_episode_outside_the_range_is_not_in_the_file(self, ranged_file, anidb, session):
+        session.add(factories.make_episode(aid=6187, eid=96472, epno="9"))
+        session.commit()
+
+        assert anidb.Episode(eid=96472) not in ranged_file
