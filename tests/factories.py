@@ -38,16 +38,20 @@ ANIME_TITLES_XML = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 # Anime-Lists mapping: one series with a straightforward tvdb season mapping, and
-# one with a per-episode map including a two-parter.
+# one with per-episode maps including a two-parter. The second series is mapped at
+# both services, to a deliberately different season and episode numbering at each,
+# so a lookup that read the wrong service's mappings would answer wrongly rather
+# than coincidentally right.
 ANIME_LIST_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <anime-list>
   <anime anidbid="6187" tvdbid="83243" defaulttvdbseason="1" episodeoffset="0">
     <name>Kemono no Souja Erin</name>
   </anime>
-  <anime anidbid="1" tvdbid="70863" defaulttvdbseason="1" episodeoffset="0">
+  <anime anidbid="1" tvdbid="70863" tmdbtv="46225" defaulttvdbseason="1" episodeoffset="0">
     <name>Seikai no Monshou</name>
     <mapping-list>
       <mapping anidbseason="1" tvdbseason="1">;1-1;2-2;3-3;4-3;</mapping>
+      <mapping anidbseason="1" tmdbseason="2">;1-5;2-6;</mapping>
     </mapping-list>
   </anime>
 </anime-list>
@@ -66,45 +70,24 @@ def install_title_data(monkeypatch, titles_xml=ANIME_TITLES_XML):
 
 
 def install_anime_list(monkeypatch, anime_list_xml=ANIME_LIST_XML):
-    """Populate the tvdb/tmdb mapping table that update_anilist() would download."""
+    """Populate the tvdb/tmdb mapping table by running the real parse.
+
+    Only the fetch is stubbed; `update_anilist()` itself builds the table, so every
+    test that reads a mapping reads one the production loop produced. This used to
+    reimplement the parse instead, which is how that loop came to file every TMDB
+    mapping under `map["tvdb"]` without a single test noticing.
+
+    The rebind goes through monkeypatch so the module global is restored at
+    teardown -- `update_anilist()` assigns it directly, which nothing else undoes.
+    """
     import anidb_client.anames
 
     monkeypatch.setattr(anidb_client.anames, "anilist", None)
-    xml = etree.fromstring(anime_list_xml)
-
-    anilist = {}
-    for anime in xml.iter("anime"):
-        attrs = dict(anime.attrib)
-        aid = attrs.pop("anidbid")
-        anilist[aid] = attrs
-        mappings = anime.find("mapping-list")
-        if mappings is not None:
-            anilist[aid]["map"] = {"tvdb": [], "tmdb": []}
-            for m in mappings.iter("mapping"):
-                entry = dict(m.attrib)
-                if m.text:
-                    epmap = {}
-                    for pair in m.text.strip(";").split(";"):
-                        anidb_ep, tvdb_ep = pair.split("-")
-                        epmap[anidb_ep] = tvdb_ep
-                    # Two AniDB episodes mapping to one TVDB episode become
-                    # (episode, part) tuples, mirroring update_anilist().
-                    ordered = sorted(epmap, key=int)
-                    resolved = {}
-                    for anidb_ep in ordered:
-                        target = epmap[anidb_ep]
-                        siblings = [x for x in ordered if epmap[x] == target]
-                        if len(siblings) == 1:
-                            resolved[anidb_ep] = target
-                        else:
-                            resolved[anidb_ep] = (target, siblings.index(anidb_ep) + 1)
-                    entry["epmap"] = resolved
-                anilist[aid]["map"]["tvdb"].append(entry)
-        name = anime.find("name")
-        anilist[aid]["name"] = name.text if name is not None else None
-
-    monkeypatch.setattr(anidb_client.anames, "anilist", anilist)
-    return anilist
+    with monkeypatch.context() as stubbed:
+        stubbed.setattr(anidb_client.anames, "update_xml", lambda _url: "/ignored")
+        stubbed.setattr(anidb_client.anames, "_read_anidb_xml", lambda _path: etree.fromstring(anime_list_xml))
+        anidb_client.anames.update_anilist()
+    return anidb_client.anames.anilist
 
 
 def _stamp(updated=None, dice=None):
