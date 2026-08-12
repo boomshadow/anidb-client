@@ -1,8 +1,8 @@
 ---
 title: "Configuration and Credentials"
-description: "Behavioral expectations for initialising anidb-client: init() as the single required entry point, the database URL, the three credential sources it resolves (direct arguments, a netrc file, or neither in db_only mode), the exact netrc machine-name matching rules for AniDB credentials, database credentials and the fanart key, safe injection of a netrc-sourced password into the SQL URL, the registered client identity, the encryption key, logging setup, and close() as the clean shutdown."
+description: "Behavioral expectations for initialising anidb-client: init() as the single required entry point, the database URL and the in-memory URL it refuses outside db_only mode, the connection-pool size it exposes, the three credential sources it resolves (direct arguments, a netrc file, or neither in db_only mode), the exact netrc machine-name matching rules for AniDB credentials, database credentials and the fanart key, safe injection of a netrc-sourced password into the SQL URL, the registered client identity, the encryption key, logging setup, and close() as the clean shutdown."
 status: accepted
-tags: [configuration, init, credentials, netrc, database-url, sql-url, db-only, client-registration, client-name, client-version, encryption-key, api-key, fanart-key, logging, udp-port, http-timeout, close, shutdown]
+tags: [configuration, init, credentials, netrc, database-url, sql-url, db-only, in-memory, connection-pool, client-registration, client-name, client-version, encryption-key, api-key, fanart-key, logging, udp-port, http-timeout, close, shutdown]
 ---
 
 # Configuration and Credentials
@@ -12,6 +12,16 @@ tags: [configuration, init, credentials, netrc, database-url, sql-url, db-only, 
 ## The single required argument
 
 The database URL is the only required argument. Everything else is optional, and the optional arguments interact in ways worth stating explicitly.
+
+### The one URL that is refused
+
+**An in-memory SQLite database is refused unless `db_only` is set**, and the error says why rather than letting the caller find out later that nothing works.
+
+Outside `db_only` this library runs a callback thread per API reply, and each thread is handed its own connection. Every connection to an in-memory database is *a separate database*: the tables are created on the thread that called `init()`, and every other thread finds a database with nothing in it. Passing such a URL used to succeed and then silently answer nothing useful.
+
+No setting fixes this. Sharing a single connection across the threads would make the tables visible, but the pool that does so is documented as supporting no form of concurrency at all. It is a mismatch between an in-memory database and this library's threading model, not a missing flag.
+
+In `db_only` mode there are no callback threads and no UDP session, and an in-memory cache works. That is the realistic use of one, and it stays supported.
 
 ## Credential resolution
 
@@ -52,6 +62,8 @@ The registered client version is deliberately unrelated to the distribution's ow
 
 **Encryption key** — enabling an encrypted session is the user's choice, not a default. Supplying a key here (or via netrc) turns encryption on; see SPEC-002 for what that changes about session establishment.
 
+**Database connection-pool size** — the cache's pool is bounded (SPEC-003), and its size is an argument here. The default is modest and suits a client of this library; an application that knows its own concurrency raises or lowers it rather than living with a number this library picked for it. The burst allowance above that size is not exposed: the bound is the decision, not its shape.
+
 **Outgoing UDP port** — chosen at random within a fixed range when not supplied. The choice is made per `init()` call rather than once per process, so several clients in one process do not collide on a port fixed at import time.
 
 **Logging** — a caller may supply its own logger, which is used as-is. Absent one, the library configures a logger at the requested level, attaches a syslog handler, and in debug mode additionally logs to standard error. Credentials are never logged: the AUTH command's contents are suppressed even at debug level, where every other command is logged in full.
@@ -66,4 +78,4 @@ The registered client version is deliberately unrelated to the distribution's ow
 
 - **Line of truth (external):** the netrc file format, and AniDB's client-registration requirement for the name-and-version pair sent in AUTH.
 - **Related specs:** SPEC-002 (what the resolved credentials, client identity and encryption key are used for); SPEC-003 (the database URL's role and the backends it may name); SPEC-005 (the fanart key's effect on `Anime.fanart`); SPEC-001 (objects, none of which may be constructed before `init()` has run).
-- **Tests:** credential resolution and the `db_only` path in `tests/unit/test_init_credentials.py`; the SQL URL rewriting rules — hostname matching, user pairing, percent-encoding, IPv6 and ports — in `tests/unit/test_sql_url_credentials.py`; the HTTP timeout's presence at every call site in `tests/unit/test_http_timeouts.py`; the package's declared public surface in `tests/unit/test_package.py`.
+- **Tests:** credential resolution and the `db_only` path in `tests/unit/test_init_credentials.py`; the in-memory refusal — including that no UDP link is opened before it — and the pool-size argument reaching the engine in `tests/unit/test_init_database.py`; the SQL URL rewriting rules — hostname matching, user pairing, percent-encoding, IPv6 and ports — in `tests/unit/test_sql_url_credentials.py`; the HTTP timeout's presence at every call site in `tests/unit/test_http_timeouts.py`; the package's declared public surface in `tests/unit/test_package.py`.

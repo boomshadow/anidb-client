@@ -33,8 +33,13 @@ from sqlalchemy import (
     String,
     Unicode,
     create_engine,
+    event,
 )
+from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import ArgumentError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
+
+import anidb_client
 
 # The constrained vocabularies, defined once.
 #
@@ -138,17 +143,126 @@ class Base(DeclarativeBase):
     """
 
 
-def init_db(url: str) -> sessionmaker[Session]:
+# How many connections the cache pool keeps, and how many more it may open in a
+# burst before refusing. The ceiling matters more than the numbers: this library
+# runs inside somebody else's application, and the pool used to be created with
+# max_overflow=-1 -- unlimited, "never block, unconditionally make a new connection"
+# -- so a connection leak grew until PostgreSQL's max_connections or the process's
+# file-descriptor limit refused somebody, quite possibly the host application
+# rather than us. A bound turns that into a fast, attributable error instead. A
+# caller who knows its own concurrency overrides the size through init().
+DEFAULT_POOL_SIZE = 10
+POOL_MAX_OVERFLOW = 5
+
+# How long SQLite waits behind another writer before raising "database is locked",
+# in seconds. Set rather than inherited: the driver's default five seconds is a
+# value nobody here decided, and WAL makes contention rarer without removing it.
+#
+# Passed as the driver's own `timeout` connect argument, which is exactly SQLite's
+# busy timeout, rather than as a `PRAGMA busy_timeout=` statement -- a pragma takes
+# no bound parameter, so setting it in SQL means formatting the value into the
+# statement, which is the shape of a SQL-injection bug even when the value is a
+# constant defined here.
+SQLITE_BUSY_TIMEOUT_SECONDS = 15.0
+
+
+def _is_sqlite(url: str) -> bool:
+    try:
+        return make_url(url).drivername.startswith("sqlite")
+    except ArgumentError:
+        return False
+
+
+def is_in_memory_sqlite(url: str) -> bool:
+    """True when the URL names a SQLite database that exists only in memory.
+
+    Both spellings count -- `sqlite://` and `sqlite:///:memory:` -- as does the
+    URI form naming `mode=memory`, whose parameters SQLAlchemy lifts out of the
+    path into the URL's query. Anything that is not SQLite, and anything this
+    cannot parse, is answered False: the question is only asked to refuse a
+    configuration that cannot work, so a URL that will not parse is left to fail where it
+    is actually opened.
+    """
+    if not _is_sqlite(url):
+        return False
+    parsed = make_url(url)
+    database = parsed.database or ""
+    return not database or database == ":memory:" or parsed.query.get("mode") == "memory"
+
+
+def _enforce_foreign_keys(dbapi_connection: Any, connection_record: Any) -> None:
+    """Turn foreign-key enforcement on as each SQLite connection is opened.
+
+    SQLite ignores foreign keys unless each connection turns them on, so the
+    constraints this schema declares are decorative without this listener: the
+    cascade tests pass on SQLAlchemy performing the cascade in Python, not on the
+    database refusing anything. Enforcement is a per-connection setting, which is
+    why it goes on the connect event rather than being done once at startup.
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
+
+
+def _request_wal(engine: Engine) -> str | None:
+    """Ask SQLite for write-ahead logging; answer with the mode actually in force.
+
+    `PRAGMA journal_mode=WAL` returns the mode that resulted, so no filesystem
+    detection is needed to find out whether the request was granted. None means
+    the statement itself failed, which some filesystems do rather than answering
+    with the unchanged mode.
+    """
+    try:
+        with engine.connect() as conn:
+            return str(conn.exec_driver_sql("PRAGMA journal_mode=WAL").scalar())
+    except OperationalError:
+        return None
+
+
+def _configure_sqlite(engine: Engine) -> None:
+    """Bring a SQLite cache up to what this library's threading model needs.
+
+    WAL is attempted rather than required. It does not work over a network
+    filesystem -- it needs shared memory between the processes on one host -- and
+    this package supports `nfs://` paths, so a cache on a NAS is a configuration
+    somebody has. It also creates `-wal` and `-shm` companion files next to a
+    database file the user owns. So the mode is asked for, the answer is read, and
+    a refusal is logged and carried on from rather than raised.
+    """
+    event.listen(engine, "connect", _enforce_foreign_keys)
+    mode = _request_wal(engine)
+    # init_db() is reachable before init() has installed a logger -- a caller's own
+    # test suite opens the cache directly -- so the logger is checked, as in mapper.py.
+    if anidb_client.log is None:
+        return
+    if mode is None:
+        anidb_client.log.warning("SQLite refused the journal-mode change; the cache keeps the mode it had")
+    elif mode.lower() == "wal":
+        anidb_client.log.debug("SQLite cache journal mode is WAL")
+    else:
+        anidb_client.log.info(f"SQLite cache journal mode is {mode!r}; WAL was asked for and not granted")
+
+
+def init_db(url: str, pool_size: int = DEFAULT_POOL_SIZE) -> sessionmaker[Session]:
     # Connection-pool sizing is only meaningful for pools that queue. SQLAlchemy
     # gives in-memory SQLite a SingletonThreadPool, which takes neither argument
     # and raises TypeError if handed them -- so an in-memory cache, the obvious
     # choice for a caller's own test suite, could not be opened at all. File-backed
     # SQLite and the server databases all get a QueuePool and are unaffected.
-    engine_options = {"pool_size": 10, "max_overflow": -1}
+    connect_args: dict[str, Any] = {}
+    if _is_sqlite(url):
+        connect_args["timeout"] = SQLITE_BUSY_TIMEOUT_SECONDS
+    pool_options = {"pool_size": pool_size, "max_overflow": POOL_MAX_OVERFLOW}
     try:
-        engine = create_engine(url, **engine_options)
+        engine = create_engine(url, connect_args=connect_args, **pool_options)
     except TypeError:
-        engine = create_engine(url)
+        engine = create_engine(url, connect_args=connect_args)
+    # SQLite only. The pragma is not valid SQL anywhere else, and the defaults it
+    # corrects are SQLite's alone.
+    if engine.dialect.name == "sqlite":
+        _configure_sqlite(engine)
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine, expire_on_commit=False)
     return session

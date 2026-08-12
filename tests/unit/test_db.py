@@ -11,11 +11,12 @@ nothing to tear down.
 import datetime
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import sessionmaker
+import sqlalchemy
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from anidb_client.db import (
+    POOL_MAX_OVERFLOW,
+    SQLITE_BUSY_TIMEOUT_SECONDS,
     AnimeRelationTable,
     AnimeTable,
     Base,
@@ -25,21 +26,26 @@ from anidb_client.db import (
     GroupTable,
     MylistState,
     init_db,
+    is_in_memory_sqlite,
 )
 
 NOW = datetime.datetime(2026, 8, 11, 12, 0, tzinfo=datetime.UTC)
 
 
 @pytest.fixture
-def session():
-    engine = create_engine("sqlite://")
-    Base.metadata.create_all(engine)
-    factory = sessionmaker(bind=engine, expire_on_commit=False)
+def session(tmp_path):
+    """A session on a cache opened the way the library opens one.
+
+    Through init_db() rather than a bare create_engine, so everything below runs
+    against the engine configuration real callers get -- foreign keys enforced,
+    WAL where the filesystem grants it -- rather than against SQLite's defaults.
+    """
+    factory = init_db(f"sqlite:///{tmp_path}/cache.db")
     with factory() as s:
         yield s
     # Without this the pooled connections survive the test and are only closed
     # when the collector gets round to them.
-    engine.dispose()
+    factory.kw["bind"].dispose()
 
 
 def _anime(aid=6187, **kwargs):
@@ -95,6 +101,95 @@ class TestSchema:
         factory = init_db("sqlite://")
         with factory() as s:
             assert s.query(AnimeTable).count() == 0
+
+
+class TestEngineConfiguration:
+    """The engine is opened for a threaded library, not for SQLite's defaults.
+
+    Those defaults are `journal_mode=delete` (one writer excludes every reader for
+    the length of the busy timeout), foreign keys off, and -- as this library used
+    to create it -- an unbounded connection pool.
+    """
+
+    def test_a_file_database_is_put_into_wal_mode(self, tmp_path):
+        factory = init_db(f"sqlite:///{tmp_path}/cache.db")
+        with factory() as s:
+            assert s.connection().exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"
+        factory.kw["bind"].dispose()
+
+    def test_a_refused_journal_mode_still_yields_a_working_cache(self, tmp_path, monkeypatch):
+        """WAL is asked for, not required.
+
+        It does not work over a network filesystem, and this package supports
+        `nfs://` paths. Simulated by making the statement fail rather than by
+        needing a network share: what matters is that the cache still opens.
+        """
+        real = sqlalchemy.engine.Connection.exec_driver_sql
+
+        def refuse(self, statement, *args, **kwargs):
+            if "journal_mode" in statement:
+                raise OperationalError(statement, None, Exception("disk I/O error"))
+            return real(self, statement, *args, **kwargs)
+
+        monkeypatch.setattr(sqlalchemy.engine.Connection, "exec_driver_sql", refuse)
+
+        factory = init_db(f"sqlite:///{tmp_path}/cache.db")
+        with factory() as s:
+            assert s.query(AnimeTable).count() == 0
+        factory.kw["bind"].dispose()
+
+    def test_an_in_memory_cache_keeps_the_mode_it_can_have(self):
+        """The other half of the fallback, and a real one: `:memory:` has no WAL."""
+        factory = init_db("sqlite://")
+        with factory() as s:
+            assert s.connection().exec_driver_sql("PRAGMA journal_mode").scalar() == "memory"
+            assert s.query(AnimeTable).count() == 0
+
+    def test_foreign_keys_are_enforced_by_the_database(self, session):
+        """Not merely declared. SQLite ignores them unless each connection opts in."""
+        assert session.connection().exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+
+        session.add(AnimeRelationTable(anime_pk=404, related_aid=2, relation_type="sequel"))
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+    def test_the_busy_timeout_is_the_one_we_chose(self, session):
+        """Set through the driver's own connect argument, read back as the pragma."""
+        expected_ms = int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)
+        assert session.connection().exec_driver_sql("PRAGMA busy_timeout").scalar() == expected_ms
+
+    def test_the_pool_is_bounded(self, tmp_path):
+        """It was max_overflow=-1: unlimited, by SQLAlchemy's own documentation."""
+        factory = init_db(f"sqlite:///{tmp_path}/cache.db")
+        pool = factory.kw["bind"].pool
+        assert pool.size() == 10
+        assert pool._max_overflow == POOL_MAX_OVERFLOW
+        factory.kw["bind"].dispose()
+
+    def test_the_pool_size_can_be_overridden(self, tmp_path):
+        factory = init_db(f"sqlite:///{tmp_path}/cache.db", pool_size=3)
+        assert factory.kw["bind"].pool.size() == 3
+        factory.kw["bind"].dispose()
+
+
+class TestInMemoryDetection:
+    """Used by init() to refuse a cache that cannot serve a threaded client."""
+
+    @pytest.mark.parametrize("url", ["sqlite://", "sqlite:///:memory:", "sqlite:///file:c?mode=memory&uri=true"])
+    def test_an_in_memory_url_is_recognised(self, url):
+        assert is_in_memory_sqlite(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "sqlite:///anidb.db",
+            "sqlite:////var/tmp/anidb.db",
+            "postgresql://user:pass@dbhost/anidb",
+            "not a url at all",
+        ],
+    )
+    def test_everything_else_is_not(self, url):
+        assert not is_in_memory_sqlite(url)
 
 
 class TestRoundTrips:

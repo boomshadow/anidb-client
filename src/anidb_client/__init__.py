@@ -101,7 +101,24 @@ def init(
     db_only: bool = False,
     client_name: str | None = None,
     client_version: int | None = None,
+    db_pool_size: int = anidb_client.db.DEFAULT_POOL_SIZE,
 ) -> None:
+    # In-memory SQLite cannot back a client that opens a UDP session, and failing
+    # here is the only honest answer: SQLAlchemy gives it a SingletonThreadPool, so
+    # every thread gets its own connection -- and every connection to :memory: is a
+    # separate database. create_all() runs on the calling thread, so each
+    # response-callback thread would find a database with no tables in it at all.
+    # No setting fixes that: StaticPool would share one connection, but SQLAlchemy
+    # is explicit that it does not support any form of concurrency. In db_only mode
+    # there are no callback threads and an in-memory cache works, which is the use
+    # it is kept for.
+    if not db_only and anidb_client.db.is_in_memory_sqlite(sql_db_url):
+        raise adbb_errors.AniDBError(
+            "An in-memory SQLite database cannot be used outside db_only mode: each of this "
+            "library's response threads would get its own empty database. Pass a file-backed "
+            "database URL, or db_only=True."
+        )
+
     # Chosen here rather than in the signature: a call in a default argument is
     # evaluated once, when the module is imported, so every init() in a process
     # previously reused the same "random" port -- and it was baked in at import
@@ -218,7 +235,7 @@ def init(
                 log.debug("Fanart key found in netrc")
                 fanart_key = key[0]
 
-    _sessionmaker = anidb_client.db.init_db(sql_db_url)
+    _sessionmaker = anidb_client.db.init_db(sql_db_url, pool_size=db_pool_size)
 
 
 def get_session() -> sqlalchemy.orm.Session:
