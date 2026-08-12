@@ -16,6 +16,9 @@
 # along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 
 
+import enum
+from collections.abc import Iterable
+
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -31,6 +34,91 @@ from sqlalchemy import (
     create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
+
+# The constrained vocabularies, defined once.
+#
+# These used to be written out twice -- as bare strings in the Enum() columns
+# below, and again as the values of the conversion tables in mapper.py -- with
+# nothing keeping the two in step. Adding a value to one and not the other
+# produced either a row the database rejects or a wire value converting to a
+# string no column accepts, and neither showed up until it happened.
+#
+# They live here because the schema is the self-enforcing artifact: these classes
+# are executed to build the columns, so the vocabulary cannot be described
+# incorrectly. mapper.py maps AniDB's wire codes onto the members.
+#
+# StrEnum rather than Enum: members are drop-in for the strings they replace --
+# equal to them, hashing as them, and formatting as them -- so callers holding a
+# plain "on hdd" keep working and the value stored in the database is unchanged.
+
+
+class AnimeRelationType(enum.StrEnum):
+    SEQUEL = "sequel"
+    PREQUEL = "prequel"
+    SAME_SETTING = "same setting"
+    ALTERNATIVE_SETTING = "alternative setting"
+    ALTERNATIVE_VERSION = "alternative version"
+    MUSIC_VIDEO = "music video"
+    CHARACTER = "character"
+    SIDE_STORY = "side story"
+    PARENT_STORY = "parent story"
+    SUMMARY = "summary"
+    FULL_STORY = "full story"
+    OTHER = "other"
+
+
+class EpisodeType(enum.StrEnum):
+    REGULAR = "regular"
+    SPECIAL = "special"
+    CREDIT = "credit"
+    TRAILER = "trailer"
+    PARODY = "parody"
+    OTHER = "other"
+
+
+class MylistState(enum.StrEnum):
+    UNKNOWN = "unknown"
+    ON_HDD = "on hdd"
+    ON_CD = "on cd"
+    DELETED = "deleted"
+
+
+class MylistFileState(enum.StrEnum):
+    NORMAL_ORIGINAL = "normal/original"
+    CORRUPTED = "corrupted version/invalid crc"
+    SELF_EDITED = "self edited"
+    SELF_RIPPED = "self ripped"
+    ON_DVD = "on dvd"
+    ON_VHS = "on vhs"
+    ON_TV = "on tv"
+    IN_THEATERS = "in theaters"
+    STREAMED = "streamed"
+    OTHER = "other"
+
+
+class GroupRelationType(enum.StrEnum):
+    PARTICIPANT_IN = "participant in"
+    PARENT_OF = "parent of"
+    MERGED_FROM = "merged from"
+    NOW_KNOWN_AS = "now known as"
+    OTHER = "other"
+    INCLUDES = "includes"
+    FORMERLY = "formerly"
+    MERGED_INTO = "merged into"
+    LOST_PART = "lost part"
+    SPLIT_FROM = "split from"
+    CHILD_OF = "child of"
+
+
+def _values(members: Iterable[enum.Enum]) -> list[str]:
+    """Persist a StrEnum by value, not by member name.
+
+    SQLAlchemy's default for a Python enum is to store `member.name`, which would
+    put ON_HDD in a column that has always held "on hdd". These vocabularies are
+    AniDB's wording, punctuation and all -- "normal/original" is not a legal
+    identifier -- so the value is the only faithful thing to store.
+    """
+    return [str(member.value) for member in members]
 
 
 class Base(DeclarativeBase):
@@ -128,21 +216,7 @@ class AnimeRelationTable(Base):
     anime_pk = Column(BigInteger().with_variant(Integer, "sqlite"), ForeignKey("anime.pk"), nullable=False)
     related_aid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False)
     relation_type: Column[str] = Column(
-        Enum(
-            "sequel",
-            "prequel",
-            "same setting",
-            "alternative setting",
-            "alternative version",
-            "music video",
-            "character",
-            "side story",
-            "parent story",
-            "summary",
-            "full story",
-            "other",
-            name="anime_relation_type_enum",
-        ),
+        Enum(AnimeRelationType, values_callable=_values, name="anime_relation_type_enum"),
         nullable=False,
     )
 
@@ -178,9 +252,7 @@ class EpisodeTable(Base):
     title_romaji = Column(String(512), nullable=True)
     title_kanji = Column(Unicode(512), nullable=True)
     aired = Column(Date(), nullable=True)
-    type: Column[str] = Column(
-        Enum("regular", "special", "credit", "trailer", "parody", "other", name="episode_type_enum"), nullable=False
-    )
+    type: Column[str] = Column(Enum(EpisodeType, values_callable=_values, name="episode_type_enum"), nullable=False)
 
     updated = Column(DateTime(timezone=True), nullable=False)
     last_update_dice = Column(DateTime(timezone=True), nullable=False)
@@ -222,22 +294,10 @@ class FileTable(Base):
     aired_date = Column(Date, nullable=True)
 
     mylist_state: Column[str] = Column(
-        Enum("unknown", "on hdd", "on cd", "deleted", name="mylist_state_enum"), nullable=True
+        Enum(MylistState, values_callable=_values, name="mylist_state_enum"), nullable=True
     )
     mylist_filestate: Column[str] = Column(
-        Enum(
-            "normal/original",
-            "corrupted version/invalid crc",
-            "self edited",
-            "self ripped",
-            "on dvd",
-            "on vhs",
-            "on tv",
-            "in theaters",
-            "streamed",
-            "other",
-            name="mylist_filestate_enum",
-        ),
+        Enum(MylistFileState, values_callable=_values, name="mylist_filestate_enum"),
         nullable=True,
     )
     mylist_viewed = Column(Boolean, nullable=True)
@@ -305,20 +365,7 @@ class GroupRelationTable(Base):
     group_pk = Column(BigInteger().with_variant(Integer, "sqlite"), ForeignKey("group.pk"), nullable=False)
     related_gid = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False)
     relation_type: Column[str] = Column(
-        Enum(
-            "participant in",
-            "parent of",
-            "merged from",
-            "now known as",
-            "other",
-            "includes",
-            "formerly",
-            "merged into",
-            "lost part",
-            "split from",
-            "child of",
-            name="group_relation_type_enum",
-        ),
+        Enum(GroupRelationType, values_callable=_values, name="group_relation_type_enum"),
         nullable=False,
     )
 
