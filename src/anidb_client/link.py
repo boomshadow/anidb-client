@@ -31,7 +31,7 @@ import anidb_client.commands
 from anidb_client.commands import Command
 from anidb_client.errors import AniDBInternalError, AniDBMustAuthError
 from anidb_client.ratelimit import RateLimiter
-from anidb_client.responses import Response, ResponseResolver
+from anidb_client.responses import Disposition, Response, ResponseResolver, disposition_for
 
 # The AES cipher objects pycryptodome hands back are one of several mode classes
 # with no common base, and this code only ever calls encrypt/decrypt on them. Any
@@ -519,20 +519,20 @@ class AniDBListener(threading.Thread):
                     continue
             else:
                 # No responsetag... we're probably banned
-                try:
-                    code = int(payload[:3])
-                except ValueError:
-                    # Previously sys.exit(2). A library must not terminate its
-                    # host process, and in a non-main thread sys.exit only ends
-                    # that thread -- so the listener died silently and every
-                    # later command timed out with no indication why.
-                    anidb_client.log.error(f"Unparsable response from API: {repr(data)}")
-                    self._last_receive = monotonic()
-                    continue
+                #
+                # The verdict comes from the response table in responses.py,
+                # which is where AniDB's contract is transcribed. It used to be
+                # the literal tuple (600, 601, 602, 604) here -- and `555 BANNED`,
+                # the code AniDB actually answers with when it has had enough of
+                # a client, was in the table and not in the tuple. So the one
+                # reply that says "stop" was logged as unrecognised and the
+                # client carried on sending.
+                code = resolved.rescode
                 reason = resolved.resstr
-                if code in (600, 601, 602, 604):
-                    self._sender.set_banned(code=code, reason=reason)
-                elif code == 598:
+                if (disposition := disposition_for(code)) is not Disposition.NORMAL:
+                    anidb_client.log.warning(f"API says {code} {reason} ({disposition.name})")
+                    self._sender.set_banned(code=int(code), reason=reason)
+                elif code == "598":
                     # We get here if an encrypted session has timed out
                     # No need to log in again if all that's left in queue is a
                     # logout command.

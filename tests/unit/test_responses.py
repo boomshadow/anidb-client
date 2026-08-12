@@ -16,9 +16,11 @@ from anidb_client.mapper import getAnimeBitsA, getAnimeCodesA
 from anidb_client.responses import (
     AnimeResponse,
     BannedResponse,
+    Disposition,
     LoginAcceptedResponse,
     NoSuchAnimeResponse,
     ResponseResolver,
+    disposition_for,
     responses,
 )
 
@@ -111,6 +113,46 @@ class TestResponseCodeTable:
         real reply and the client would stop rather than back off.
         """
         assert responses[code].__name__ == expected
+
+
+class TestDisposition:
+    """The verdict a code carries about the connection, as opposed to its payload.
+
+    This lives beside the code table because the transport used to restate it as
+    a tuple of integers, and the restatement disagreed with the table: `555
+    BANNED` was mapped to a response class and absent from the tuple, so the one
+    reply AniDB sends to say "stop" was treated as unrecognised.
+    """
+
+    @pytest.mark.parametrize("code", ["504", "555"])
+    def test_a_ban_is_classified_as_a_ban(self, code):
+        assert disposition_for(code) is Disposition.BANNED
+
+    @pytest.mark.parametrize("code", ["600", "601", "602", "604"])
+    def test_a_server_side_problem_asks_for_a_back_off(self, code):
+        assert disposition_for(code) is Disposition.BACK_OFF
+
+    @pytest.mark.parametrize("code", ["200", "220", "330", "403"])
+    def test_an_ordinary_reply_carries_no_verdict(self, code):
+        """Anything the caller asked for is the caller's business, not the transport's."""
+        assert disposition_for(code) is Disposition.NORMAL
+
+    def test_an_unmapped_code_carries_no_verdict(self):
+        """AniDB may answer with something this table has never seen.
+
+        That is not an error here -- the transport logs the code it could not
+        classify. It must not be mistaken for a ban.
+        """
+        assert disposition_for("799") is Disposition.NORMAL
+
+    def test_every_code_that_stops_the_client_is_classified(self):
+        """The set that must never silently shrink.
+
+        Losing a classification here is invisible in every other test: the client
+        keeps sending, and only AniDB notices.
+        """
+        stopping = {code for code, reply in responses.items() if reply.disposition is not Disposition.NORMAL}
+        assert stopping == {"504", "555", "600", "601", "602", "604"}
 
 
 class TestResponseParsing:

@@ -187,11 +187,17 @@ class TestWireFormats:
 
 
 class TestBanHandling:
-    @pytest.mark.parametrize("code", [600, 601, 602])
+    @pytest.mark.parametrize("code", [555, 600, 601, 602, 604])
     def test_an_untagged_server_error_registers_a_back_off(self, server, make_link, code):
         """These arrive with no tag, so there is no command to attribute them to.
 
         The client has to recognise them from the code alone and back off.
+
+        555 is the one that matters: it is what AniDB actually answered with in
+        the incident this test exists for, and the transport's hardcoded list of
+        ban codes did not contain it. The reply was logged as unrecognised, no
+        back-off was registered, and the client kept sending at full rate into a
+        service that had just told it to stop.
         """
         server.on("AUTH", lambda req: f"{code} SERVER UNHAPPY\n".encode())
         link = make_link(server)
