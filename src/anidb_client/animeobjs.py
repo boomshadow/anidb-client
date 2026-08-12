@@ -55,6 +55,12 @@ from anidb_client.db import (
 )
 from anidb_client.errors import AniDBError, AniDBFileError, IllegalAnimeObject
 
+# Ceiling on the fanart.tv rate-limit back-off. Retry-After is chosen by the remote
+# server, and an uncapped sleep on the calling thread is exactly the failure SPEC-002
+# gives the UDP ban back-off a ceiling to avoid: a client that has, for practical
+# purposes, stopped, while reporting only that it is waiting.
+FANART_MAX_BACKOFF = 300
+
 
 class AniDBObj:
     def __init__(self):
@@ -466,17 +472,35 @@ class Anime(AniDBObj):
                 with urllib.request.urlopen(req, timeout=anidb_client.HTTP_TIMEOUT) as f:
                     res = json.loads(f.read())
             except urllib.error.HTTPError as e:
-                if e.code != 404:
+                # 429 is tested before the catch-all. It used to be tested after
+                # `if e.code != 404: return []`, which 429 satisfies -- so the
+                # back-off below could never run and a rate-limited reply was
+                # treated as a hard failure.
+                if e.code == 429:
+                    try:
+                        asked = int(e.headers.get("Retry-After", 0))
+                    except TypeError, ValueError:
+                        # Retry-After is also allowed to be an HTTP-date. Not worth
+                        # parsing for this: move on rather than guess at a delay.
+                        asked = 0
+                    retry_after = min(asked, FANART_MAX_BACKOFF)
+                    if retry_after < asked:
+                        anidb_client.log.warning(f"Fanart asked for {asked}s; waiting {retry_after}s and moving on")
+                    else:
+                        anidb_client.log.warning(f"Fanart ratelimited, sleeping for {retry_after} seconds")
+                    time.sleep(retry_after)
+                elif e.code != 404:
                     anidb_client.log.error(f"Failed to fetch fanart at {url}: {e}")
-                    return []
-                if e.code == 429 and "Retry-After" in e.headers:
-                    sleep = int(e.headers.get("Retry-After", 0))
-                    anidb_client.log.warning(f"Fanart ratelimited, sleeping for {sleep} seconds")
-                    time.sleep(sleep)
+                    return ret
+                # 404 and 429 both leave this url without a result and move on to
+                # the next one, rather than failing the whole lookup.
                 res = None
             except urllib.error.URLError as e:
+                # `ret`, not []. An anime can be mapped at several sources, and
+                # artwork already gathered from one is not made worthless by a later
+                # one failing -- returning [] discarded it silently.
                 anidb_client.log.warning(f"Failed to fetch fanart at {url}: {e}")
-                return []
+                return ret
             if res:
                 ret.append(res)
 
@@ -488,8 +512,15 @@ class Anime(AniDBObj):
         return self.aid == other.aid
 
     def __contains__(self, other):
+        # `False`, not `NotImplemented`. There is no reflected form of __contains__
+        # for Python to fall back to -- `in` coerces whatever this returns to a bool
+        # -- and since 3.14 that coercion raises TypeError instead of warning. So
+        # returning NotImplemented made `anything in anime` raise for every operand
+        # that was not an Episode, where the intent was plainly "no, it is not in
+        # there". __eq__ below is the case where NotImplemented is right, because
+        # Python really does fall back to identity comparison for it.
         if not isinstance(other, Episode):
-            return NotImplemented
+            return False
         return other.aid == self.aid
 
     def __repr__(self):
@@ -995,24 +1026,32 @@ class File(AniDBObj):
                 else:
                     finfo[attr] = data
 
-            if state & 0x1:
-                finfo["crc_ok"] = True
-            elif state & 0x2:
-                finfo["crc_ok"] = False
-            if state & 0x4:
-                finfo["file_version"] = 2
-            elif state & 0x8:
-                finfo["file_version"] = 3
-            elif state & 0x10:
-                finfo["file_version"] = 4
-            elif state & 0x20:
-                finfo["file_version"] = 5
-            else:
-                finfo["file_version"] = 1
-            if state & 0x40:
-                finfo["censored"] = False
-            elif state & 0x80:
-                finfo["censored"] = True
+            # Only decode the state bitmask when AniDB actually sent one. `state`
+            # stays None when the field is absent from the reply, and `None & 0x1`
+            # raises TypeError -- here, on the listener's response thread, before
+            # `_file_updated.set()` at the end of this method. The reply had arrived
+            # and been parsed, and every waiter on it blocked forever regardless.
+            # Absent state means unknown, so the fields it would set stay unset
+            # rather than being given invented defaults.
+            if state is not None:
+                if state & 0x1:
+                    finfo["crc_ok"] = True
+                elif state & 0x2:
+                    finfo["crc_ok"] = False
+                if state & 0x4:
+                    finfo["file_version"] = 2
+                elif state & 0x8:
+                    finfo["file_version"] = 3
+                elif state & 0x10:
+                    finfo["file_version"] = 4
+                elif state & 0x20:
+                    finfo["file_version"] = 5
+                else:
+                    finfo["file_version"] = 1
+                if state & 0x40:
+                    finfo["censored"] = False
+                elif state & 0x80:
+                    finfo["censored"] = True
 
         if self._path:
             finfo["path"] = self._path
@@ -1570,8 +1609,10 @@ class File(AniDBObj):
         return len(self.multiep)
 
     def __contains__(self, other):
+        # See Anime.__contains__: NotImplemented is not a legal answer here, and
+        # since 3.14 returning it raises TypeError rather than reading as true.
         if not isinstance(other, Episode):
-            return NotImplemented
+            return False
         return other.episode_number in self.multiep
 
 

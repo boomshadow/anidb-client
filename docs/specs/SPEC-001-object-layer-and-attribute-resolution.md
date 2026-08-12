@@ -66,7 +66,9 @@ The objects implement the comparisons that make collection use natural, and each
 - Two `File` are equal when their file ids match; two generic files (SPEC-004) are equal when they cover the same episode. Two distinct real files are never equal — including when neither has a file id.
 - `len(file)` is the number of episodes the file covers, and `episode in file` tests membership in that set.
 
-Comparison against an unrelated type returns `NotImplemented`, so Python falls back to identity comparison rather than the objects claiming an answer they do not have.
+**Equality** against an unrelated type returns `NotImplemented`, so Python falls back to identity comparison rather than the object claiming an answer it does not have.
+
+**Containment** must not do the same, and the distinction is easy to get wrong. `in` has no reflected form to fall back to: it coerces whatever `__contains__` returns straight to a bool, and `NotImplemented` is not a legal answer there — Python 3.14 raises `TypeError` on that coercion rather than quietly treating it as true. A containment test against an unrelated type is therefore simply **false**.
 
 ## Images
 
@@ -78,4 +80,4 @@ Fanart is a separate source with separate preconditions; see SPEC-005.
 
 - **Line of truth (self-enforcing):** `src/anidb_client/db.py` — the cache schema whose rows back every attribute read. `anidb_client.__all__` in `src/anidb_client/__init__.py` — the package's declared public surface.
 - **Related specs:** SPEC-003 (when a cached value counts as fresh, and what the cache stores); SPEC-002 (the transport that a fetch goes out over, and its pacing); SPEC-004 (`File` construction from a path, and mylist operations); SPEC-005 (title matching, external ids and fanart); SPEC-006 (`init()`, which must run before any object is constructed).
-- **Tests:** the object layer is exercised through the fixture in `tests/objectlayer.py` against the fake server in `tests/fake_anidb.py`. Attribute-resolution behavior lives in `tests/unit/test_attribute_resolution.py` (falsy cached values, relation reads), illegal-object and not-found paths in `tests/unit/test_notfound_paths.py`, and the fixture's own guarantees in `tests/unit/test_objectlayer_fixture.py`. Equality and containment are covered in `tests/unit/test_file_identity.py`.
+- **Tests:** the object layer is exercised through the fixture in `tests/objectlayer.py` against the fake server in `tests/fake_anidb.py`. Attribute-resolution behavior lives in `tests/unit/test_attribute_resolution.py` (falsy cached values, relation reads), illegal-object and not-found paths in `tests/unit/test_notfound_paths.py`, and the fixture's own guarantees in `tests/unit/test_objectlayer_fixture.py`. Equality and containment are covered in `tests/unit/test_file_identity.py`, and the rule that a field the API did not supply resolves to an absence rather than an error — for the optional parts of a FILE reply — in `tests/unit/test_file_response_decoding.py`.
