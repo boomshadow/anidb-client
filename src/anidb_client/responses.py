@@ -15,6 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 
+import enum
 from typing import TYPE_CHECKING
 
 import anidb_client.mapper
@@ -22,6 +23,37 @@ from anidb_client.errors import AniDBInternalError
 
 if TYPE_CHECKING:
     from anidb_client.commands import Command
+
+
+class Disposition(enum.Enum):
+    """What a response code tells the transport to do, apart from its payload.
+
+    A reply carries two independent things: data for whoever asked, and a verdict
+    on the connection itself. The second is a property of the code, so it is
+    recorded here beside the code table rather than restated as a tuple of
+    integers in the transport -- which is what it was, and which is how `555
+    BANNED` came to be a code the parser knew and the transport did not.
+    """
+
+    # Nothing for the transport to do; the reply is the caller's business.
+    NORMAL = enum.auto()
+    # The server is unhappy but not with us specifically -- busy, down, or asking
+    # for a resubmit. Back off before trying again.
+    BACK_OFF = enum.auto()
+    # We have been banned. Same immediate handling as BACK_OFF today, kept
+    # distinct because it is a statement about this client rather than about the
+    # server's health, and the two want different recovery.
+    BANNED = enum.auto()
+
+
+def disposition_for(rescode: str) -> Disposition:
+    """The transport's verdict on a response code, `NORMAL` if it has none.
+
+    An unrecognised code is not an error here: AniDB may answer with something
+    this table has never seen, and the caller of this function logs that case.
+    """
+    reply = responses.get(rescode)
+    return reply.disposition if reply else Disposition.NORMAL
 
 
 def _answered_command(cmd: Command | None, reply: str) -> Command:
@@ -93,6 +125,11 @@ class Response:
     codehead: tuple[str, ...] = ()
     codetail: tuple[str, ...] = ()
     coderep: tuple[str, ...] = ()
+
+    # The transport's verdict on this code. Declared here so every reply has one
+    # and the transport can read it off any of them; overridden only by the codes
+    # that mean something to the connection rather than to the caller.
+    disposition: Disposition = Disposition.NORMAL
 
     # Populated by parse(), which every reply goes through before handle().
     attrs: dict[str, str]
@@ -1695,6 +1732,7 @@ class ClientBannedResponse(Response):
     codehead = ()
     codetail = ()
     coderep = ()
+    disposition = Disposition.BANNED
 
 
 class IllegalInputOrAccessDeniedResponse(Response):
@@ -1760,6 +1798,7 @@ class BannedResponse(Response):
     codehead = ()
     codetail = ()
     coderep = ()
+    disposition = Disposition.BANNED
 
 
 class UnknownCommandResponse(Response):
@@ -1786,6 +1825,7 @@ class InternalServerErrorResponse(Response):
     codehead = ()
     codetail = ()
     coderep = ()
+    disposition = Disposition.BACK_OFF
 
 
 class AnidbOutOfServiceResponse(Response):
@@ -1799,6 +1839,7 @@ class AnidbOutOfServiceResponse(Response):
     codehead = ()
     codetail = ()
     coderep = ()
+    disposition = Disposition.BACK_OFF
 
 
 class ServerBusyResponse(Response):
@@ -1812,6 +1853,25 @@ class ServerBusyResponse(Response):
     codehead = ()
     codetail = ()
     coderep = ()
+    disposition = Disposition.BACK_OFF
+
+
+class TimeoutResponse(Response):
+    """
+    attributes:
+
+    data:
+    """
+
+    # AniDB's "604 TIMEOUT - DELAY AND RESUBMIT". The transport already treated
+    # this code as a reason to back off, but it had no entry here -- so the code
+    # was a bare integer in the transport's dispatch and a synthetic argument to
+    # set_banned(), and nothing tied either to AniDB's own table.
+    codestr = "TIMEOUT"
+    codehead = ()
+    codetail = ()
+    coderep = ()
+    disposition = Disposition.BACK_OFF
 
 
 class ApiViolationResponse(Response):
@@ -1943,6 +2003,7 @@ responses: dict[str, type[Response]] = {
     "600": InternalServerErrorResponse,
     "601": AnidbOutOfServiceResponse,
     "602": ServerBusyResponse,
+    "604": TimeoutResponse,
     "666": ApiViolationResponse,
     "998": VersionResponse,
 }
