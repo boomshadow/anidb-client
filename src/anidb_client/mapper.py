@@ -15,6 +15,9 @@
 # You should have received a copy of the GNU General Public License
 # along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 import datetime
+import enum
+from collections.abc import Callable, Container, Mapping, Sequence
+from typing import Any
 
 import anidb_client
 from anidb_client.db import (
@@ -25,10 +28,16 @@ from anidb_client.db import (
     MylistState,
 )
 
+# One field of an AniDB reply, as a string, turned into whatever the cache stores
+# for it. The return is deliberately Any: the whole point of a converter table is
+# that each entry produces a different type -- an int, a date, a bool, a member of
+# a vocabulary -- and the caller writes the result straight into a column.
+type FieldConverter = Callable[[str], Any]
+
 _blacklist = ("unused", "retired", "reserved", "not_implemented")
 
 
-def _enum_converter(table, field):
+def _enum_converter[T: enum.StrEnum](table: Mapping[str, T], field: str) -> Callable[[str | None], T | None]:
     """Convert an AniDB enumeration code, tolerating codes this table does not list.
 
     Every converter built here runs inside a response callback, on the response
@@ -47,7 +56,7 @@ def _enum_converter(table, field):
     tables hold members, so naming one that does not exist fails at import.
     """
 
-    def convert(value):
+    def convert(value: str | None) -> T | None:
         if not value:
             return None
         try:
@@ -64,7 +73,7 @@ def _enum_converter(table, field):
 
 # each line is one byte
 # only change this if the api changes
-anime_map_a_converters = {
+anime_map_a_converters: dict[str, FieldConverter] = {
     "aid": int,
     "nr_of_episodes": int,
     "highest_episode_number": int,
@@ -111,7 +120,7 @@ mylist_filestate_map = {
     "100": MylistFileState.OTHER,
 }
 
-file_map_f_converters = {
+file_map_f_converters: dict[str, FieldConverter] = {
     "fid": int,
     "aid": int,
     "eid": int,
@@ -141,7 +150,7 @@ episode_type_map = {
     "6": EpisodeType.OTHER,
 }
 
-episode_map_converters = {
+episode_map_converters: dict[str, FieldConverter] = {
     "eid": int,
     "aid": int,
     "length": int,
@@ -151,7 +160,7 @@ episode_map_converters = {
     "type": _enum_converter(episode_type_map, "episode type"),
 }
 
-mylist_map_converters = {
+mylist_map_converters: dict[str, FieldConverter] = {
     "lid": int,
     "fid": int,
     "eid": int,
@@ -189,7 +198,7 @@ anime_relation_map = {
     "100": AnimeRelationType.OTHER,
 }
 
-group_map_converters = {
+group_map_converters: dict[str, FieldConverter] = {
     "gid": int,
     "rating": int,
     "votes": int,
@@ -219,7 +228,7 @@ group_relation_map = {
     "106": GroupRelationType.OTHER,
 }
 
-roman_numbering = {
+roman_numbering: dict[str, int] = {
     "i": 1,
     "ii": 2,
     "iii": 3,
@@ -254,7 +263,7 @@ roman_numbering = {
     # system..
 }
 
-anime_map_a = [
+anime_map_a: list[str] = [
     "aid",
     "unused",
     "year",
@@ -313,7 +322,7 @@ anime_map_a = [
     "unused",
 ]
 
-file_map_f = [
+file_map_f: list[str] = [
     "unused",
     "aid",
     "eid",
@@ -358,7 +367,7 @@ file_map_f = [
 # Trailing entries retained from the upstream map, commented out:
 # seven 'not_implemented' slots followed by 'unused'.
 
-file_map_a = [
+file_map_a: list[str] = [
     "anime_total_episodes",
     "highest_episode_number",
     "year",
@@ -394,37 +403,37 @@ file_map_a = [
 ]
 
 
-def getAnimeBitsA(amask):
+def getAnimeBitsA(amask: Container[str]) -> str:
     bitmap = anime_map_a
     return _getBitChain(bitmap, amask)
 
 
-def getAnimeCodesA(aBitChain):
+def getAnimeCodesA(aBitChain: str) -> list[str]:
     amap = anime_map_a
     return _getCodes(amap, aBitChain)
 
 
-def getFileBitsF(fmask):
+def getFileBitsF(fmask: Container[str]) -> str:
     fmap = file_map_f
     return _getBitChain(fmap, fmask)
 
 
-def getFileCodesF(bitChainF):
+def getFileCodesF(bitChainF: str) -> list[str]:
     fmap = file_map_f
     return _getCodes(fmap, bitChainF)
 
 
-def getFileBitsA(amask):
+def getFileBitsA(amask: Container[str]) -> str:
     amap = file_map_a
     return _getBitChain(amap, amask)
 
 
-def getFileCodesA(bitChainA):
+def getFileCodesA(bitChainA: str) -> list[str]:
     amap = file_map_a
     return _getCodes(amap, bitChainA)
 
 
-def _getBitChain(attrmap, wanted):
+def _getBitChain(attrmap: Sequence[str], wanted: Container[str]) -> str:
     """Return an hex string with the correct bit set corresponding to the wanted fields in the map"""
     bit = 0
     for index, field in enumerate(attrmap):
@@ -442,7 +451,7 @@ def _getBitChain(attrmap, wanted):
     return f"{bit:0{len(attrmap) // 4}x}"
 
 
-def _getCodes(attrmap, bitChain):
+def _getCodes(attrmap: Sequence[str], bitChain: str) -> list[str]:
     """Returns a list with the corresponding fields as set in the bitChain (hex string)"""
     bits = int(bitChain, 16)
     mapLength = len(attrmap)
