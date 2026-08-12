@@ -9,12 +9,8 @@ These are the largest untested surface in the library, and the failure mode is
 quiet: a mis-split line does not raise, it writes shifted values into the cache.
 """
 
-import ast
-import pathlib
-
 import pytest
 
-import anidb_client.responses
 from anidb_client.commands import AnimeCommand, AuthCommand, Command
 from anidb_client.mapper import getAnimeBitsA, getAnimeCodesA
 from anidb_client.responses import (
@@ -191,33 +187,41 @@ class TestResponseParsing:
     def test_no_response_class_assigns_a_bare_string_to_a_field_name_tuple(self):
         """A bare string in any code* attribute splits into characters.
 
-        Swept across the whole module rather than only the two that were wrong,
-        because the failure is silent: it yields plausible-looking single-letter
-        keys instead of raising.
+        Swept across every registered class rather than only the two that were
+        wrong, because the failure is silent: it yields plausible-looking
+        single-letter keys instead of raising.
 
-        Read from the source with ast rather than from the classes, because these
-        are instance attributes assigned in __init__ -- `getattr(cls, "codetail")`
-        finds nothing and would make this assertion vacuous. Instantiating them
-        all is not an option either; most need a matching command object.
+        This used to have to read the source with `ast`, because the values were
+        assigned in each subclass's __init__ and `getattr(cls, "codetail")` found
+        nothing. They are class attributes now, so the check can look at the values
+        themselves -- which also catches a non-tuple arriving any other way.
         """
-        tree = ast.parse(pathlib.Path(anidb_client.responses.__file__).read_text())
-
-        offenders = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
-                continue
-            if not isinstance(node.value.value, str):
-                continue
-            for target in node.targets:
-                if (
-                    isinstance(target, ast.Attribute)
-                    and target.attr in ("codehead", "codetail", "coderep")
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id == "self"
-                ):
-                    offenders.append(f"line {node.lineno}: self.{target.attr} = {node.value.value!r}")
+        offenders = [
+            f"{cls.__name__}.{name} = {getattr(cls, name)!r}"
+            for cls in set(responses.values())
+            for name in ("codehead", "codetail", "coderep")
+            if isinstance(getattr(cls, name), str)
+        ]
 
         assert offenders == [], "these need a trailing comma to be tuples: " + "; ".join(offenders)
+
+    def test_no_field_name_carries_stray_whitespace(self):
+        """A field name is a dict key. Whitespace in one is invisible and total.
+
+        `parse()` zips these tuples against the wire payload, so a name with a
+        leading space becomes a key nothing will ever look up -- the field is
+        silently absent rather than wrong, which is the hardest kind to notice.
+        GROUPSTATUS carried exactly that for `last_episode_number`.
+        """
+        offenders = [
+            f"{cls.__name__}.{name}: {field!r}"
+            for cls in set(responses.values())
+            for name in ("codehead", "codetail", "coderep")
+            for field in getattr(cls, name)
+            if isinstance(field, str) and field != field.strip()
+        ]
+
+        assert offenders == [], "field names with stray whitespace: " + "; ".join(offenders)
 
     def test_banned_reply_parses_without_a_request(self):
         """A ban arrives untagged, so there is no command to resolve it against."""
