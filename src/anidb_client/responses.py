@@ -15,24 +15,47 @@
 # You should have received a copy of the GNU General Public License
 # along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 
+from typing import TYPE_CHECKING
+
 import anidb_client.mapper
+from anidb_client.errors import AniDBInternalError
+
+if TYPE_CHECKING:
+    from anidb_client.commands import Command
+
+
+def _answered_command(cmd: Command | None, reply: str) -> Command:
+    """The command a reply is being parsed against.
+
+    A handful of replies cannot be read without it: AniDB does not repeat the
+    field mask in the answer, so the only record of which fields a FILE reply
+    carries is the mask that was sent. Most replies never look, which is why the
+    parameter is optional on `Response` -- and why an untagged reply, which
+    answers nothing, can still be built.
+
+    Was an AttributeError on None, raised on the response thread while the reply
+    object was still being constructed.
+    """
+    if cmd is None:
+        raise AniDBInternalError(f"A {reply} reply cannot be parsed without the command it answers")
+    return cmd
 
 
 class ResponseResolver:
-    def __init__(self, data):
-        data = data.decode("utf-8")
-        restag, rescode, resstr, datalines = self.parse(data)
+    def __init__(self, data: bytes) -> None:
+        restag, rescode, resstr, datalines = self.parse(data.decode("utf-8"))
 
         self.restag = restag
         self.rescode = rescode
         self.resstr = resstr
         self.datalines = datalines
 
-    def parse(self, data):
+    def parse(self, data: str) -> tuple[str | None, str, str, list[list[str]]]:
         resline = data.split("\n", 1)[0]
         lines = data.split("\n")[1:-1]
 
         rescode, resstr = resline.split(" ", 1)
+        restag: str | None
         if rescode[0] == "T":
             restag = rescode
             rescode, resstr = resstr.split(" ", 1)
@@ -45,7 +68,7 @@ class ResponseResolver:
 
         return restag, rescode, resstr, datalines
 
-    def resolve(self, cmd):
+    def resolve(self, cmd: Command | None) -> Response:
         return responses[self.rescode](cmd, self.restag, self.rescode, self.resstr, self.datalines)
 
 
@@ -71,14 +94,25 @@ class Response:
     codetail: tuple[str, ...] = ()
     coderep: tuple[str, ...] = ()
 
-    def __init__(self, cmd, restag, rescode, resstr, rawlines):
+    # Populated by parse(), which every reply goes through before handle().
+    attrs: dict[str, str]
+    datalines: list[dict[str, str]]
+
+    def __init__(
+        self,
+        cmd: Command | None,
+        restag: str | None,
+        rescode: str,
+        resstr: str,
+        rawlines: list[list[str]],
+    ) -> None:
         self.req = cmd
         self.restag = restag
         self.rescode = rescode
         self.resstr = resstr
         self.rawlines = rawlines
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         tmp = f"{self.__class__.__name__}({self.restag!r},{self.rescode!r},{self.resstr!r}) {self.attrs!r}\n"
 
         m = 0
@@ -93,49 +127,64 @@ class Response:
                 tmp += "    {}:{} {}\n".format(k, (m - len(k)) * " ", v)
         return tmp
 
-    def parse(self):
-        tmp = self.resstr.split(" ", len(self.codehead))
+    def parse(self) -> None:
+        head = self.resstr.split(" ", len(self.codehead))
         # strict=False throughout: the code* tuples are deliberately shorter than
         # the payload, which is how optional trailing fields are ignored.
-        self.attrs = dict(zip(self.codehead, tmp[:-1], strict=False))
-        self.resstr = tmp[-1]
+        self.attrs = dict(zip(self.codehead, head[:-1], strict=False))
+        self.resstr = head[-1]
 
         self.datalines = []
         for rawline in self.rawlines:
             normal = dict(zip(self.codetail, rawline, strict=False))
-            rawline = rawline[len(self.codetail) :]
+            remainder = rawline[len(self.codetail) :]
             rep = []
             if len(self.coderep):
-                while rawline:
-                    tmp = dict(zip(self.coderep, rawline, strict=False))
-                    rawline = rawline[len(self.coderep) :]
-                    rep.append(tmp)
+                while remainder:
+                    rep.append(dict(zip(self.coderep, remainder, strict=False)))
+                    remainder = remainder[len(self.coderep) :]
             # normal['rep']=rep
             self.datalines.append(normal)
 
-    def handle(self):
+    def handle(self) -> None:
         if self.req:
             self.req.handle(self)
 
 
 class CachedResponse(Response):
-    def __init__(self, cmd, restag, rescode, resstr, data):
+    def __init__(
+        self,
+        cmd: Command | None,
+        restag: str | None,
+        rescode: str,
+        resstr: str,
+        data: dict[str, str],
+    ) -> None:
         self.datalines = [data]
-        Response.__init__(self, cmd, restag, rescode, resstr, self.datalines)
+        # Empty rawlines rather than the parsed rows: this reply is already
+        # parsed, parse() below is a no-op, and nothing reads rawlines afterwards.
+        Response.__init__(self, cmd, restag, rescode, resstr, [])
         self.codestr = "CACHED"
         self.codetail = ()
         self.coderep = ()
         self.codehead = ()
 
-    def parse(self):
+    def parse(self) -> None:
         pass
 
-    def handle(self):
+    def handle(self) -> None:
         pass
 
 
 class LoginAcceptedResponse(Response):
-    def __init__(self, cmd, restag, rescode, resstr, datalines):
+    def __init__(
+        self,
+        cmd: Command | None,
+        restag: str | None,
+        rescode: str,
+        resstr: str,
+        datalines: list[list[str]],
+    ) -> None:
         """
         attributes:
         sesskey    - session key
@@ -149,7 +198,7 @@ class LoginAcceptedResponse(Response):
         self.codetail = ()
         self.coderep = ()
 
-        nat = cmd.parameters["nat"]
+        nat = _answered_command(cmd, "LOGIN_ACCEPTED").parameters["nat"]
         if nat in ("1", 1):
             self.codehead = ("sesskey", "address")
         else:
@@ -157,7 +206,14 @@ class LoginAcceptedResponse(Response):
 
 
 class LoginAcceptedNewVerResponse(Response):
-    def __init__(self, cmd, restag, rescode, resstr, datalines):
+    def __init__(
+        self,
+        cmd: Command | None,
+        restag: str | None,
+        rescode: str,
+        resstr: str,
+        datalines: list[list[str]],
+    ) -> None:
         """
         attributes:
         sesskey    - session key
@@ -180,7 +236,7 @@ class LoginAcceptedNewVerResponse(Response):
         # since link.py treats 201 as a successful login, _auth_handler then read
         # attrs["address"], raised KeyError on the response thread, and never set
         # the authenticated event -- hanging every command queued behind it.
-        nat = cmd.parameters["nat"]
+        nat = _answered_command(cmd, "LOGIN_ACCEPTED").parameters["nat"]
         if nat in ("1", 1):
             self.codehead = ("sesskey", "address")
         else:
@@ -335,7 +391,14 @@ class EncodingChangedResponse(Response):
 
 
 class FileResponse(Response):
-    def __init__(self, cmd, restag, rescode, resstr, datalines):
+    def __init__(
+        self,
+        cmd: Command | None,
+        restag: str | None,
+        rescode: str,
+        resstr: str,
+        datalines: list[list[str]],
+    ) -> None:
         """
         attributes:
 
@@ -389,11 +452,11 @@ class FileResponse(Response):
         self.codehead = ()
         self.coderep = ()
 
-        fmask = cmd.parameters["fmask"]
-        amask = cmd.parameters["amask"]
-
-        codeListF = anidb_client.mapper.getFileCodesF(fmask)
-        codeListA = anidb_client.mapper.getFileCodesA(amask)
+        req = _answered_command(cmd, "FILE")
+        # The masks are hex strings built by mapper; str() is a formality that lets
+        # the reader see the parameter table admits ints too.
+        codeListF = anidb_client.mapper.getFileCodesF(str(req.parameters["fmask"]))
+        codeListA = anidb_client.mapper.getFileCodesA(str(req.parameters["amask"]))
         # print "File - codelistF: "+str(codeListF)
         # print "File - codelistA: "+str(codeListA)
 
@@ -488,14 +551,21 @@ class MylistStatsResponse(Response):
 
 
 class AnimeResponse(Response):
-    def __init__(self, cmd, restag, rescode, resstr, datalines):
+    def __init__(
+        self,
+        cmd: Command | None,
+        restag: str | None,
+        rescode: str,
+        resstr: str,
+        datalines: list[list[str]],
+    ) -> None:
         Response.__init__(self, cmd, restag, rescode, resstr, datalines)
         self.codestr = "ANIME"
         self.codehead = ()
         self.coderep = ()
 
         # TODO: impl random anime
-        amask = cmd.parameters["amask"]
+        amask = str(_answered_command(cmd, "ANIME").parameters["amask"])
         codeList = anidb_client.mapper.getAnimeCodesA(amask)
         self.codetail = tuple(codeList)
 
@@ -942,7 +1012,14 @@ class NotifyackSuccessfulNResponse(Response):
 
 
 class NotificationResponse(Response):
-    def __init__(self, cmd, restag, rescode, resstr, datalines):
+    def __init__(
+        self,
+        cmd: Command | None,
+        restag: str | None,
+        rescode: str,
+        resstr: str,
+        datalines: list[list[str]],
+    ) -> None:
         """
         attributes:
 
@@ -961,7 +1038,7 @@ class NotificationResponse(Response):
         # or "0")` reached int("someuser") and raised ValueError while the response
         # object was still being built -- on the response thread, leaving the
         # caller waiting. Only its presence matters here, not its value.
-        buddy = cmd.parameters["buddy"]
+        buddy = _answered_command(cmd, "NOTIFY").parameters["buddy"]
         if buddy:
             self.codetail = ("notifies", "msgs", "buddys")
         else:
@@ -1764,7 +1841,7 @@ class VersionResponse(Response):
     coderep = ()
 
 
-responses = {
+responses: dict[str, type[Response]] = {
     "200": LoginAcceptedResponse,
     "201": LoginAcceptedNewVerResponse,
     "203": LoggedOutResponse,

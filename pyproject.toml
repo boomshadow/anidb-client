@@ -121,10 +121,13 @@ enable_error_code = ["ignore-without-code"]
 [[tool.mypy.overrides]]
 module = [
     "anidb_client.db",
+    "anidb_client.commands",
     "anidb_client.errors",
     "anidb_client.fileinfo",
+    "anidb_client.link",
     "anidb_client.mapper",
     "anidb_client.ratelimit",
+    "anidb_client.responses",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

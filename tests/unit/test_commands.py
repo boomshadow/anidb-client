@@ -190,6 +190,18 @@ class TestParameterValidation:
         """AniDB usernames are case-insensitive; normalising avoids a cache miss."""
         assert BuddyAddCommand(uname="MixedCase").parameters["uname"] == "mixedcase"
 
+    def test_buddyadd_accepts_a_uid_with_no_username(self):
+        """The other half of the XOR the guard above accepts.
+
+        This lowercased `uname` unconditionally, so identifying a buddy by id --
+        which the guard explicitly permits -- raised AttributeError on None
+        instead of building the command.
+        """
+        cmd = BuddyAddCommand(uid=42)
+
+        assert cmd.parameters["uid"] == 42
+        assert cmd.raw_data() == "BUDDYADD uid=42"
+
     @pytest.mark.parametrize(
         ("title", "body"),
         [("x" * 51, "ok"), ("ok", "x" * 901)],
