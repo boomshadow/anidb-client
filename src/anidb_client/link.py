@@ -60,7 +60,7 @@ class AniDBLink(threading.Thread):
         timeout: int = 20,
         api_key: str | None = None,
         client_name: str | None = None,
-        client_version: str | None = None,
+        client_version: int | None = None,
         rate_limiter: RateLimiter | None = None,
     ) -> None:
         super().__init__()

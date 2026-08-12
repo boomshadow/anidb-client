@@ -27,11 +27,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
+from typing import Any, override
 
 import sqlalchemy
 import sqlalchemy.exc
 import sqlalchemy.orm
 import sqlalchemy.orm.exc
+from sqlalchemy.orm import Session
 
 import anidb_client
 import anidb_client.anames
@@ -39,6 +42,7 @@ import anidb_client.fileinfo
 import anidb_client.mapper
 from anidb_client.commands import (
     AnimeCommand,
+    Command,
     EpisodeCommand,
     FileCommand,
     GroupCommand,
@@ -55,6 +59,8 @@ from anidb_client.db import (
     GroupTable,
 )
 from anidb_client.errors import AniDBError, AniDBFileError, IllegalAnimeObject
+from anidb_client.link import AniDBLink
+from anidb_client.responses import Response
 
 # Ceiling on the fanart.tv rate-limit back-off. Retry-After is chosen by the remote
 # server, and an uncapped sleep on the calling thread is exactly the failure SPEC-002
@@ -63,8 +69,30 @@ from anidb_client.errors import AniDBError, AniDBFileError, IllegalAnimeObject
 FANART_MAX_BACKOFF = 300
 
 
+def _required[T](value: T | None, what: str) -> T:
+    """A value an internal invariant guarantees is present, stated rather than assumed.
+
+    These are branches that only run once the thing they need has been set: an
+    Episode built from an anime and an episode number always has the anime, and
+    the request it sends cannot be addressed without it. Reading straight through
+    was an AttributeError on None, raised from inside a response thread with
+    nothing in it naming what was missing.
+    """
+    if value is None:
+        raise IllegalAnimeObject(f"{what} is not available on this object")
+    return value
+
+
 class AniDBObj:
-    def __init__(self):
+    # The cached row: an AnimeTable, EpisodeTable, FileTable or GroupTable, or None
+    # before one has been found. `Any` rather than that union because the policy
+    # methods here read fields the four rows share -- `updated`, `last_update_dice`
+    # -- without a common base declaring them, and because every attribute a caller
+    # reads off one of these objects arrives through __getattr__ below, which cannot
+    # be typed more precisely than the row it forwards to.
+    db_data: Any
+
+    def __init__(self) -> None:
         self._anidb_link = anidb_client._anidb
         self._illegal_object = False
         self._updated = threading.Event()
@@ -74,12 +102,24 @@ class AniDBObj:
         self._timezone = datetime.UTC
         self.db_data = None
 
-    def _to_timezoneaware(self, obj):
+    def _link(self) -> AniDBLink:
+        """The transport, for a path that has decided it needs the network.
+
+        None when the library was initialised with db_only (SPEC-006), where it is
+        a cache in front of nothing. Reaching a request from there used to be an
+        AttributeError on None raised inside a response thread; this says what
+        actually happened.
+        """
+        if self._anidb_link is None:
+            raise AniDBError("This client was initialised with db_only, so it has no AniDB link")
+        return self._anidb_link
+
+    def _to_timezoneaware(self, obj: datetime.datetime) -> datetime.datetime:
         if obj.tzinfo is None or obj.tzinfo.utcoffset(obj) is None:
             return obj.replace(tzinfo=self._timezone)
         return obj
 
-    def _fetch_anidb_data(self, block):
+    def _fetch_anidb_data(self, block: bool) -> None:
         anidb_client.log.debug(f"Sending anidb request for {self}")
         thread = threading.Thread(target=self._send_anidb_update_req, kwargs={"prio": block})
         thread.start()
@@ -88,7 +128,7 @@ class AniDBObj:
             if self._illegal_object:
                 raise IllegalAnimeObject(f"{self} is not a valid AniDB object")
 
-    def update(self, block=False):
+    def update(self, block: bool = False) -> None:
         locked = self._updating.acquire(False)
         if not locked:
             if block:
@@ -97,10 +137,10 @@ class AniDBObj:
             return
         self._fetch_anidb_data(block=block)
 
-    def _extra_refresh_probability(self):
+    def _extra_refresh_probability(self) -> int:
         return 0
 
-    def _probability_of_refresh(self):
+    def _probability_of_refresh(self) -> int:
         """Percent chance that this object's cached data should be re-fetched.
 
         Extracted from update_if_old so the policy can be read and tested on its
@@ -130,7 +170,7 @@ class AniDBObj:
         anidb_client.log.debug(f"Probability of updating {self}: {total}% ({class_probability}% from class rules)")
         return total
 
-    def update_if_old(self, block=False):
+    def update_if_old(self, block: bool = False) -> None:
         if not self.db_data:
             self.update(block=True)
         else:
@@ -163,19 +203,19 @@ class AniDBObj:
             if random.randint(1, 100) <= refresh_probability:
                 self.update(block=block)
 
-    def _send_anidb_update_req(self, prio=False):
+    def _send_anidb_update_req(self, prio: bool = False) -> None:
         # NotImplementedError, not a bare Exception: `except Exception` around a
         # call site would swallow a missing override as though it were a runtime
         # failure. Every subclass overrides this; the signature matches theirs.
         raise NotImplementedError
 
-    def _close_db_session(self, session):
+    def _close_db_session(self, session: Session) -> None:
         session.close()
 
-    def _get_db_session(self):
+    def _get_db_session(self) -> Session:
         return anidb_client.get_session()
 
-    def _db_commit(self, session):
+    def _db_commit(self, session: Session) -> None:
         try:
             session.commit()
             anidb_client.log.debug(f"Object saved to database: {self.db_data}")
@@ -186,7 +226,7 @@ class AniDBObj:
                 anidb_client.log.warning(f"Failed to update db: {e}")
             session.rollback()
 
-    def __getattribute__(self, attr):
+    def __getattribute__(self, attr: str) -> Any:
         # Internal machinery stays readable on an object that has been marked
         # illegal. Everything here is either the flag itself or a completion event
         # that a waiting thread depends on -- File's `_file_updated` and
@@ -199,7 +239,12 @@ class AniDBObj:
             raise IllegalAnimeObject(f"{self} is not a valid AniDB object")
         return super().__getattribute__(attr)
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
+        # `Any` is the honest answer and the boundary of what this module can be
+        # checked at: this forwards to whichever column of whichever cached row
+        # carries `name`, answering None for one that does not exist. A caller
+        # reading `anime.rating` reaches a float through here and `anime.picname` a
+        # string, and nothing static can say which without the row in hand.
         local_vars = vars(self)
         if name not in ("updated", "relations"):
             local_name = f"_{name}"
@@ -245,12 +290,12 @@ class AniDBObj:
 
 
 class Anime(AniDBObj):
-    def __init__(self, init):
+    def __init__(self, init: int | str) -> None:
         super().__init__()
-        self._aid = None
-        self._titles = None
-        self._title = None
-        self._in_mylist = None
+        self._aid: int | None = None
+        self._titles: list[AnimeTitle] | None = None
+        self._title: str | None = None
+        self._in_mylist: bool | None = None
 
         try:
             if isinstance(init, int):
@@ -264,7 +309,8 @@ class Anime(AniDBObj):
         self.db_data = None
         self._get_db_data()
 
-    def _extra_refresh_probability(self):
+    @override
+    def _extra_refresh_probability(self) -> int:
         ref = datetime.timedelta()
         # The shorter time there is between when anidb updated this
         # anime and we fetched our data, the more likely is it that it has
@@ -280,7 +326,7 @@ class Anime(AniDBObj):
             probability -= 10
         return max(probability, 0)
 
-    def _get_db_data(self, close=True):
+    def _get_db_data(self, close: bool = True) -> None:
         sess = self._get_db_session()
         res = sess.query(AnimeTable).filter_by(aid=self.aid).all()
         if len(res) > 0:
@@ -288,7 +334,7 @@ class Anime(AniDBObj):
         if close:
             self._close_db_session(sess)
 
-    def _db_data_callback(self, res):
+    def _db_data_callback(self, res: Response) -> None:
         # "NO SUCH ANIME" carries no data lines, so this check has to come before
         # anything reads them. It used to sit *after* `res.datalines[0]`, which
         # raised IndexError on every 330 reply -- and because the exception left
@@ -305,21 +351,25 @@ class Anime(AniDBObj):
             self._updated.set()
             return
 
-        relations = []
+        relations: list[AnimeRelationTable] = []
+        # Separate from `relations` below, which used to be this and then the rows
+        # built from it -- two types under one name, and unbindable when the reply
+        # carried no relations at all.
+        paired: Iterable[tuple[str, str]] = []
         new = None
-        ainfo = res.datalines[0]
+        ainfo: dict[str, Any] = res.datalines[0]
 
         if all(x in ainfo and ainfo[x] for x in ["related_aid_list", "related_aid_type"]):
             # strict=False: AniDB has been seen to return the two lists at different
             # lengths, and the pre-existing behaviour is to pair what it can.
-            relations = zip(ainfo["related_aid_list"].split("'"), ainfo["related_aid_type"].split("'"), strict=False)
+            paired = zip(ainfo["related_aid_list"].split("'"), ainfo["related_aid_type"].split("'"), strict=False)
         if "related_aid_list" in ainfo:
             del ainfo["related_aid_list"]
         if "related_aid_type" in ainfo:
             del ainfo["related_aid_type"]
         relations = [
             AnimeRelationTable(related_aid=int(x), relation_type=anidb_client.mapper.anime_relation_map[y])
-            for x, y in relations
+            for x, y in paired
         ]
 
         # convert datatypes
@@ -351,8 +401,13 @@ class Anime(AniDBObj):
                 self.db_data.relations = new_relations
             else:
                 new = AnimeTable(**ainfo)
-                new.updated = datetime.datetime.now(self._timezone)
-                new.last_update_dice = datetime.datetime.now(self._timezone)
+                # Through the row's own update() helper: these columns are declared in the
+                # legacy Column() style (see db.py's Base), so assigning to them directly is
+                # opaque to a type checker in a way setattr is not.
+                new.update(
+                    updated=datetime.datetime.now(self._timezone),
+                    last_update_dice=datetime.datetime.now(self._timezone),
+                )
                 new.relations = relations
                 # commit to sql database
                 sess.add(new)
@@ -365,15 +420,16 @@ class Anime(AniDBObj):
             anidb_client.log.error(f"Failed to update {self} in database")
         self._updated.set()
 
-    def _send_anidb_update_req(self, prio=False):
+    @override
+    def _send_anidb_update_req(self, prio: bool = False) -> None:
         self._updated.clear()
         req = AnimeCommand(aid=str(self.aid), amask=anidb_client.mapper.getAnimeBitsA(anidb_client.mapper.anime_map_a))
-        self._anidb_link.request(req, self._db_data_callback, prio=prio)
+        self._link().request(req, self._db_data_callback, prio=prio)
         self._updated.wait()
         self._updating.release()
 
     @property
-    def in_mylist(self):
+    def in_mylist(self) -> bool | None:
         if self._in_mylist is not None:
             return self._in_mylist
         try:
@@ -387,7 +443,7 @@ class Anime(AniDBObj):
         return self._in_mylist
 
     @property
-    def relations(self):
+    def relations(self) -> list[tuple[str, Anime]]:
         try:
             relations = [(x.relation_type, Anime(x.related_aid)) for x in self.db_data.relations]
         except sqlalchemy.orm.exc.DetachedInstanceError:
@@ -397,7 +453,7 @@ class Anime(AniDBObj):
             self._close_db_session(sess)
         return relations
 
-    def related_anime(self, exclude=None, only_in_mylist=True):
+    def related_anime(self, exclude: Iterable[Anime] | None = None, only_in_mylist: bool = True) -> list[Anime]:
         """Walk this anime's relations transitively and return the connected set.
 
         The returned list starts with this Anime, followed by every Anime
@@ -407,16 +463,16 @@ class Anime(AniDBObj):
         which stops a single sequel link from dragging in an entire franchise.
         """
         excluded = list(exclude) if exclude else []
-        found = [self]
-        queue = []
+        found: list[Anime] = [self]
+        queue: list[Anime] = []
 
-        def _followable(anime):
+        def _followable(anime: Anime) -> bool:
             # Anime defines __eq__ but not __hash__, so it is unhashable and
             # membership here is list scans rather than set lookups. Relation
             # neighbourhoods are small enough that this does not matter.
             if anime in excluded or anime in found or anime in queue:
                 return False
-            return not only_in_mylist or anime.in_mylist
+            return not only_in_mylist or bool(anime.in_mylist)
 
         try:
             queue.extend(a for _relation_type, a in self.relations if _followable(a))
@@ -432,38 +488,40 @@ class Anime(AniDBObj):
 
         return found
 
-    def extid(self, source, id_type="tv"):
+    def extid(self, source: str, id_type: str = "tv") -> str | list[str] | None:
         if source == "thetvdb":
             return anidb_client.anames.get_tvdbid(self.aid, id_type)
         elif source == "tmdb":
             return anidb_client.anames.get_tmdbid(self.aid, id_type)
         elif source == "imdb":
             return anidb_client.anames.get_imdbid(self.aid, id_type)
+        # An unrecognised source is an absence, matching every other id lookup here.
+        return None
 
     @property
-    def tvdbid(self):
+    def tvdbid(self) -> str | None:
         return anidb_client.anames.get_tvdbid(self.aid)
 
     @property
-    def tmdbid(self):
+    def tmdbid(self) -> str | list[str] | None:
         return anidb_client.anames.get_tmdbid(self.aid)
 
     @property
-    def imdbid(self):
+    def imdbid(self) -> str | list[str] | None:
         return anidb_client.anames.get_imdbid(self.aid)
 
     @property
-    def fanart(self):
+    def fanart(self) -> list[Any]:
         if not anidb_client.fanart_key:
             return []
-        ret = []
+        ret: list[Any] = []
         headers = {"api-key": anidb_client.fanart_key, "content-type": "application/json"}
         base_url = "https://webservice.fanart.tv/"
 
         # Currently fanart.tv only supports tvdbids for tv fanart
         tv_id = self.extid("thetvdb", "tv")
         movie_ids = [x for x in [self.extid("tmdb", "movie"), self.extid("imdb", "movie")] if x]
-        urls = []
+        urls: list[str] = []
         for i in movie_ids:
             if type(i) is str:
                 urls.append(urllib.parse.urljoin(base_url, f"/v3.2/movies/{i}"))
@@ -512,12 +570,12 @@ class Anime(AniDBObj):
 
         return ret
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, Anime):
             return NotImplemented
-        return self.aid == other.aid
+        return bool(self.aid == other.aid)
 
-    def __contains__(self, other):
+    def __contains__(self, other: object) -> bool:
         # `False`, not `NotImplemented`. There is no reflected form of __contains__
         # for Python to fall back to -- `in` coerces whatever this returns to a bool
         # -- and since 3.14 that coercion raises TypeError instead of warning. So
@@ -527,9 +585,9 @@ class Anime(AniDBObj):
         # Python really does fall back to identity comparison for it.
         if not isinstance(other, Episode):
             return False
-        return other.aid == self.aid
+        return bool(other.aid == self.aid)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "Anime(title='{}', aid={})".format(
             object.__getattribute__(self, "_title"), object.__getattribute__(self, "_aid")
         )
@@ -548,26 +606,34 @@ class AnimeTitle:
 
 
 class Episode(AniDBObj):
-    _eid = None
-    _anime = None
-    _episode_number = None
+    _eid: int | None = None
+    _anime: Anime | None = None
+    _episode_number: str | None = None
+    _in_mylist: bool | None = None
+    _part: int | None = None
 
     @property
-    def episode_number(self):
+    def episode_number(self) -> str:
         if self._episode_number:
             return self._episode_number
-        return self.epno
+        # Declared str rather than optional, and returned as it is rather than
+        # through str(): an Episode either carries the number it was built with or
+        # resolves one from its cached row, and an eid AniDB does not recognise
+        # makes the object illegal before this can be read. str() around it would
+        # turn that never-case into the string "None", which is worse than None.
+        epno: str = self.epno
+        return epno
 
     @property
-    def tvdb_episode(self):
+    def tvdb_episode(self) -> tuple[int | None, Any]:
         return self._get_ext_epid("tvdb")
 
     @property
-    def tmdb_episode(self):
+    def tmdb_episode(self) -> tuple[int | None, Any]:
         return self._get_ext_epid("tmdb")
 
-    def _get_ext_epid(self, source):
-        res = anidb_client.anames.get_tv_episode(self.anime.aid, self.episode_number, source)
+    def _get_ext_epid(self, source: str) -> tuple[int | None, Any]:
+        res: tuple[int | None, Any] = anidb_client.anames.get_tv_episode(self.anime.aid, self.episode_number, source)
         # special case if when anidb adds parts as regular episodes on movies
         if self.anime.nr_of_episodes == 1 and self._part is None:
             season, ep = res
@@ -576,11 +642,11 @@ class Episode(AniDBObj):
             except ValueError:
                 return res
             if type(ep) is tuple:
-                epno, part = ep
+                epno, _part = ep
                 res = (season, epno) if my_ep == 1 else (season, (epno, my_ep - 1))
         return res
 
-    def _get_mdbid(self, ids):
+    def _get_mdbid(self, ids: str | list[str] | None) -> str | None:
         if not ids:
             return None
         mdbid = None
@@ -602,15 +668,15 @@ class Episode(AniDBObj):
         return mdbid
 
     @property
-    def tmdbid(self):
+    def tmdbid(self) -> str | None:
         return self._get_mdbid(self.anime.extid("tmdb", "movie"))
 
     @property
-    def imdbid(self):
+    def imdbid(self) -> str | None:
         return self._get_mdbid(self.anime.extid("imdb", "movie"))
 
     @property
-    def in_mylist(self):
+    def in_mylist(self) -> bool | None:
         if self._in_mylist is not None:
             return self._in_mylist
         try:
@@ -624,15 +690,18 @@ class Episode(AniDBObj):
         return self._in_mylist
 
     @property
-    def eid(self):
-        eid = self.__getattr__("eid")
+    def eid(self) -> int | None:
+        eid: int | None = self.__getattr__("eid")
         if eid:
             return eid
         elif self.db_data and not self.db_data.eid:
             self.update(True)
-        return self.db_data.eid
+        result: int | None = self.db_data.eid
+        return result
 
-    def __init__(self, anime=None, epno=None, eid=None):
+    def __init__(
+        self, anime: Anime | int | str | None = None, epno: str | int | None = None, eid: int | None = None
+    ) -> None:
         super().__init__()
 
         if not ((anime and epno) or eid):
@@ -645,20 +714,24 @@ class Episode(AniDBObj):
             else:
                 self._anime = Anime(anime)
         if epno:
+            epno_text = str(epno)
             with contextlib.suppress(ValueError):
-                epno = str(int(epno))
-            self._episode_number = epno
+                epno_text = str(int(epno))
+            self._episode_number = epno_text
         self.db_data = None
         self._get_db_data()
 
-    def _get_db_data(self):
+    def _get_db_data(self) -> None:
         sess = self._get_db_session()
         if self._eid:
             res = sess.query(EpisodeTable).filter_by(eid=self._eid).all()
         else:
             res = (
                 sess.query(EpisodeTable)
-                .filter(EpisodeTable.aid == self._anime.aid, EpisodeTable.epno.ilike(self.episode_number))
+                .filter(
+                    EpisodeTable.aid == _required(self._anime, "anime").aid,
+                    EpisodeTable.epno.ilike(self.episode_number),
+                )
                 .all()
             )
         if len(res) > 0:
@@ -678,7 +751,7 @@ class Episode(AniDBObj):
                 self._anime = Anime(self.db_data.aid)
         self._close_db_session(sess)
 
-    def _anidb_data_callback(self, res):
+    def _anidb_data_callback(self, res: Response) -> None:
         try:
             sess = self._get_db_session()
             if res.rescode == "340":
@@ -686,7 +759,7 @@ class Episode(AniDBObj):
                 self._illegal_object = True
                 self._updated.set()
                 return
-            einfo = res.datalines[0]
+            einfo: dict[str, Any] = res.datalines[0]
             new = None
             for attr, data in einfo.items():
                 if attr == "epno":
@@ -703,8 +776,13 @@ class Episode(AniDBObj):
                 self.db_data.updated = datetime.datetime.now(self._timezone)
             else:
                 new = EpisodeTable(**einfo)
-                new.updated = datetime.datetime.now(self._timezone)
-                new.last_update_dice = datetime.datetime.now(self._timezone)
+                # Through the row's own update() helper: these columns are declared in the
+                # legacy Column() style (see db.py's Base), so assigning to them directly is
+                # opaque to a type checker in a way setattr is not.
+                new.update(
+                    updated=datetime.datetime.now(self._timezone),
+                    last_update_dice=datetime.datetime.now(self._timezone),
+                )
                 sess.add(new)
 
             if new:
@@ -716,28 +794,30 @@ class Episode(AniDBObj):
             anidb_client.log.error(f"Failed to update {self} in database")
         self._updated.set()
 
-    def _send_anidb_update_req(self, prio=False):
+    @override
+    def _send_anidb_update_req(self, prio: bool = False) -> None:
         self._updated.clear()
         if self._eid:
             req = EpisodeCommand(eid=self._eid)
         else:
-            req = EpisodeCommand(aid=self._anime.aid, epno=self.episode_number)
-        self._anidb_link.request(req, self._anidb_data_callback, prio=prio)
+            req = EpisodeCommand(aid=_required(self._anime, "anime").aid, epno=self.episode_number)
+        self._link().request(req, self._anidb_data_callback, prio=prio)
         self._updated.wait()
         self._updating.release()
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, Episode):
             return NotImplemented
         if self._eid and other._eid:
             return self._eid == other._eid
         if self._lid and other._lid:
-            return self._lid == other._lid
+            return bool(self._lid == other._lid)
         if self._episode_number and other._episode_number:
             return self._episode_number == other._episode_number
-        return self.eid == other.eid or self.lid == other.lid
+        # `self.eid` and `self.lid` come through __getattr__, so they are Any.
+        return bool(self.eid == other.eid or self.lid == other.lid)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "Episode(anime={}, episode_number='{}', eid={})".format(
             object.__getattribute__(self, "_anime"),
             object.__getattribute__(self, "_episode_number"),
@@ -746,36 +826,36 @@ class Episode(AniDBObj):
 
 
 class File(AniDBObj):
-    _anime = None
-    _episode = None
-    _group = None
+    _anime: Anime | None = None
+    _episode: Episode | None = None
+    _group: Group | None = None
     # None, not []. A mutable default on the class is shared by every File in the
     # process, so the first `.append` to it would leak one file's episode list into
     # all the others. Nothing appends today -- every write here rebinds -- which is
     # why this has not bitten yet, and is exactly the state in which it is cheap to
     # fix.
     _multiep: list[str] | None = None
-    _fid = None
-    _path = None
-    _size = None
-    _ed2khash = None
-    _mtime = None
-    _lid = None
-    _part = None
-    _is_generic = None
+    _fid: int | None = None
+    _path: str | None = None
+    _size: int | None = None
+    _ed2khash: str | None = None
+    _mtime: datetime.datetime | None = None
+    _lid: int | None = None
+    _part: int | None = None
+    _is_generic: bool | None = None
 
     @property
-    def anime(self):
+    def anime(self) -> Anime:
         if self._anime:
             return self._anime
         self._anime = Anime(self.aid)
         return self._anime
 
     @property
-    def episode(self):
+    def episode(self) -> Episode:
         if self._episode:
             return self._episode
-        kwargs = {}
+        kwargs: dict[str, Any] = {}
         if self._multiep:
             kwargs["epno"] = self._multiep[0]
         if self._anime:
@@ -788,16 +868,16 @@ class File(AniDBObj):
         elif self.eid:
             self._episode = Episode(eid=self.eid)
         else:
-            anime, episodes = self._guess_anime_ep_from_file(aid=self._anime.aid)
-            self._episode = episodes[0]
+            _anime, episodes = self._guess_anime_ep_from_file(aid=_required(self._anime, "anime").aid)
+            self._episode = _required(episodes, "episodes")[0]
         return self._episode
 
     @property
-    def in_mylist(self):
+    def in_mylist(self) -> bool:
         return bool(self.lid)
 
     @property
-    def group(self):
+    def group(self) -> Group | None:
         if self._group:
             return self._group
         if self.gid:
@@ -806,7 +886,7 @@ class File(AniDBObj):
         return None
 
     @property
-    def part(self):
+    def part(self) -> int | None:
         if self._part:
             return self._part
         if self._path:
@@ -821,7 +901,7 @@ class File(AniDBObj):
         return None
 
     @property
-    def multiep(self):
+    def multiep(self) -> list[str]:
         """Return all episode numbers if there are more of them. Note that this
         is very much not reliable since this attribute is not stored in the
         database.
@@ -856,7 +936,7 @@ class File(AniDBObj):
         return self._multiep
 
     @property
-    def size(self):
+    def size(self) -> int | None:
         if self._size:
             return self._size
         if self.path:
@@ -866,7 +946,7 @@ class File(AniDBObj):
         return self._size
 
     @property
-    def mtime(self):
+    def mtime(self) -> datetime.datetime | None:
         if self._mtime:
             return self._mtime
         if self.path:
@@ -876,7 +956,7 @@ class File(AniDBObj):
         return self._mtime
 
     @property
-    def ed2khash(self):
+    def ed2khash(self) -> str | None:
         if self._ed2khash:
             return self._ed2khash
         elif self._path:
@@ -904,15 +984,15 @@ class File(AniDBObj):
 
     def __init__(
         self,
-        path=None,
-        fid=None,
-        lid=None,
-        anime=None,
-        episode=None,
-        nfs_obj=None,
-        force_single_episode_series=False,
-        parse_dir=True,
-    ):
+        path: str | None = None,
+        fid: int | None = None,
+        lid: int | None = None,
+        anime: Anime | int | str | None = None,
+        episode: Episode | str | None = None,
+        nfs_obj: Any = None,
+        force_single_episode_series: bool = False,
+        parse_dir: bool = True,
+    ) -> None:
         super().__init__()
         self.force_single_episode_series = force_single_episode_series
         self.parse_dir = parse_dir
@@ -944,7 +1024,7 @@ class File(AniDBObj):
                 self._multiep = [episode]
         self._get_db_data()
 
-    def _get_db_data(self):
+    def _get_db_data(self) -> None:
         sess = self._get_db_session()
         res = None
         if self._fid:
@@ -959,8 +1039,12 @@ class File(AniDBObj):
                 res = []
             if not res:
                 res = sess.query(FileTable).filter_by(size=self._size, ed2khash=self.ed2khash).all()
-        elif self._episode.eid:
-            res = sess.query(FileTable).filter_by(aid=self._anime.aid, eid=self._episode.eid).all()
+        elif _required(self._episode, "episode").eid:
+            res = (
+                sess.query(FileTable)
+                .filter_by(aid=_required(self._anime, "anime").aid, eid=_required(self._episode, "episode").eid)
+                .all()
+            )
             if res and len(res) > 0:
                 res = [x for x in res if x.lid]
         if res and len(res) > 0:
@@ -969,8 +1053,8 @@ class File(AniDBObj):
                 self.db_data.path = self._path
             if not self.db_data.aid or not self.db_data.eid:
                 anime, episodes = self._guess_anime_ep_from_file()
-                self.db_data.aid = anime.aid
-                self.db_data.eid = episodes[0].eid
+                self.db_data.aid = _required(anime, "anime").aid
+                self.db_data.eid = _required(episodes, "episodes")[0].eid
 
             sess.merge(self.db_data)
             self._db_commit(sess)
@@ -981,17 +1065,17 @@ class File(AniDBObj):
             self._anime = Anime(self.db_data.aid)
         self._close_db_session(sess)
 
-    def _anidb_file_data_callback(self, res):
+    def _anidb_file_data_callback(self, res: Response) -> None:
         new = None
         update_mylist = False
-        finfo = {}
+        finfo: dict[str, Any] = {}
         anidb_client.log.debug(f"Response from anidb about file {self}")
         if res.rescode in ("340", "320"):
             anidb_client.log.debug(f"{self} is not present in AniDB")
             if not self.db_data:
                 self._is_generic = True
                 if self._anime:
-                    anime, episodes = self._guess_anime_ep_from_file(aid=self._anime.aid)
+                    anime, episodes = self._guess_anime_ep_from_file(aid=_required(self._anime, "anime").aid)
                 else:
                     anime, episodes = self._guess_anime_ep_from_file()
                 if anime and episodes:
@@ -1006,7 +1090,7 @@ class File(AniDBObj):
                     if anime is None:
                         raise IllegalAnimeObject(f"Could not identify {self}")
                     finfo["aid"] = anime.aid
-                    finfo["eid"] = episodes[0].eid
+                    finfo["eid"] = _required(episodes, "episodes")[0].eid
                     finfo["is_generic"] = self._is_generic
                 except IllegalAnimeObject, IndexError, TypeError:
                     self._illegal_object = True
@@ -1017,8 +1101,10 @@ class File(AniDBObj):
                     self._file_updated.set()
                     return
         else:
-            finfo = res.datalines[0]
-            state = None
+            # Copied rather than aliased: `del finfo["state"]` below would
+            # otherwise reach back into the response object's own data line.
+            finfo.update(res.datalines[0])
+            state: int | None = None
             anidb_client.log.debug(f"{self} is in anidb")
 
             # if this file previously was generic, the file has probably been
@@ -1096,9 +1182,9 @@ class File(AniDBObj):
         anidb_client.log.debug(f"fetching a db session to update {self}")
         if self.db_data and not self.db_data.aid and "aid" not in finfo:
             anime, episodes = self._guess_anime_ep_from_file()
-            finfo["aid"] = anime.aid
+            finfo["aid"] = _required(anime, "anime").aid
             if not self.db_data.eid and "eid" not in finfo:
-                finfo["eid"] = episodes[0].eid
+                finfo["eid"] = _required(episodes, "episodes")[0].eid
 
         try:
             sess = self._get_db_session()
@@ -1109,8 +1195,13 @@ class File(AniDBObj):
                 self.db_data.updated = datetime.datetime.now(self._timezone)
             else:
                 new = FileTable(**finfo)
-                new.updated = datetime.datetime.now(self._timezone)
-                new.last_update_dice = datetime.datetime.now(self._timezone)
+                # Through the row's own update() helper: these columns are declared in the
+                # legacy Column() style (see db.py's Base), so assigning to them directly is
+                # opaque to a type checker in a way setattr is not.
+                new.update(
+                    updated=datetime.datetime.now(self._timezone),
+                    last_update_dice=datetime.datetime.now(self._timezone),
+                )
                 sess.add(new)
 
             if new:
@@ -1129,7 +1220,7 @@ class File(AniDBObj):
                 other=self.db_data.mylist_other,
             )
 
-    def _anidb_mylist_data_callback(self, res):
+    def _anidb_mylist_data_callback(self, res: Response) -> None:
         new = None
         if res.rescode == "312":
             self._mylist_updated.set()
@@ -1138,7 +1229,7 @@ class File(AniDBObj):
             self._mylist_updated.set()
             return
         else:
-            finfo = res.datalines[0]
+            finfo: dict[str, Any] = res.datalines[0]
             if "date" in finfo:
                 del finfo["date"]
             for attr, data in finfo.items():
@@ -1158,16 +1249,26 @@ class File(AniDBObj):
                     finfo["is_generic"] = True
 
                 # there is something in mylist; but it's not us :/
-                res = sess.query(FileTable).filter_by(lid=finfo["lid"]).all()
-                if not res:
+                existing = sess.query(FileTable).filter_by(lid=finfo["lid"]).all()
+                if not existing:
                     new = FileTable(**finfo)
-                    new.updated = datetime.datetime.now(self._timezone)
-                    new.last_update_dice = datetime.datetime.now(self._timezone)
+                    # Through the row's own update() helper: these columns are declared in the
+                    # legacy Column() style (see db.py's Base), so assigning to them directly is
+                    # opaque to a type checker in a way setattr is not.
+                    new.update(
+                        updated=datetime.datetime.now(self._timezone),
+                        last_update_dice=datetime.datetime.now(self._timezone),
+                    )
                     sess.add(new)
                 else:
-                    obj = res[0]
-                    obj.updated = datetime.datetime.now(self._timezone)
-                    obj.last_update_dice = datetime.datetime.now(self._timezone)
+                    obj = existing[0]
+                    # Through the row's own update() helper: these columns are declared in the
+                    # legacy Column() style (see db.py's Base), so assigning to them directly is
+                    # opaque to a type checker in a way setattr is not.
+                    obj.update(
+                        updated=datetime.datetime.now(self._timezone),
+                        last_update_dice=datetime.datetime.now(self._timezone),
+                    )
                     obj.update(**finfo)
                 self._db_commit(sess)
                 self._close_db_session(sess)
@@ -1194,8 +1295,13 @@ class File(AniDBObj):
                 self.db_data.updated = datetime.datetime.now(self._timezone)
             else:
                 new = FileTable(**finfo)
-                new.updated = datetime.datetime.now(self._timezone)
-                new.last_update_dice = datetime.datetime.now(self._timezone)
+                # Through the row's own update() helper: these columns are declared in the
+                # legacy Column() style (see db.py's Base), so assigning to them directly is
+                # opaque to a type checker in a way setattr is not.
+                new.update(
+                    updated=datetime.datetime.now(self._timezone),
+                    last_update_dice=datetime.datetime.now(self._timezone),
+                )
                 anidb_client.log.debug(f"Adding mylist info: {finfo}")
                 sess.add(new)
 
@@ -1207,8 +1313,11 @@ class File(AniDBObj):
             anidb_client.log.error(f"Failed to update {self} in database")
         self._mylist_updated.set()
 
-    def _send_anidb_update_req(self, prio=False, req_mylist=False, req_file=True):
+    def _send_anidb_update_req(self, prio: bool = False, req_mylist: bool = False, req_file: bool = True) -> None:
         anidb_client.log.debug(f"updating - fid: {self._fid}, size: {self._size}, path: {self._path}")
+        # One name for both halves of this method: it sends a FILE request and then,
+        # depending on what came back, a MYLIST one.
+        req: Command
         if req_file:
             if self._fid:
                 self._file_updated.clear()
@@ -1218,7 +1327,7 @@ class File(AniDBObj):
                     fmask=anidb_client.mapper.getFileBitsF(anidb_client.mapper.file_map_f),
                     amask=anidb_client.mapper.getFileBitsA(["epno"]),
                 )
-                self._anidb_link.request(req, self._anidb_file_data_callback, prio=prio)
+                self._link().request(req, self._anidb_file_data_callback, prio=prio)
                 self._file_updated.wait()
             elif self._size and self._path:
                 self._file_updated.clear()
@@ -1229,7 +1338,7 @@ class File(AniDBObj):
                     fmask=anidb_client.mapper.getFileBitsF(anidb_client.mapper.file_map_f),
                     amask=anidb_client.mapper.getFileBitsA(["epno"]),
                 )
-                self._anidb_link.request(req, self._anidb_file_data_callback, prio=prio)
+                self._link().request(req, self._anidb_file_data_callback, prio=prio)
                 self._file_updated.wait()
 
         # We want to send a mylist request only if explicitly asked for, or if
@@ -1245,11 +1354,11 @@ class File(AniDBObj):
                 anidb_client.log.debug("fetching mylist with aid and epno")
                 req = MyListCommand(aid=self.anime.aid, epno=self.episode.episode_number)
             anidb_client.log.debug("sending mylist request")
-            self._anidb_link.request(req, self._anidb_mylist_data_callback, prio=prio)
+            self._link().request(req, self._anidb_mylist_data_callback, prio=prio)
             self._mylist_updated.wait()
         self._updating.release()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         db_data = object.__getattribute__(self, "db_data")
         path = object.__getattribute__(self, "_path")
         watched = db_data.mylist_viewdate if db_data else None
@@ -1261,10 +1370,10 @@ class File(AniDBObj):
             watched,
         )
 
-    def remove_from_mylist(self):
+    def remove_from_mylist(self) -> None:
         wait = threading.Event()
 
-        def _mylistdel_callback(res):
+        def _mylistdel_callback(res: Response) -> None:
             if res.rescode == "211":
                 anidb_client.log.info(f"File {self} removed from mylist")
             elif res.rescode == "411":
@@ -1273,10 +1382,10 @@ class File(AniDBObj):
 
         if self.db_data and self.db_data.fid:
             req = MyListDelCommand(fid=self.db_data.fid)
-            self._anidb_link.request(req, _mylistdel_callback, prio=True)
+            self._link().request(req, _mylistdel_callback, prio=True)
         elif self.db_data and self.db_data.lid:
             req = MyListDelCommand(lid=self.db_data.lid)
-            self._anidb_link.request(req, _mylistdel_callback, prio=True)
+            self._link().request(req, _mylistdel_callback, prio=True)
         elif self.is_generic:
             # `self.is_generic`, not `self._is_generic`. The private attribute is
             # only set when the File was constructed as generic in this process; a
@@ -1287,12 +1396,12 @@ class File(AniDBObj):
             episodes = self._multiep or [self.episode.episode_number]
             for ep in episodes:
                 wait.clear()
-                req = MyListDelCommand(aid=self._anime.aid, epno=ep)
-                self._anidb_link.request(req, _mylistdel_callback, prio=True)
+                req = MyListDelCommand(aid=_required(self._anime, "anime").aid, epno=ep)
+                self._link().request(req, _mylistdel_callback, prio=True)
                 wait.wait()
         else:
             req = MyListDelCommand(size=self.size, ed2k=self.ed2khash)
-            self._anidb_link.request(req, _mylistdel_callback, prio=True)
+            self._link().request(req, _mylistdel_callback, prio=True)
         self._lid = None
         sess = self._get_db_session()
         finfo = {
@@ -1311,14 +1420,20 @@ class File(AniDBObj):
         self._close_db_session(sess)
         wait.wait()
 
-    def update_mylist(self, state=None, watched=None, source=None, other=None):
+    def update_mylist(
+        self,
+        state: str | None = None,
+        watched: bool | datetime.datetime | None = None,
+        source: str | None = None,
+        other: str | None = None,
+    ) -> None:
         wait = threading.Event()
         self.update_if_old()
         viewdate = None
         edit = False
         req = None
 
-        def _mylistadd_callback(res):
+        def _mylistadd_callback(res: Response) -> None:
             if res.rescode in ("320", "330", "350", "310", "322", "411"):
                 anidb_client.log.warning(f"Could not add file {self} to mylist, anidb says: {res.rescode}")
             elif res.rescode in ("210", "310", "311"):
@@ -1363,7 +1478,9 @@ class File(AniDBObj):
             res = sess.query(FileTable).filter_by(eid=self.episode.eid).all()
             self._db_commit(sess)
             self._close_db_session(sess)
-            mylist_entries = [x for x in res if x.lid]
+            # `Any`: db.py declares its columns in the legacy Column() style, so a
+            # read off a row is a Column[...] to a checker rather than the value.
+            mylist_entries: list[Any] = [x for x in res if x.lid]
             if mylist_entries:
                 for entry in mylist_entries:
                     other_file = File(lid=entry.lid)
@@ -1399,7 +1516,7 @@ class File(AniDBObj):
             for ep in self.multiep:
                 wait.clear()
                 req = MyListAddCommand(
-                    aid=self._anime.aid,
+                    aid=_required(self._anime, "anime").aid,
                     epno=ep,
                     generic=1,
                     state=state_num,
@@ -1408,7 +1525,7 @@ class File(AniDBObj):
                     source=source,
                     other=other,
                 )
-                self._anidb_link.request(req, _mylistadd_callback, prio=True)
+                self._link().request(req, _mylistadd_callback, prio=True)
                 wait.wait()
             # Already sent; nothing left for the single send below. This also stops
             # an empty episode list reaching it with req still None.
@@ -1424,7 +1541,7 @@ class File(AniDBObj):
                 other=other,
             )
         if req is not None:
-            self._anidb_link.request(req, _mylistadd_callback, prio=True)
+            self._link().request(req, _mylistadd_callback, prio=True)
             wait.wait()
         if edit:
             sess = self._get_db_session()
@@ -1458,7 +1575,7 @@ class File(AniDBObj):
             self._send_anidb_update_req(req_file=False, req_mylist=True)
         anidb_client.log.info(f"File {self} updated in mylist")
 
-    def _guess_anime_ep_from_file(self, aid=None):
+    def _guess_anime_ep_from_file(self, aid: int | None = None) -> tuple[Anime | None, list[Episode] | None]:
         # Read the path without going through __getattr__. This runs from inside
         # _anidb_file_data_callback, and `self.path` on a File with no local path
         # falls through to update_if_old() -- which starts a fetch and waits on the
@@ -1514,7 +1631,7 @@ class File(AniDBObj):
 
         return (anime, episodes)
 
-    def _search_filename(self, filename, regex, anime):
+    def _search_filename(self, filename: str, regex: re.Pattern[str], anime: Anime) -> list[str]:
         ret = []
         res = regex.search(filename)
         if res:
@@ -1561,7 +1678,7 @@ class File(AniDBObj):
                     ret.append(str(ep))
         return ret
 
-    def _guess_epno_from_filename(self, filename, anime):
+    def _guess_epno_from_filename(self, filename: str, anime: Anime) -> list[Episode]:
         count = 1
         ret = None
         for r in anidb_client.fileinfo.ep_nr_re:
@@ -1587,19 +1704,29 @@ class File(AniDBObj):
             # multi episode series, but the regular regexp gave nothing, try
             # the fallbacks
             for r in anidb_client.fileinfo.ep_nr_re[count:]:
+                # The slice starts past the None sentinel the loop above stopped at,
+                # so this never fires -- it is what makes that readable to a checker.
+                if r is None:
+                    continue
                 ret = self._search_filename(filename, r, anime)
                 if ret:
                     break
             if not ret:
                 anidb_client.log.debug(f"file '{filename}': could not figure out episode number(s)")
                 return []
-        m = re.match(anidb_client.fileinfo.specials_re, ret[0])
+        first = re.match(anidb_client.fileinfo.specials_re, ret[0])
         if len(ret) == 2:
-            if m:
-                mi = int(m.group(2))
-                m = re.match(anidb_client.fileinfo.specials_re, ret[1])
-                ma = int(m.group(2))
-                ret = [f"{m.group(1).upper()}{x}" for x in range(mi, ma + 1)]
+            if first:
+                # _search_filename prefixes every number it found from one match's
+                # group(1), so both endpoints of a range always carry the same
+                # prefix. The second match is still checked rather than assumed:
+                # reading .group() off a failed match would raise here, halfway
+                # through building the episode list.
+                second = re.match(anidb_client.fileinfo.specials_re, ret[1])
+                if second:
+                    mi = int(first.group(2))
+                    ma = int(second.group(2))
+                    ret = [f"{first.group(1).upper()}{x}" for x in range(mi, ma + 1)]
             else:
                 mi = int(ret[0])
                 ma = int(ret[1])
@@ -1607,7 +1734,7 @@ class File(AniDBObj):
         anidb_client.log.debug(f"file '{filename}': looks like episode(s) {ret}")
         return [Episode(anime=anime, epno=e) for e in ret]
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, File):
             return NotImplemented
         if self.fid and self.fid == other.fid:
@@ -1620,10 +1747,10 @@ class File(AniDBObj):
         # anything inspecting the result itself saw None.
         return False
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.multiep)
 
-    def __contains__(self, other):
+    def __contains__(self, other: object) -> bool:
         # See Anime.__contains__: NotImplemented is not a legal answer here, and
         # since 3.14 returning it raises TypeError rather than reading as true.
         if not isinstance(other, Episode):
@@ -1632,10 +1759,10 @@ class File(AniDBObj):
 
 
 class Group(AniDBObj):
-    _gid = None
-    _name = None
+    _gid: int | None = None
+    _name: str | None = None
 
-    def __init__(self, name=None, gid=None):
+    def __init__(self, name: str | None = None, gid: int | None = None) -> None:
         super().__init__()
         if not (name or gid):
             raise IllegalAnimeObject("At least name or gid must be given when creating a Group object")
@@ -1647,7 +1774,7 @@ class Group(AniDBObj):
         self.db_data = None
         self._get_db_data()
 
-    def _anidb_data_callback(self, res):
+    def _anidb_data_callback(self, res: Response) -> None:
         sess = self._get_db_session()
         if self.db_data:
             self.db_data = sess.merge(self.db_data)
@@ -1664,7 +1791,7 @@ class Group(AniDBObj):
                 )
                 sess.add(new)
         else:
-            ginfo = res.datalines[0]
+            ginfo: dict[str, Any] = res.datalines[0]
             for attr, data in ginfo.items():
                 if attr == "relations":
                     relations = data.split("'")
@@ -1720,8 +1847,12 @@ class Group(AniDBObj):
             self.db_data.relations = new_relations
         else:
             new = GroupTable(**ginfo)
-            new.updated = datetime.datetime.now(self._timezone)
-            new.last_update_dice = datetime.datetime.now(self._timezone)
+            # Through the row's own update() helper: these columns are declared in the
+            # legacy Column() style (see db.py's Base), so assigning to them directly is
+            # opaque to a type checker in a way setattr is not.
+            new.update(
+                updated=datetime.datetime.now(self._timezone), last_update_dice=datetime.datetime.now(self._timezone)
+            )
             sess.add(new)
             self.db_data = new
 
@@ -1729,7 +1860,7 @@ class Group(AniDBObj):
         self._close_db_session(sess)
         self._updated.set()
 
-    def _get_db_data(self):
+    def _get_db_data(self) -> None:
         sess = self._get_db_session()
         if self._gid:
             res = sess.query(GroupTable).filter_by(gid=self._gid).all()
@@ -1744,14 +1875,15 @@ class Group(AniDBObj):
             anidb_client.log.debug(f"Found db_data for group: {self.db_data}")
         self._close_db_session(sess)
 
-    def _send_anidb_update_req(self, prio=False):
+    @override
+    def _send_anidb_update_req(self, prio: bool = False) -> None:
         self._updated.clear()
         req = GroupCommand(gid=self._gid) if self._gid else GroupCommand(gname=self._name)
-        self._anidb_link.request(req, self._anidb_data_callback, prio=prio)
+        self._link().request(req, self._anidb_data_callback, prio=prio)
         self._updated.wait()
         self._updating.release()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "Group(gid='{}', name='{}')".format(
             object.__getattribute__(self, "_gid"), object.__getattribute__(self, "_name")
         )

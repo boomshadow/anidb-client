@@ -183,7 +183,9 @@ anidb_client.init(
 ```
 
 `sql_db_url` is a SQLAlchemy URL and is the only required argument. Credentials
-come either from `api_user`/`api_pass` or from a [netrc file](#netrc). Pass
+come either from `api_user`/`api_pass` or from a [netrc file](#netrc); unless
+`db_only=True`, `init()` raises if it finds neither rather than failing later on
+the first request. Pass
 `db_only=True` to work entirely from cache without opening a UDP session, and
 `client_name`/`client_version` to authenticate as your own
 [registered client](#registering-a-client-with-anidb).
@@ -384,7 +386,9 @@ argument. The library looks for:
   and only the hostname: no port, and no brackets around an IPv6 literal
   (`machine ::1`, not `machine [::1]:5432`). Matching is case-insensitive. This
   lookup only happens when the URL carries no password of its own; a password
-  already in the URL is left alone.
+  already in the URL is left alone. The entry needs a `login` as well as a
+  `password`: the credential is used only when it belongs to the user the URL
+  names, and one with no login belongs to no user.
 * fanart.tv API key — machine name must be one of `fanart.tv`,
   `assets.fanart.tv`, `webservice.fanart.tv` or `api.fanart.tv`.
 

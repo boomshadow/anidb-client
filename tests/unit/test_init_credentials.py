@@ -75,6 +75,24 @@ class TestCredentialsRequired:
         with pytest.raises(anidb_client.errors.AniDBError, match="username and password"):
             anidb_client.init(f"sqlite:///{tmp_path}/cache.db", netrc_file=str(tmp_path / "absent"))
 
+    def test_a_netrc_naming_no_anidb_host_is_the_same_error(self, tmp_path, clean_globals, captured_link):
+        """A file that exists but has nothing for AniDB in it.
+
+        The absent-file case above is caught before the lookup runs. This one
+        gets all the way through it and comes out with the credentials still
+        unset -- which used to open the link anyway, so the failure surfaced at
+        AUTH with nothing pointing back at the netrc file that did not have what
+        was wanted.
+        """
+        path = tmp_path / "netrc"
+        path.write_text("machine example.com\n  login someone\n  password something\n")
+        path.chmod(0o600)
+
+        with pytest.raises(anidb_client.errors.AniDBError, match="username and password"):
+            anidb_client.init(f"sqlite:///{tmp_path}/cache.db", netrc_file=str(path))
+
+        assert captured_link == [], "no link may be opened without credentials"
+
     def test_explicit_credentials_are_passed_through(self, tmp_path, clean_globals, captured_link):
         anidb_client.init(f"sqlite:///{tmp_path}/cache.db", api_user="u", api_pass="p")
 

@@ -39,7 +39,7 @@ A netrc file is consulted for three separate secrets, each keyed by its own set 
 
 The database lookup applies only when the URL carries no password of its own; a password already in the URL is left alone. When a netrc password is found, two further rules apply:
 
-- **The credential must belong to the user named in the URL.** netrc holds one credential per host, and pairing it with a different username would just fail authentication confusingly. When the URL names no user, the netrc login is used.
+- **The credential must belong to the user named in the URL.** netrc holds one credential per host, and pairing it with a different username would just fail authentication confusingly. When the URL names no user, the netrc login is used. netrc also permits an entry with a password and no login at all: such a credential belongs to no user, so it is left unused whether or not the URL names one.
 - **The URL is rebuilt structurally, not by string surgery.** The username and password are percent-encoded before being placed into the URL, so a password containing URL-significant characters produces a URL that still parses as intended. An IPv6 literal host is re-bracketed and any port is preserved.
 
 ## Client identity

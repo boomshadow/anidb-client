@@ -1,8 +1,8 @@
 ---
 title: "Coding Style and Conventions"
-description: "House coding conventions for anidb-client: Docker-native development with no host Python toolchain, the Taskfile as the developer-command entry point, a current-rather-than-conservative interpreter floor restated to ruff, to mypy and in the pinned image tag rather than derived, ruff for formatting and linting, the mypy per-module strictness ratchet, codespell, the pin-and-verify supply-chain posture (exact pins, hashed uv.lock, a 45-day soak declared to the resolver, a digest-pinned base image), the no-network testing discipline enforced by the suite itself rather than by the runner, and the ratcheting coverage floor."
+description: "House coding conventions for anidb-client: Docker-native development with no host Python toolchain, the Taskfile as the developer-command entry point, a current-rather-than-conservative interpreter floor restated to ruff, to mypy and in the pinned image tag rather than derived, ruff for formatting and linting, mypy under global strict with its two documented exemptions, codespell, the pin-and-verify supply-chain posture (exact pins, hashed uv.lock, a 45-day soak declared to the resolver, a digest-pinned base image), the no-network testing discipline enforced by the suite itself rather than by the runner, and the ratcheting coverage floor."
 status: accepted
-tags: [coding-style, conventions, python, interpreter-floor, requires-python, target-version, ruff, mypy, ratchet, codespell, docker-native, taskfile, uv, uv-lock, supply-chain, pin-and-verify, soak, digest-pin, editorconfig, testing, network-guard, fake-server, coverage, coverage-floor, postgres-marker]
+tags: [coding-style, conventions, python, interpreter-floor, requires-python, target-version, ruff, mypy, strict, type-annotations, codespell, docker-native, taskfile, uv, uv-lock, supply-chain, pin-and-verify, soak, digest-pin, editorconfig, testing, network-guard, fake-server, coverage, coverage-floor, postgres-marker]
 ---
 
 # Coding Style and Conventions
@@ -29,7 +29,16 @@ And, least visibly, in the **tag of the pinned toolchain image**, which the `Doc
 
 **ruff** is both formatter and linter, configured in `pyproject.toml`. Its rule selection subsumes what would otherwise be several tools; the `pyproject` is authoritative for which rules are enabled.
 
-**mypy runs as a ratchet, not a wall.** The codebase arrived with no annotations at all, so blanket strictness would produce hundreds of errors and, inevitably, a blanket ignore — which checks nothing. Instead the baseline is lenient and catches what can be caught without annotations, and a per-module list opts individual modules into full strictness. The convention is one-directional: a module joins the strict list once it is annotated, and cannot silently regress afterwards. Adding a module to that list is the intended way to make progress; removing one is not.
+**mypy is strict, everywhere.** Every module in the package is annotated and checked under `strict`, and a new one is strict from its first line rather than opted in afterwards. There is no per-module exemption list and adding one would be a regression, not a convenience: the point of a single global setting is that no module can be quietly left out of it.
+
+This was reached rather than declared. The package arrived with no annotations at all, where blanket strictness would have produced hundreds of errors and, inevitably, a blanket ignore that checks nothing — so strictness was applied module by module through a per-module list that could only grow. That list is now the global setting, and the history is recorded here only to explain why a reader will not find one.
+
+Two things stay outside it, each documented where it lives:
+
+- **A third-party library with no type information**, waived in `pyproject.toml`. `libnfs` is the remaining case; it ships nothing and is not installed in the development environment at all, so `nfs://` paths are typed at the boundary and `Any` beyond it. A library that gains type information gets its waiver removed, not kept for tidiness.
+- **The library logger**, waived on the declaration itself rather than in configuration, because it is one line rather than a module. It is `None` until `init()` runs, which is a state no code path that logs can observe, so it is annotated as a logger with a single documented `type: ignore` rather than made optional at every call site. The one module a caller's own test can reach before `init()` guards explicitly and has a test for it.
+
+Where the annotations reach the edge of what can be stated — an attribute forwarded to whichever cached row carries it, a conversion table whose every entry produces a different type, an AES cipher object with no common base across modes — `Any` is used deliberately and says in a comment why the alternative would be worse. `Any` that merely postpones the question is not the same thing.
 
 **codespell** checks prose and code alike. Its ignore list is for real words that look like typos — AniDB field names, values quoted from wire payloads — and each entry carries a note saying which. Whole files are skipped only when naming their contents individually would re-introduce the same false positives.
 
@@ -55,6 +64,6 @@ Timing is injected, not slept through. The rate limiter takes its clock and its 
 
 ## Related Artifacts
 
-- **Line of truth (self-enforcing):** `pyproject.toml` (ruff rules, the mypy strict-module list, codespell's ignores, pytest configuration and markers, the coverage floor, exact dependency pins and the declared soak window); `uv.lock` (the resolved, hashed dependency set); `.editorconfig` (formatting per file type); `Taskfile.yml` (the developer commands); `Dockerfile` and `docker-compose.yml` (the container the commands run in).
+- **Line of truth (self-enforcing):** `pyproject.toml` (ruff rules, the global mypy strict setting and the one library waived from it, codespell's ignores, pytest configuration and markers, the coverage floor, exact dependency pins and the declared soak window); `uv.lock` (the resolved, hashed dependency set); `.editorconfig` (formatting per file type); `Taskfile.yml` (the developer commands); `Dockerfile` and `docker-compose.yml` (the container the commands run in).
 - **Related specs:** SPEC-008 (the CI pipeline that runs these same checks, and the scanning that reads `.grype.yaml`); SPEC-003 (why the PostgreSQL-marked tests exist at all).
 - **Tests:** style and typing conformance is enforced by the tooling itself through `task check` rather than by unit tests. The conventions that tooling cannot enforce are covered directly: the network guard's own behavior in `tests/test_network_guard.py`, and the bounded-HTTP-timeout rule — that no `urlopen` call site is left unbounded — in `tests/unit/test_http_timeouts.py`.

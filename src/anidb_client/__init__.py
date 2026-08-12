@@ -22,6 +22,9 @@ import os
 import random
 import urllib.parse
 import urllib.request
+from typing import IO
+
+import sqlalchemy.orm
 
 import anidb_client.db
 import anidb_client.errors
@@ -79,26 +82,26 @@ HTTP_TIMEOUT = 30
 # they cannot be in. mapper.py, whose converters a caller's own test can reach
 # before init(), guards explicitly and has a test for it.
 log: logging.Logger = None  # type: ignore[assignment]
-_anidb = None
-_sessionmaker = None
-fanart_key = None
+_anidb: AniDBLink | None = None
+_sessionmaker: sqlalchemy.orm.sessionmaker[sqlalchemy.orm.Session] | None = None
+fanart_key: str | None = None
 
 
 def init(
-    sql_db_url,
-    api_user=None,
-    api_pass=None,
-    debug=False,
-    loglevel="info",
-    logger=None,
-    netrc_file=None,
-    outgoing_udp_port=None,
-    api_key=None,
-    fanart_api_key=None,
-    db_only=False,
-    client_name=None,
-    client_version=None,
-):
+    sql_db_url: str,
+    api_user: str | None = None,
+    api_pass: str | None = None,
+    debug: bool = False,
+    loglevel: str = "info",
+    logger: logging.Logger | None = None,
+    netrc_file: str | None = None,
+    outgoing_udp_port: int | None = None,
+    api_key: str | None = None,
+    fanart_api_key: str | None = None,
+    db_only: bool = False,
+    client_name: str | None = None,
+    client_version: int | None = None,
+) -> None:
     # Chosen here rather than in the signature: a call in a default argument is
     # evaluated once, when the module is imported, so every init() in a process
     # previously reused the same "random" port -- and it was baked in at import
@@ -109,6 +112,7 @@ def init(
     if logger is None:
         logger = logging.getLogger(__name__)
         logger.setLevel(loglevel.upper())
+        lh: logging.Handler
         if debug:
             logger.setLevel(logging.DEBUG)
             lh = logging.StreamHandler()
@@ -140,10 +144,13 @@ def init(
                 "An AniDB username and password are required, either as arguments or in a netrc file"
             )
         for host in ["api.anidb.net", "api.anidb.info", "anidb.net"]:
-            try:
-                username, account, password = nrc.authenticators(host)
-            except TypeError:
+            # authenticators() answers None for a host it has no entry for. That
+            # used to be read by unpacking it and catching the TypeError, which
+            # works but says the opposite of what it means.
+            auth = nrc.authenticators(host)
+            if auth is None:
                 continue
+            username, account, password = auth
             if username and password:
                 api_user = username
                 api_pass = password
@@ -152,6 +159,13 @@ def init(
                 break
 
     if not db_only:
+        if not (api_user and api_pass):
+            # A netrc file that exists but names none of AniDB's hosts left the
+            # credentials unset and opened the link anyway, which failed later at
+            # AUTH with nothing pointing back at the configuration.
+            raise adbb_errors.AniDBError(
+                "An AniDB username and password are required, either as arguments or in a netrc file"
+            )
         _anidb = anidb_client.link.AniDBLink(
             api_user,
             api_pass,
@@ -174,11 +188,9 @@ def init(
         # safe to put back.
         parsed = urllib.parse.urlparse(sql_db_url)
         if parsed.hostname and not parsed.password:
-            try:
-                netrc_user, _account, netrc_password = nrc.authenticators(parsed.hostname)
-            except TypeError:
-                netrc_user, netrc_password = (None, None)
-            if netrc_password:
+            db_auth = nrc.authenticators(parsed.hostname)
+            netrc_user, netrc_password = (db_auth[0], db_auth[2]) if db_auth else (None, None)
+            if netrc_user and netrc_password:
                 db_user = parsed.username or netrc_user
                 # Only supply the password if it belongs to the user in the URL:
                 # netrc holds one credential per host, and pairing it with a
@@ -196,10 +208,10 @@ def init(
 
         if not fanart_key:
             for host in ["fanart.tv", "assets.fanart.tv", "webservice.fanart.tv", "api.fanart.tv"]:
-                try:
-                    username, account, password = nrc.authenticators(host)
-                except TypeError:
+                fanart_auth = nrc.authenticators(host)
+                if fanart_auth is None:
                     continue
+                _username, account, password = fanart_auth
                 key = [x for x in [account, password] if x]
                 if not key:
                     continue
@@ -209,15 +221,17 @@ def init(
     _sessionmaker = anidb_client.db.init_db(sql_db_url)
 
 
-def get_session():
+def get_session() -> sqlalchemy.orm.Session:
+    if _sessionmaker is None:
+        raise anidb_client.errors.AniDBError("anidb_client.init() has not been called")
     return _sessionmaker()
 
 
-def close_session(session):
+def close_session(session: sqlalchemy.orm.Session) -> None:
     session.close()
 
 
-def download_image(filehandle, obj):
+def download_image(filehandle: IO[bytes], obj: Anime | Group) -> None:
     if type(obj) not in (Anime, Group):
         raise anidb_client.errors.AniDBMissingImage(f"Object type {type(obj)} does not support images")
     if not obj.picname:
@@ -229,7 +243,7 @@ def download_image(filehandle, obj):
         filehandle.write(f.read())
 
 
-def download_fanart(filehandle, url, preview=False):
+def download_fanart(filehandle: IO[bytes], url: str, preview: bool = False) -> None:
     if not fanart_key:
         raise anidb_client.errors.FanartError("No fanart key available")
     my_url = urllib.parse.urlparse(url)
@@ -245,7 +259,7 @@ def download_fanart(filehandle, url, preview=False):
         filehandle.write(f.read())
 
 
-def close():
+def close() -> None:
     global _anidb
     if _anidb:
         _anidb.stop()

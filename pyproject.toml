@@ -105,40 +105,13 @@ ignore = []
 [tool.mypy]
 python_version = "3.14"
 files = ["src"]
-# Lenient by default, strict per module below. The codebase arrived with no
-# annotations at all, so blanket strictness would mean ~870 errors and a blanket
-# ignore -- which checks nothing. This setting still catches the errors that do
-# not need annotations to find, and the per-module list is the ratchet: a module
-# joins it once it is annotated, and can never silently regress afterwards.
+# Strict everywhere. This was a per-module list for as long as it took to annotate
+# the package one module at a time; every module is on it now, so the list is the
+# global setting. A new module is strict from its first line rather than opted in.
+strict = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 enable_error_code = ["ignore-without-code"]
-
-# --- The ratchet. Move a module up here once it is fully annotated. ---
-# The individual flags rather than `strict = true`: mypy does not accept `strict`
-# in a per-module section and silently applies it globally instead, which turns
-# the whole codebase strict and produces ~860 errors.
-[[tool.mypy.overrides]]
-module = [
-    "anidb_client.db",
-    "anidb_client.anames",
-    "anidb_client.commands",
-    "anidb_client.errors",
-    "anidb_client.fileinfo",
-    "anidb_client.link",
-    "anidb_client.mapper",
-    "anidb_client.ratelimit",
-    "anidb_client.responses",
-]
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-disallow_untyped_calls = true
-disallow_any_generics = true
-disallow_subclassing_any = true
-disallow_untyped_decorators = true
-warn_return_any = true
-strict_equality = true
-no_implicit_reexport = true
 
 # --- Documented holes: third-party libraries without type information ---
 # pycryptodome used to be listed here; as of 3.23.0 it ships py.typed and .pyi
