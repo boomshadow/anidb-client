@@ -374,6 +374,19 @@ class TestRelationships:
 
 
 class TestUpdateHelper:
+    """`update(**fields)` is how a refresh applies a whole reply at once.
+
+    It exists for the one thing direct assignment cannot do: take a dictionary of
+    field names AniDB decided and set them all. It used to be reached for on paths
+    that had no such dictionary either -- assigning a timestamp to a column was an
+    error to a type checker under the old declarative style, so the helper was the
+    way past it. It is not needed for that any more, and those call sites now assign
+    directly, which leaves this with only its real purpose.
+
+    Four copies of it, one per row class, so each is exercised: the copies are
+    identical today and nothing would notice if one drifted.
+    """
+
     def test_update_sets_the_given_attributes(self, session):
         session.add(_anime(aid=1))
         session.commit()
@@ -384,6 +397,41 @@ class TestUpdateHelper:
 
         stored = session.query(AnimeTable).one()
         assert (stored.nr_of_episodes, stored.year) == (51, "2010")
+
+    def test_update_sets_the_given_attributes_on_an_episode(self, session):
+        session.add(
+            EpisodeTable(aid=1, eid=2, length=25, votes=0, epno="1", type="regular", updated=NOW, last_update_dice=NOW)
+        )
+        session.commit()
+        episode = session.query(EpisodeTable).one()
+
+        episode.update(length=24, title_eng="A Title")
+        session.commit()
+
+        stored = session.query(EpisodeTable).one()
+        assert (stored.length, stored.title_eng) == (24, "A Title")
+
+    def test_update_sets_the_given_attributes_on_a_file(self, session):
+        session.add(FileTable(aid=1, eid=1, is_generic=False, last_update_dice=NOW))
+        session.commit()
+        file = session.query(FileTable).one()
+
+        file.update(mylist_state="on hdd", mylist_viewed=True)
+        session.commit()
+
+        stored = session.query(FileTable).one()
+        assert (stored.mylist_state, stored.mylist_viewed) == ("on hdd", True)
+
+    def test_update_sets_the_given_attributes_on_a_group(self, session):
+        session.add(GroupTable(gid=1, name="Some Group", short="SG", last_update_dice=NOW))
+        session.commit()
+        group = session.query(GroupTable).one()
+
+        group.update(name="Renamed Group", votes=7)
+        session.commit()
+
+        stored = session.query(GroupTable).one()
+        assert (stored.name, stored.votes) == ("Renamed Group", 7)
 
 
 class TestRepr:
