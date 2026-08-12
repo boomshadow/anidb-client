@@ -185,10 +185,18 @@ class AniDBLink(threading.Thread):
                 return
             self._authenticating.set()
             self._auth_attempt = Future()
-        if self._api_key:
-            self._start_encrypted_session()
-        else:
-            self._send_auth()
+        try:
+            if self._api_key:
+                self._start_encrypted_session()
+            else:
+                self._send_auth()
+        except AniDBError as e:
+            # The handshake never left the building -- refused by the back-off, or
+            # by a socket that is gone. Nothing is going to answer it, so it settles
+            # here rather than leaving a waiter on an attempt that was never made.
+            with self._auth_lock:
+                self._authenticating.clear()
+            self._settle_auth(e)
 
     def _settle_auth(self, error: AniDBError | None) -> None:
         """Release whoever is waiting on the handshake, one way or the other.
@@ -196,15 +204,28 @@ class AniDBLink(threading.Thread):
         Every path that ends an authentication attempt comes through here, which
         is the whole point: an attempt that ends without settling its future is a
         sender parked on a reply that has already been and gone.
+
+        The settled attempt is left in place rather than cleared. A waiter that
+        arrives afterwards has to be able to read *why* it ended -- clearing it
+        left that waiter with nothing to look at, so it reported "the handshake did
+        not complete" instead of the refusal or the back-off that actually ended
+        it, and its caller was retried instead of told. `_reauthenticate` replaces
+        it when a genuinely new attempt starts.
+
+        Settled under the lock, so that two threads reaching a conclusion about the
+        same attempt -- a reply arriving as the timeout sweep claims it -- cannot
+        both get past the done() check. The second settle would raise
+        InvalidStateError on whichever lost, which for the listener means the
+        socket stops being read.
         """
         with self._auth_lock:
-            attempt, self._auth_attempt = self._auth_attempt, None
-        if attempt is None or attempt.done():
-            return
-        if error is None:
-            attempt.set_result(None)
-        else:
-            attempt.set_exception(error)
+            attempt = self._auth_attempt
+            if attempt is None or attempt.done():
+                return
+            if error is None:
+                attempt.set_result(None)
+            else:
+                attempt.set_exception(error)
 
     def _auth_handler(self, resp: Response) -> None:
         # Authentication succeeded, so whatever the back-off was for has passed.
@@ -341,11 +362,15 @@ class AniDBLink(threading.Thread):
         if not self._authed.is_set():
             return
         time_since_cmd = self._rate_limiter.seconds_since_last_send()
-        if self._do_ping and time_since_cmd > self._nat_ping_interval:
-            self.request(anidb_client.commands.PingCommand(), self._ping_callback)
-        elif time_since_cmd >= 1800:
-            anidb_client.log.debug("Session idle for 30 minutes, sending UPTIME command")
-            self.request(anidb_client.commands.UptimeCommand(), self._ping_callback)
+        # Suppressed rather than handled: a keepalive is housekeeping, and nothing
+        # is waiting on one. Sending is refused while a back-off is open, and that
+        # refusal must not escape into the loop that keeps the transport running.
+        with contextlib.suppress(AniDBError):
+            if self._do_ping and time_since_cmd > self._nat_ping_interval:
+                self.request(anidb_client.commands.PingCommand(), self._ping_callback)
+            elif time_since_cmd >= 1800:
+                anidb_client.log.debug("Session idle for 30 minutes, sending UPTIME command")
+                self.request(anidb_client.commands.UptimeCommand(), self._ping_callback)
 
     def run(self) -> None:
         while True:
@@ -356,8 +381,11 @@ class AniDBLink(threading.Thread):
 
             anidb_client.log.debug(f"sending command {command.command} with tag {command.tag}")
             if not (self._authed.is_set() or command.command in ("AUTH", "ENCRYPT", "PING")):
-                self.reauthenticate()
                 try:
+                    # Inside the try because starting a handshake means sending, and
+                    # sending is refused while a back-off is open. That refusal is
+                    # an answer about this command, not a fault in the loop.
+                    self.reauthenticate()
                     self._await_auth()
                 except AniDBAuthFailedError as e:
                     # No session is ever coming.
@@ -366,12 +394,23 @@ class AniDBLink(threading.Thread):
                     if command.command == "LOGOUT":
                         break
                     continue
+                except AniDBBannedError as e:
+                    # A back-off is open, so nothing at all is going out for a
+                    # while. Putting the command back would spin this loop at full
+                    # speed against a clock that has not moved -- and the answer is
+                    # already known. Tell whoever asked; they can come back later,
+                    # which is a decision they are better placed to make than a
+                    # queue that would hold them for half an hour to make it.
+                    anidb_client.log.warning(f"Refusing {command.command} ({command.tag}): {e}")
+                    self._fail_command(command, e)
+                    if command.command == "LOGOUT":
+                        break
+                    continue
                 except AniDBError as e:
-                    # The handshake may still work later -- the API was busy, or
-                    # did not answer. Put the command back rather than losing it;
-                    # it stays registered under the same tag, and the back-off
-                    # registered by the failure decides when the next attempt goes
-                    # out. There is nothing to log out of if we never got in.
+                    # The handshake may still work later -- the API did not answer,
+                    # or answered something unusable. Put the command back rather
+                    # than losing it; it stays registered under the same tag. There
+                    # is nothing to log out of if we never got in.
                     if command.command == "LOGOUT":
                         break
                     anidb_client.log.warning(f"Requeueing {command.command} ({command.tag}): {e}")
@@ -428,6 +467,19 @@ class AniDBLink(threading.Thread):
                 command.fail(error)
 
     def _send_command(self, command: Command) -> None:
+        # Checked before pacing, and before anything touches the socket. While the
+        # back-off is open nothing goes out at all -- not this command, not the
+        # authentication it would trigger. The transport used to *sleep* here
+        # instead, holding the command and its thread for the length of the ban;
+        # when the thread was the listener, that stopped the socket being read.
+        #
+        # Refusing rather than waiting is also the gentler of the two. The waiting
+        # version still intended to send, and did, the moment the clock allowed it.
+        # This one sends nothing and says so, and whoever asked can decide when to
+        # come back.
+        remaining = self._rate_limiter.ban_remaining()
+        if remaining > 0:
+            raise AniDBBannedError(f"AniDB asked this client to back off; {remaining / 60:.0f} minutes remaining")
         self._rate_limiter.wait()
         # `sock is None` as well as thread liveness: stop() closes the socket
         # before the listener thread has finished winding down, and a command
@@ -547,11 +599,22 @@ class AniDBLink(threading.Thread):
         # bytes literals, which formatted as b'API not responding' in the log line.
         if isinstance(reason, bytes):
             reason = reason.decode("utf-8", "replace")
-        anidb_client.log.error(f"Backing off: {reason}")
         self._rate_limiter.register_ban()
+        anidb_client.log.error(
+            f"Backing off: {reason} (nothing will be sent for {self._rate_limiter.ban_remaining() / 60:.0f} minutes)"
+        )
+        # The session is dropped but no new one is started here. This runs on the
+        # listener thread for an untagged ban notice and for a command that timed
+        # out, and starting a handshake means sending -- which, until the back-off
+        # is over, is the one thing that must not happen, and which used to happen
+        # by sleeping out the back-off on the thread that had to keep reading the
+        # socket. The next command that needs a session drives the next handshake,
+        # once the transport is allowed to send again.
         with self._auth_lock:
+            self._authed.clear()
             self._authenticating.clear()
-        self.reauthenticate()
+            self._session = None
+            self._listener.cipher = None
 
 
 class AniDBListener(threading.Thread):
@@ -735,7 +798,12 @@ class AniDBListener(threading.Thread):
                         self.stop()
                     else:
                         anidb_client.log.warning("Lost encrypted session with AniDB; attempting to reauthenticate")
-                        self._sender.reauthenticate()
+                        # Suppressed for the reason given on the tagged
+                        # session-loss path below: re-authenticating sends, sending
+                        # is refused during a back-off, and that refusal reaching
+                        # this thread would end the listener.
+                        with contextlib.suppress(AniDBError):
+                            self._sender.reauthenticate()
                 else:
                     # Also previously sys.exit(2); see above. An untagged reply we
                     # do not recognise is worth shouting about, but it is not worth
@@ -757,8 +825,16 @@ class AniDBListener(threading.Thread):
                     self.stop()
                 else:
                     anidb_client.log.warning("Lost session with AniDB; attempting to reauthenticate")
-                    self._sender.reauthenticate()
-                    self._sender.request(cmd, cmd.callback, prio=True)
+                    try:
+                        self._sender.reauthenticate()
+                        self._sender.request(cmd, cmd.callback, prio=True)
+                    except AniDBError as e:
+                        # Re-authenticating means sending, which is refused while a
+                        # back-off is open. On this thread that refusal would end
+                        # the listener, and a listener that has stopped reading the
+                        # socket is a permanent hang for every caller.
+                        anidb_client.log.error(f"Cannot recover the session right now: {e}")
+                        cmd.fail(e)
                 self._last_receive = monotonic()
                 continue
             elif resp.rescode in ("203", "500", "503"):
@@ -834,9 +910,17 @@ class AniDBListener(threading.Thread):
             # out at all -- it belongs in the same re-request branch. Comparing it
             # raised TypeError on this thread, which ends the listener, and a
             # listener that has stopped reading the socket is a permanent hang.
-            if cmd.started is None or cmd.started < self._last_receive:
-                # API isn't dead yet, probably reauthenticating
-                self._sender.request(cmd, cmd.callback, prio=True)
-            else:
-                anidb_client.log.warning(f"Command {tag} timed out")
-                cmd.handle_timeout(self._sender)
+            # Both branches can end up sending, and sending is refused while a
+            # back-off is open. That refusal is this command's answer, not a fault
+            # in the sweep -- and left to escape it would end the listener, which is
+            # the failure the whole sweep exists to avoid.
+            try:
+                if cmd.started is None or cmd.started < self._last_receive:
+                    # API isn't dead yet, probably reauthenticating
+                    self._sender.request(cmd, cmd.callback, prio=True)
+                else:
+                    anidb_client.log.warning(f"Command {tag} timed out")
+                    cmd.handle_timeout(self._sender)
+            except AniDBError as e:
+                anidb_client.log.error(f"Giving up on {cmd.command} ({tag}): {e}")
+                cmd.fail(e)

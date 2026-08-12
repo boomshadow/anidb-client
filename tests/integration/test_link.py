@@ -52,7 +52,9 @@ def make_link(monkeypatch):
             port=srv.port,
             myport=0,
             timeout=kwargs.pop("timeout", 2),
-            rate_limiter=RateLimiter(sleep=lambda _seconds: None),
+            # Overridable: a test about the back-off needs a limiter that really
+            # sleeps, or it cannot tell sleeping from not sleeping.
+            rate_limiter=kwargs.pop("rate_limiter", None) or RateLimiter(sleep=lambda _seconds: None),
             **kwargs,
         )
         links.append(link)
@@ -424,6 +426,72 @@ class TestCommandOutcome:
             future.result(timeout=5)
 
 
+class TestBackingOffWithoutSleeping:
+    """A back-off is a window during which nothing is sent, not a sleep.
+
+    It used to be a sleep taken in the send path. The listener thread reaches that
+    path -- through an untagged ban notice, and through its own timeout sweep --
+    so the thread whose only job is to read the socket could spend up to four
+    hours not reading it. Every reply arriving in that window was lost, and no
+    command could time out either, because the sweep runs on that same thread.
+
+    These use a real sleeping limiter rather than the fixture's no-op one: a test
+    that cannot tell sleeping from not sleeping cannot check this.
+    """
+
+    def test_the_listener_keeps_reading_while_the_back_off_runs(self, server, make_link):
+        server.on("AUTH", lambda req: b"555 BANNED\n")
+        link = make_link(server, rate_limiter=RateLimiter())
+        link.reauthenticate()
+
+        _await(lambda: link._rate_limiter.is_banned, message="the ban was never registered")
+
+        # The listener answering a ping is proof it is still in its receive loop.
+        threading.Event().wait(0.3)
+        assert link._listener.is_alive(), "the listener died"
+        assert link._listener.sock is not None, "the listener stopped reading the socket"
+
+    def test_nothing_is_sent_while_the_back_off_is_open(self, server, make_link):
+        """The gentleness rule, and the whole reason to fail rather than wait.
+
+        The sleeping version still intended to send, and did, the moment the clock
+        allowed it. This one sends nothing -- not the command, and not the
+        authentication the command would have triggered.
+        """
+        server.on("AUTH", lambda req: b"555 BANNED\n")
+        link = make_link(server, rate_limiter=RateLimiter())
+        link.reauthenticate()
+        _await(lambda: link._rate_limiter.is_banned, message="the ban was never registered")
+
+        sent_before = len(server.received_commands())
+        # UPTIME rather than PING: PING is one of the few commands dispatched
+        # without a session, so it would not exercise the queue the rest go through.
+        futures = [link.request(anidb_client.commands.UptimeCommand(), lambda _resp: None) for _ in range(3)]
+        threading.Event().wait(0.5)
+
+        assert len(server.received_commands()) == sent_before, "commands went out during a back-off"
+        for future in futures:
+            with pytest.raises(AniDBBannedError):
+                future.result(timeout=5)
+
+    def test_the_caller_is_told_rather_than_held(self, server, make_link):
+        """Half an hour of silence is right; half an hour of blocking is not.
+
+        The reported incident is precisely this distinction: the process was doing
+        the correct thing to AniDB and the wrong thing to its caller.
+        """
+        server.on("AUTH", lambda req: b"555 BANNED\n")
+        link = make_link(server, rate_limiter=RateLimiter())
+        link.reauthenticate()
+        _await(lambda: link._rate_limiter.is_banned, message="the ban was never registered")
+
+        started = monotonic()
+        with pytest.raises(AniDBBannedError):
+            link.request(anidb_client.commands.UptimeCommand(), lambda _resp: None).result(timeout=10)
+
+        assert monotonic() - started < 5, "the caller was held for the back-off instead of being told"
+
+
 class TestListenerRobustness:
     def test_an_unparsable_reply_does_not_kill_the_listener(self, server, make_link):
         """Regression: this path used to call sys.exit(2).
@@ -448,9 +516,12 @@ class TestListenerRobustness:
             message="the handshake never settled, so nothing could start another",
         )
 
-        # And it still works afterwards. A fresh handshake is only started when
-        # something asks for one -- there is no point authenticating into an idle
-        # session, least of all against an API that has just asked us to back off.
+        # And it still works afterwards. Two things stand between here and that:
+        # a fresh handshake is only started when something asks for one, and the
+        # unanswered one registered a back-off during which nothing is sent at all.
+        # Clearing it stands in for the window elapsing -- the point of this test
+        # is the listener, and the back-off has its own.
+        link._rate_limiter.clear_ban()
         server.on("AUTH", AUTH_OK)
         link.reauthenticate()
         _await(lambda: link._authed.is_set(), message="listener stopped serving after garbage")
@@ -703,8 +774,9 @@ class TestSharedTransportState:
         InvalidStateError out of whichever lost -- on the listener thread, where
         that ends the listener and hangs every caller.
 
-        The attempt is taken and cleared inside the lock, so the loser finds
-        nothing to settle rather than finding a settled one.
+        The check and the settle both happen inside the lock, so the loser sees an
+        attempt that is already done and leaves it alone. The settled attempt stays
+        in place: a waiter arriving afterwards has to be able to read why it ended.
         """
         link = make_link(server)
         with link._auth_lock:
@@ -732,7 +804,10 @@ class TestSharedTransportState:
 
         assert not errors, f"settling raced: {errors}"
         assert attempt.done(), "the attempt was left unsettled"
-        assert link._auth_attempt is None, "a settled attempt must not stay claimable"
+        # Readable afterwards, and settled exactly once: a second settle would have
+        # raised, and the recorded outcome is whichever call won rather than a mix.
+        assert link._auth_attempt is attempt
+        link._settle_auth(None)
 
     def test_settling_an_attempt_that_is_already_gone_is_harmless(self, server, make_link):
         """The sweep can reach a handshake that settled a moment earlier.
