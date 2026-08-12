@@ -118,7 +118,12 @@ def update_anilist():
 
         anilist[aid] = a_attrs
         mappings = anime.find("mapping-list")
-        if mappings:
+        # `is not None`, not a truth test. An Element is falsy when it has no
+        # children, so a present-but-empty <mapping-list> read as absent -- and
+        # ElementTree has deprecated the truth test outright, which this package's
+        # own pytest filterwarnings turns into a test failure the moment anything
+        # covers this branch.
+        if mappings is not None:
             anilist[aid]["map"] = {}
             for m in mappings.iter("mapping"):
                 attrs = m.attrib

@@ -14,9 +14,65 @@ The mapping documents are supplied by the fixture, exactly as update_anilist()
 would have built them from Anime-Lists.
 """
 
+import xml.etree.ElementTree as etree
+
 import pytest
 
 from tests import factories
+
+
+class TestUpdateAnilistParsing:
+    """The real `update_anilist()` parse loop, which nothing else exercises.
+
+    Every other test here takes its mapping table from the fixture, which builds
+    the dict itself (`tests/factories.py`) rather than calling the production
+    loop. So the loop had no coverage at all -- which is how a deprecated
+    ElementTree truth test lived in it unnoticed. `if mappings:` is False for an
+    element with no children, so a present-but-empty `<mapping-list/>` read as
+    absent; and ElementTree deprecated the truth test outright, which this
+    package's `filterwarnings` setting turns into an error the moment any test
+    reaches the line.
+    """
+
+    POPULATED = """<anime-list>
+      <anime anidbid="6187" tvdbid="79895">
+        <mapping-list><mapping tvdbseason="1">;1-1;2-2;</mapping></mapping-list>
+        <name>Toradora!</name>
+      </anime>
+    </anime-list>"""
+
+    EMPTY_MAPPING_LIST = """<anime-list>
+      <anime anidbid="1" tvdbid="1">
+        <mapping-list/>
+        <name>Seikai no Monshou</name>
+      </anime>
+    </anime-list>"""
+
+    @staticmethod
+    def _parse(monkeypatch, xml_text):
+        import anidb_client.anames as anames
+
+        # Registered with monkeypatch so the module global is restored afterwards:
+        # update_anilist() rebinds it directly, which nothing else would undo.
+        monkeypatch.setattr(anames, "anilist", None)
+        monkeypatch.setattr(anames, "update_xml", lambda _url: "/ignored")
+        monkeypatch.setattr(anames, "_read_anidb_xml", lambda _path: etree.fromstring(xml_text))
+
+        anames.update_anilist()
+        return anames.anilist
+
+    def test_a_populated_mapping_list_is_parsed(self, monkeypatch):
+        anilist = self._parse(monkeypatch, self.POPULATED)
+
+        assert anilist["6187"]["name"] == "Toradora!"
+        assert anilist["6187"]["map"]["tvdb"][0]["epmap"] == {"1": "1", "2": "2"}
+
+    def test_a_present_but_empty_mapping_list_is_still_a_mapping_list(self, monkeypatch):
+        """The case the truth test got wrong: an Element with no children is
+        falsy, so this anime came out with no `map` key at all."""
+        anilist = self._parse(monkeypatch, self.EMPTY_MAPPING_LIST)
+
+        assert anilist["1"]["map"] == {}
 
 
 @pytest.fixture

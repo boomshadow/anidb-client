@@ -1,12 +1,16 @@
-"""Equality and per-instance state on File objects.
+"""Equality, containment and per-instance state on File objects.
 
-Two small things that were wrong in ways that had not yet cost anything, and
-were cheap to make right while the file was open:
+This is the file SPEC-001 names as covering equality and containment.
+
+The equality and `_multiep` cases were small things wrong in ways that had not
+yet cost anything, and were cheap to make right while the file was open:
 
 - `__eq__` fell off the end and returned None for two files that were simply
   different, rather than False;
 - `_multiep` defaulted to a list declared on the class, which every File in the
   process therefore shared.
+
+Containment is the one that had started costing something -- see TestContainment.
 """
 
 import pytest
@@ -51,6 +55,39 @@ class TestEquality:
 
         assert first.__eq__("not a file") is NotImplemented
         assert first != "not a file"
+
+
+class TestContainment:
+    """`in` coerces whatever `__contains__` returns straight to a bool.
+
+    There is no reflected form to fall back to, the way there is for `__eq__`, so
+    `NotImplemented` is not a legal answer here. Returning it read as True on
+    3.13 -- `NotImplemented` is truthy -- and raises `TypeError` on 3.14, which
+    made `anything in anime` an error. Both are wrong: the answer is False.
+    """
+
+    def test_a_files_own_episode_is_in_it(self, two_files):
+        first, _second = two_files
+
+        assert first.episode in first
+
+    def test_another_files_episode_is_not_in_it(self, two_files):
+        first, second = two_files
+
+        assert second.episode not in first
+
+    def test_an_unrelated_type_is_not_in_a_file(self, two_files):
+        first, _second = two_files
+
+        assert ("not an episode" in first) is False
+
+    def test_an_episode_of_the_anime_is_in_it(self, two_files, anidb):
+        first, _second = two_files
+
+        assert first.episode in anidb.Anime(6187)
+
+    def test_an_unrelated_type_is_not_in_an_anime(self, anidb):
+        assert (12345 in anidb.Anime(6187)) is False
 
 
 class TestMultiepDefault:

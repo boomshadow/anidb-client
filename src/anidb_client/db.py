@@ -146,12 +146,16 @@ class AnimeRelationTable(Base):
         nullable=False,
     )
 
-    def __cmp__(self, other):
-        return (
-            self.anime_pk == other.anime_pk
-            and self.related_aid == other.related_aid
-            and self.relation_type == other.relation_type
-        )
+    # Deliberately no __eq__: these rows compare by identity, which is what the
+    # refresh loop in animeobjs.py wants. That loop appends the very row objects
+    # it matched into its replacement list, so `row not in new_relations` is
+    # asking "is this one I kept", and the default identity comparison answers it
+    # correctly. Defining __eq__ would also drop the class's __hash__, and
+    # SQLAlchemy keeps mapped instances in sets.
+    #
+    # A Python 2 `__cmp__` used to sit here comparing the three columns by value.
+    # Python 3 never calls __cmp__, so it did nothing at all -- but it read as
+    # though equality were value-based, which is the opposite of the truth.
 
     def __repr__(self):
         return (
@@ -318,12 +322,8 @@ class GroupRelationTable(Base):
         nullable=False,
     )
 
-    def __cmp__(self, other):
-        return (
-            self.group_pk == other.group_pk
-            and self.related_gid == other.related_gid
-            and self.relation_type == other.relation_type
-        )
+    # Identity equality, and no __eq__ -- see AnimeRelationTable above. The same
+    # dead Python 2 __cmp__ used to sit here too.
 
     def __repr__(self):
         return (
