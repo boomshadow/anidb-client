@@ -1,8 +1,8 @@
 ---
 title: "CI Pipeline and Security Scanning"
-description: "The GitLab CI pipeline for anidb-client across six stages: validate (lockfile freshness plus spec/ADR INDEX freshness), test (ruff, mypy, codespell, pytest against a real PostgreSQL service), build (the wheel and sdist that publish later uploads), security (shared ci-templates Semgrep SAST, Grype dependency scanning and the .grype.yaml exception audit, with a daily rescan schedule), drift-detection (the merge-request-only anchor-watch gate), and publish (tag-only PyPI upload over OIDC trusted publishing, gated behind every earlier stage, with the tag rules themselves owned by SPEC-009). Explains why container scanning is deliberately absent."
+description: "The GitLab CI pipeline for anidb-client across six stages: validate (lockfile freshness, spec/ADR INDEX freshness, and conventional-commit grammar on both merge-request titles and the subjects reaching the default branch), test (ruff, mypy, codespell, pytest against a real PostgreSQL service), build (the wheel and sdist that publish later uploads), security (shared ci-templates Semgrep SAST, Grype dependency scanning and the .grype.yaml exception audit, with a daily rescan schedule), drift-detection (the merge-request-only anchor-watch gate), and publish (tag-only PyPI upload over OIDC trusted publishing, gated behind every earlier stage, with the tag rules themselves owned by SPEC-009). Explains why container scanning is deliberately absent."
 status: accepted
-tags: [ci, gitlab-ci, pipeline, stages, validate, lockfile, index-freshness, lint, ruff, mypy, codespell, pytest, postgres-service, build, wheel, sdist, security-scanning, semgrep, sast, grype, dependency-scanning, exception-audit, ci-templates, soak, schedule, rescan, drift-detection, anchor-watch, anchored-development, publish, pypi, trusted-publishing, oidc, tags, renovate]
+tags: [ci, gitlab-ci, pipeline, stages, validate, lockfile, index-freshness, conventional-commits, commit-lint, mr-title, lint, ruff, mypy, codespell, pytest, postgres-service, build, wheel, sdist, security-scanning, semgrep, sast, grype, dependency-scanning, exception-audit, ci-templates, soak, schedule, rescan, drift-detection, anchor-watch, anchored-development, publish, pypi, trusted-publishing, oidc, tags, renovate]
 ---
 
 # CI Pipeline and Security Scanning
@@ -13,7 +13,7 @@ The pipeline exists to make a release trustworthy: everything that reaches PyPI 
 
 Six stages run in order: **validate**, **test**, **build**, **security**, **drift-detection**, **publish**.
 
-A single toolchain image — the same digest-pinned uv image the `Dockerfile` uses — is shared by the jobs that need Python, so a local run and a CI run use an identical toolchain.
+One toolchain image — the same digest-pinned uv image the `Dockerfile` uses — is shared by the jobs that need Python, so a local run and a CI run use an identical toolchain. Exactly one job departs from it, and only as far as the full-base variant of that same image at the same version, because it needs a `git` binary the slim variant does not carry. Both are pinned by digest and updated together, so the two cannot drift to different toolchains.
 
 ### When pipelines run
 
@@ -26,6 +26,10 @@ Most jobs run on branches, merge requests and tags alike, but never on the secur
 **Lockfile freshness.** `uv.lock` must match `pyproject.toml` exactly. Without this check a dependency added to `pyproject` but never locked would install fine locally, where uv resolves on the fly, and then differ from what every other job and every user gets.
 
 **Index freshness.** The spec and ADR indexes are generated artifacts (SPEC-000), so CI rebuilds each one from the frontmatter and fails if it differs from what was committed — which means the author changed a spec or ADR without re-running the generator. The check writes nothing and is performed by the generator itself rather than by diffing the working tree, so it needs no tooling beyond the Python environment the job already has. These jobs are the reason the indexes can be trusted as routing tables.
+
+**Conventional-commit grammar**, in two jobs, because squash-on-merge means the text that becomes history is not the text on the branch. A merge request's **title** is checked on every merge-request pipeline, since that is what GitLab turns into the squashed subject; the branch's own commits are discarded by the squash, so rejecting them would fail a merge request over text that never reaches history. The **subjects landing on the default branch** are checked again on push, which covers the two routes that bypass the first check — a direct push made without opening a merge request, and a squash message hand-edited in the merge dialog. Subjects a merge generates are skipped rather than refused.
+
+Why the validate stage cares at all: these subjects are the release notes (SPEC-009), so a malformed or mistyped one is a defect in a user-facing artifact rather than a style violation. Neither job installs dependencies — both scripts are standard library only — so a gate on what reaches the release notes cannot be taken down by a dependency resolution. The commit-subject job is the one place in the pipeline needing `git`, and runs on the full-base variant of the same pinned toolchain image rather than the slim one every other job uses.
 
 ## Test
 
@@ -71,7 +75,7 @@ That placement is the point. Everything a release has to survive happens before 
 
 ## Related Artifacts
 
-- **Line of truth (self-enforcing):** `.gitlab-ci.yml` (stages, jobs, rules and images); `.grype.yaml` (scan exceptions and their expiry); `renovate.json` (the dependency-update policy the soak window backs); `pyproject.toml` and `uv.lock` (what the validate and test stages check).
+- **Line of truth (self-enforcing):** `.gitlab-ci.yml` (stages, jobs, rules and images); `.grype.yaml` (scan exceptions and their expiry); `renovate.json` (the dependency-update policy the soak window backs); `pyproject.toml` and `uv.lock` (what the validate and test stages check); `scripts/conventional_commit.py` (the subject grammar and accepted type vocabulary the validate stage enforces).
 - **Decisions (why):** ADR-001 records why the README remains a full user-facing document, which is what the drift gate is told not to flag as duplication.
 - **Related specs:** SPEC-000 (the framework anchor-watch enforces, and the index-generation requirement the validate stage checks); SPEC-007 (the same lint, type, spell and test checks as they run locally, and the supply-chain posture the scanning backs); SPEC-003 (why a real PostgreSQL service is required rather than SQLite); SPEC-009 (what the publish stage actually verifies before it uploads, and the tag rules it enforces).
-- **Tests:** the pipeline is verified by running. The one project-side invariant it depends on — that the suite never reaches the network — is covered by `tests/test_network_guard.py`.
+- **Tests:** the pipeline is verified by running. The invariants it depends on that a run cannot demonstrate are covered directly: that the suite never reaches the network, in `tests/test_network_guard.py`; and the conventional-commit grammar the validate stage enforces, together with its agreement with the release-note routing table, in `tests/unit/test_conventional_commit.py`.

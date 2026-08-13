@@ -120,6 +120,13 @@ tasks:
     cmds:
       - "{{.RUN}} uv build"
 
+  check:title:
+    desc: 'Check a subject or MR title is a conventional commit (e.g. -- "feat: add a thing")'
+    # The same gate CI applies to a merge-request title. Worth running before opening
+    # one: squash-on-merge turns that title into a line of the release notes.
+    cmds:
+      - "{{.RUN}} python3 scripts/conventional_commit.py --title {{.CLI_ARGS}}"
+
   publish:notes:
     desc: Render the release notes for a version to stdout (e.g. -- v0.0.1-rc.1)
     # The mechanical half of a release note: every commit since the last release,
