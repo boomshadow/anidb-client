@@ -32,6 +32,13 @@ stages:
 .uv-image: &uv_image >-
   ghcr.io/astral-sh/uv:0.11.25-python3.14-trixie-slim@sha256:2b2e474b3a72e84c92b18a2f011a14adcb045fb361f7d8667ed1f8f55eefdafd
 
+# The same uv, Python and Debian release as above, on the full base rather than the slim
+# one -- so it carries `git`, which the slim variant does not. Exactly one job needs it:
+# reading the subjects of the commits a push added. Renovate's "uv toolchain image" group
+# matches this repository too, so both digests move together and cannot drift apart.
+.uv-image-git: &uv_image_git >-
+  ghcr.io/astral-sh/uv:0.11.25-python3.14-trixie@sha256:c9b4e559268d8a359ccb88187d24378085c8897daf960357b47c860eb49e867c
+
 # Run a merge-request pipeline for MRs; otherwise a branch pipeline -- but never both for
 # the same branch at once (avoids duplicate pipelines when a branch has an open MR).
 workflow:
@@ -135,6 +142,53 @@ validate:adr-index:
   stage: validate
   script:
     - uv run --frozen python .claude/skills/adr/scripts/generate_index.py --check
+
+# Conventional-commit enforcement, split across two jobs because squash-on-merge means
+# the text that becomes history is not the text on the branch.
+#
+# Neither job extends .uv-job: both scripts are standard library only, so there is
+# nothing to install. That keeps them fast, and keeps a gate on what reaches the release
+# notes from depending on a dependency resolution that could itself fail.
+#
+# A merge-request title is what GitLab turns into the squashed commit's subject, so that
+# is what gets checked on a merge request. The branch's own commits are discarded by the
+# squash; rejecting them would fail an MR over text that never reaches history.
+validate:mr-title:
+  stage: validate
+  image: *uv_image
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - python3 scripts/conventional_commit.py --title "$CI_MERGE_REQUEST_TITLE"
+
+# The backstop, on the default branch only. It catches the two routes by which a subject
+# reaches `main` without any merge-request title having been checked: a direct push made
+# without opening one at all, and a squash message hand-edited in the merge dialog.
+#
+# Default branch only, deliberately. On a feature branch the commits are about to be
+# squashed away, so failing a push over a work-in-progress subject would be noise.
+# `GIT_DEPTH: 0` because the range reaches back to the previous tip, which a shallow
+# clone is not guaranteed to contain.
+validate:commit-messages:
+  stage: validate
+  image: *uv_image_git
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  variables:
+    GIT_DEPTH: 0
+  script:
+    # An all-zero "before" is a branch that did not previously exist, where there is no
+    # range to read -- check the tip alone rather than the whole history.
+    - |
+      if [ "$CI_COMMIT_BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+        git log --format=%s -1 "$CI_COMMIT_SHA" > subjects.txt
+      else
+        git log --format=%s "$CI_COMMIT_BEFORE_SHA..$CI_COMMIT_SHA" > subjects.txt
+      fi
+    - cat subjects.txt
+    - python3 scripts/conventional_commit.py --stdin < subjects.txt
 
 ############################
 # Test
@@ -250,6 +304,8 @@ anchor-watch:
     - job: validate:spec-index
       artifacts: false
     - job: validate:adr-index
+      artifacts: false
+    - job: validate:mr-title
       artifacts: false
     - job: lint
       artifacts: false
