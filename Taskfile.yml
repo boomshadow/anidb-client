@@ -68,7 +68,7 @@ tasks:
     desc: Run everything CI runs (lockfile, indexes, lint, format, spell, typecheck, test)
     # Mirrors the pipeline's stage order: the validate stage first, then test. Keep this in
     # step with CI -- a `check` that passes while the pipeline fails is worse than no task
-    # at all, and both SPEC-007 and CLAUDE.md tell readers these two run the same checks.
+    # at all, and both SPEC-007 and AGENTS.md tell readers these two run the same checks.
     cmds:
       - task: lock:check
       - task: index:check
@@ -119,6 +119,17 @@ tasks:
     desc: Build the wheel and sdist into ./dist
     cmds:
       - "{{.RUN}} uv build"
+
+  publish:notes:
+    desc: Render the release notes for a version to stdout (e.g. -- v0.0.1-rc.1)
+    # The mechanical half of a release note: every commit since the last release,
+    # grouped, with merge noise dropped. The paragraph that goes above it is written by
+    # a human. `cliff.toml` is the line of truth for the shape. See SPEC-009.
+    #
+    # Not through {{.RUN}}: this is its own container, and it deliberately gets the
+    # working tree read-only.
+    cmds:
+      - docker compose run --rm --no-TTY cliff --unreleased --tag {{.CLI_ARGS}}
 
   publish:check-tag:
     desc: Check a release tag is legal and print the version it would publish (e.g. -- v0.0.1-rc.1)
