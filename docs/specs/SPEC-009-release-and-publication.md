@@ -1,8 +1,8 @@
 ---
 title: "Release and Publication"
-description: "How a version of this library reaches its users: choosing the number by SemVer against the public surface, and the freedom to change one nobody can install yet; the version declared in the package as SemVer and normalised to PEP 440 in the built artifact; the release tag grammar, which admits only alpha/beta/rc pre-releases and refuses build metadata; the permanence of tags and published versions and the fix-forward rule that follows from it; the gate that rejects a malformed tag loudly rather than publishing nothing silently; release notes carried on the release pages rather than in a changelog file, half generated from the commits and half written; the conventional-commit grammar checked on both sides of the squash — merge-request titles and the subjects reaching the default branch — with the accepted type vocabulary held against the routing table in both directions so a type nothing routes cannot fall silently into the catch-all; and upload to PyPI over OIDC trusted publishing with no stored credential."
+description: "How a version of this library reaches its users: choosing the number by SemVer against the public surface, and the freedom to change one nobody can install yet; the version declared in the package as SemVer and normalised to PEP 440 in the built artifact; the release tag grammar, which admits only alpha/beta/rc pre-releases and refuses build metadata; the permanence of tags and published versions and the fix-forward rule that follows from it; the gate that rejects a malformed tag loudly rather than publishing nothing silently; release notes carried on the release pages rather than in a changelog file, half generated from the commits and half written; the conventional-commit grammar checked on both sides of the squash — merge-request titles and the subjects reaching the default branch — with the accepted type vocabulary held against the routing table in both directions so a type nothing routes cannot fall silently into the catch-all; upload to PyPI over OIDC trusted publishing with no stored credential; and how a release is cut — the preflight conditions that stop it, the approval that is its last reversible moment, the single version-bump commit pushed outside a merge request, and publishing always preceding announcing."
 status: accepted
-tags: [release, publication, versioning, semver, pep440, tags, protected-tags, pre-release, release-candidate, immutability, fix-forward, gate, pypi, trusted-publishing, oidc, publish, release-notes, changelog, keep-a-changelog, git-cliff, conventional-commits, mirror]
+tags: [release, publication, versioning, semver, pep440, tags, protected-tags, pre-release, release-candidate, immutability, fix-forward, gate, pypi, trusted-publishing, oidc, publish, release-notes, changelog, keep-a-changelog, git-cliff, conventional-commits, mirror, orchestration, skill, preflight, glab, gh]
 ---
 
 # Release and Publication
@@ -84,6 +84,24 @@ The accepted vocabulary and the routing table are held against each other, in bo
 
 What none of this can check is whether a well-formed title is *true*. A title that describes only what the change started as, or carries a type that misdescribes it, passes every gate and still misfiles the entry. That part is discipline, and the release note is where getting it wrong shows up.
 
+## Cutting a release
+
+A release is cut from a maintainer's machine, in one step, with the pipeline doing only the part that must not be skippable. ADR-004 records why the orchestration is not itself in CI.
+
+**Nothing happens until four things hold**: the working tree is clean and on the default branch with nothing left to pull, that branch's newest pipeline is green, both the GitLab and GitHub command-line tools are authenticated, and the version is not one that already exists. A failure stops the release rather than being repaired — each of these is cheap to fix by hand and expensive to get wrong, since the step they precede cannot be undone.
+
+**The version is derived and then confirmed.** Conventional-commit arithmetic over the commits since the last release proposes a number; an explicit instruction overrides it, and the override is stated rather than applied silently. Before the first release there is no base to derive from, so that number is chosen. Whatever results is put through the same tag check CI will apply, before a tag exists.
+
+**Approval is the last reversible moment.** The version, the generated list and the written paragraph are shown together and the release stops there until approved. Everything before that point can be discarded; nothing after it can.
+
+**Then, in order:** the declared version is bumped and committed, the commit is pushed, and the tag is created on it and pushed. The tag must land on the commit carrying the matching version or the gate rejects it — which is the gate working.
+
+That version-bump commit is the only thing pushed to the default branch outside a merge request. Its subject is a conventional commit like any other, so the same check applies to it.
+
+**Publishing precedes announcing.** The tag's pipeline is watched to a terminal state, and the release pages are created only once it is green — because PyPI is the step that cannot be taken back, and a release page describing a package that was never published is worse than a late one. Both pages get the same body, and the built artifacts are attached from the pipeline rather than rebuilt, so what is offered for download is what was published.
+
+**A red pipeline ends the release.** The tag stays where it is and the repair is the next version. Nothing about a failed release is undone, because none of it can be.
+
 ## Pre-releases
 
 A pre-release publishes to PyPI exactly as a full release does. The difference is on the consumer's side: an ordinary install resolves to the newest full release and ignores pre-releases entirely, so publishing one cannot disturb anyone who has not asked for it. Someone testing an unreleased change opts in explicitly.
@@ -92,7 +110,7 @@ That makes a pre-release the correct way to exercise a change against a real con
 
 ## Related Artifacts
 
-- **Line of truth (self-enforcing):** `.gitlab-ci.yml` (when the publish job runs and what it must pass first); `scripts/release_tag.py` (the tag grammar and the version it implies); `scripts/conventional_commit.py` (the accepted commit-type vocabulary and the subject grammar); `pyproject.toml` (the build backend and where it reads the version from); `cliff.toml` (how commits become the generated half of a release note, and where a release begins); `docker-compose.yml` (the pinned generator).
-- **Decisions (why):** ADR-002 records why the repository declares versions in SemVer and lets the build backend normalise, rather than tagging in PEP 440 or deriving the version from the tag. ADR-003 records why there is no changelog file and why a release note is half generated and half written.
+- **Line of truth (self-enforcing):** `.gitlab-ci.yml` (when the publish job runs and what it must pass first); `scripts/release_tag.py` (the tag grammar and the version it implies); `scripts/conventional_commit.py` (the accepted commit-type vocabulary and the subject grammar); `pyproject.toml` (the build backend and where it reads the version from); `cliff.toml` (how commits become the generated half of a release note, and where a release begins); `docker-compose.yml` (the pinned generator); `.claude/skills/publish/SKILL.md` (the release procedure, read and executed by the agent that runs it).
+- **Decisions (why):** ADR-002 records why the repository declares versions in SemVer and lets the build backend normalise, rather than tagging in PEP 440 or deriving the version from the tag. ADR-003 records why there is no changelog file and why a release note is half generated and half written. ADR-004 records why the release is orchestrated locally while CI keeps only the publish gate, and why a stored GitHub credential was rejected.
 - **Related specs:** SPEC-008 (the pipeline this publish stage belongs to, and the checks a release must clear first); SPEC-006 (the registered AniDB client identity, and why it moves independently of this version); SPEC-007 (the toolchain the gate runs under).
 - **Tests:** the tag grammar and the artifact check are covered by `tests/unit/test_release_tag.py`. That the declared version is itself a legal tag, and that the build backend normalises it the way the gate predicts, are covered in `tests/unit/test_package.py`. The subject grammar, and the cross-check holding the accepted vocabulary against the routing table in both directions, are covered by `tests/unit/test_conventional_commit.py` — that check is the "fails as a test" this spec relies on.

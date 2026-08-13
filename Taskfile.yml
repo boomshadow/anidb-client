@@ -127,6 +127,15 @@ tasks:
     cmds:
       - "{{.RUN}} python3 scripts/conventional_commit.py --title {{.CLI_ARGS}}"
 
+  publish:next-version:
+    desc: Print the version the commits since the last release imply (SemVer, v-prefixed)
+    # Conventional-commit arithmetic: a fix bumps the patch, a feature the minor, a
+    # breaking change the major. It reads the newest release tag as its base, so it has
+    # nothing to work from until one exists -- the first release's number is chosen, not
+    # derived. It also does not propose pre-releases; those are formed from this answer.
+    cmds:
+      - docker compose run --rm --no-TTY cliff --bumped-version
+
   publish:notes:
     desc: Render the release notes for a version to stdout (e.g. -- v0.0.1-rc.1)
     # The mechanical half of a release note: every commit since the last release,
