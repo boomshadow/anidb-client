@@ -62,8 +62,13 @@ If it refuses, the message names the spelling that would have worked. Use that.
 task publish:notes -- <tag>
 ```
 
-That is the generated half: every commit since the last release, grouped. **Write the
-paragraph that goes above it** — two to four sentences saying what this release is
+That is the generated half: every commit since the last **final** release, grouped. A
+pre-release is not a boundary, so a candidate's list is cumulative — `rc.3` repeats
+everything `rc.1` and `rc.2` listed and adds to it. Expect that; it is not a bug, and the
+paragraph is the right place to tell a tester what is new *since the previous candidate*
+if that is worth saying.
+
+**Write the paragraph that goes above it** — two to four sentences saying what this release is
 *about*, in the user's register, not a restatement of the list. If the release is
 thematically incoherent, say so plainly rather than inventing a theme.
 

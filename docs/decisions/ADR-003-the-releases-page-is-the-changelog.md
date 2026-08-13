@@ -1,8 +1,8 @@
 ---
 title: "The Releases Page Is the Changelog"
-description: "This project keeps no CHANGELOG.md. The release pages on GitHub and GitLab are the changelog, carrying a generated section listing every non-merge commit grouped into Keep a Changelog's headings, under a short written paragraph saying what the release is about. A hand-curated CHANGELOG.md was rejected because the practice's value is readability rather than the file, and the file demands discipline at every merge; a CHANGELOG.md generated and committed by CI at tag time was rejected because it needs a credential that can push to a protected branch and leaves the changelog inside every published artifact one release stale; pure generation with no written summary was rejected because a list of commit subjects does not say what a release was for."
+description: "This project keeps no CHANGELOG.md. The release pages on GitHub and GitLab are the changelog, carrying a generated section listing every non-merge commit grouped into Keep a Changelog's headings, under a short written paragraph saying what the release is about, and spanning back to the last version a user could install rather than the last tag -- so pre-release notes are cumulative and a final release announces the whole body of work. Treating every tag as a boundary was rejected because a version cut after three candidates would announce only the remainder, hiding the work at the moment it becomes installable. A hand-curated CHANGELOG.md was rejected because the practice's value is readability rather than the file, and the file demands discipline at every merge; a CHANGELOG.md generated and committed by CI at tag time was rejected because it needs a credential that can push to a protected branch and leaves the changelog inside every published artifact one release stale; pure generation with no written summary was rejected because a list of commit subjects does not say what a release was for."
 status: accepted
-tags: [changelog, release-notes, keep-a-changelog, git-cliff, conventional-commits, releases, github, gitlab, mirror, documentation, generation, curation]
+tags: [changelog, release-notes, keep-a-changelog, git-cliff, conventional-commits, releases, github, gitlab, mirror, documentation, generation, curation, pre-release, release-candidate, tag-pattern, scoping, cumulative]
 ---
 
 # The Releases Page Is the Changelog
@@ -21,13 +21,17 @@ Two properties of this project bear on the choice. Its commit subjects are full 
 
 That body has two halves. The lower half is **generated** from the commits in the release: every non-merge commit, grouped into Keep a Changelog's headings, each linking to the public mirror. Nothing is filtered out — an internal or infrastructural change is still something a reader may be trying to locate months later, and grouping is what keeps the list readable rather than omission. The upper half is a short **written** paragraph saying what the release is about, which is the part a generator cannot produce.
 
+**A release note spans back to the last version a user could install** — the last final release, never the last tag. Pre-releases are not boundaries, so cutting a final after a run of candidates announces the whole body of work rather than the remainder after the last candidate.
+
 `cliff.toml` is the line of truth for the generated half. SPEC-009 describes the behavior.
 
-Three alternatives were considered and rejected.
+Four alternatives were considered and rejected.
 
 **A hand-curated `CHANGELOG.md`, per Keep a Changelog's prescription.** Rejected on both halves of the trade. The benefit is readability, and the written paragraph delivers that without the file. The cost is real and recurring: an `[Unreleased]` section must be maintained at every merge request, which is a discipline that decays exactly when the project is quiet, and it conflicts whenever two branches are open at once. It also fails the consumption test — the reader this project actually has goes to a releases page, not to a file in a source tree.
 
 **A `CHANGELOG.md` generated and committed by CI when a tag is pushed.** Rejected for two independent reasons. It requires a credential in CI that can push to a protected branch, which is a long-lived secret introduced to solve a problem that has a cheaper answer. And the commit necessarily lands *after* the tag, so the `CHANGELOG.md` inside every published artifact is permanently one release out of date — a document that is wrong in the same way every single time.
+
+**Treat every tag as a release boundary, so pre-release notes are incremental.** The common default, and the one most tooling ships with. Rejected because of what it does to the release that matters. A version cut after three candidates would announce only the commits since the third — a forty-commit release reported as three, with the body of work invisible at the exact moment it becomes installable. The gain it offers is real but small: a tester already running `rc.2` sees a tight list of what to re-test. The loss is the final release note, which is the one most people ever read. Cumulative notes cost that tester some repetition; the alternative costs everyone else the release. Where a tester needs the delta, the written paragraph can give it — a generated list cannot recover a boundary it was never given.
 
 **Pure generation, with no written summary.** Rejected because it concedes Keep a Changelog's actual point. A list of commit subjects records what changed without saying what the release was *for*, and the reader has to reconstruct the theme from the parts. The generated list is a good index and a poor summary; the paragraph above it is the summary.
 

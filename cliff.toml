@@ -85,12 +85,21 @@ commit_parsers = [
 
 # Which tags count as a release boundary, and therefore where "unreleased" starts.
 #
-# `^v` and not `^v\d+\.\d+\.\d+`, deliberately. `v0-upstream` marks the state this
-# project inherited before its own work began; treating it as a boundary is what makes
-# the first release's notes cover this project's changes rather than the entire history
-# of the code it was forked from. It is not a release and will never be published, but
-# it is exactly the right floor. The pattern still excludes a stray non-`v` tag.
-tag_pattern = "^v"
+# Final releases only. A pre-release is deliberately NOT a boundary: if it were, the note
+# for v1.0.0 would cover only the commits since v1.0.0-rc.3 and announce a forty-commit
+# release as three -- the entire body of work made invisible at the moment it ships. A
+# release note spans back to the last version a user could actually install.
+#
+# The consequence is that pre-release notes are cumulative: rc.3 repeats rc.1 and rc.2
+# and adds to them. That is the intended reading. Someone installing a candidate is
+# testing everything in it, not the delta from a build they may never have run.
+#
+# `v0-upstream` is named explicitly because it is the floor before any release exists. It
+# marks the state this project inherited, and without it the first release's notes would
+# reach back through the whole history of the code this was forked from.
+#
+# Single-quoted: a TOML literal string, so the regex is not also escaped for the parser.
+tag_pattern = '^v([0-9]+\.[0-9]+\.[0-9]+|0-upstream)$'
 
 topo_order = false
 sort_commits = "oldest"
