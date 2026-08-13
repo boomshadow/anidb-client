@@ -54,9 +54,14 @@ __all__ = [
     "update_animetitles",
 ]
 
-# This distribution's own version. Read by the build backend, so it is the single
-# source of truth for the released package version.
-__version__ = "1.0.0"
+# This distribution's own version, written in SemVer -- the same notation the release
+# tag uses, so the tag for any release is exactly `v` + this string and the two can be
+# compared without translating either. The build backend normalises it to PEP 440 for
+# the artifact, which is why a pre-release reads `0.0.1-rc.1` here and `0.0.1rc1` in
+# the wheel filename. See ADR-002 and SPEC-009.
+#
+# Bumped as part of cutting a release, never by hand in the course of other work.
+__version__ = "0.0.1"
 
 # Identity sent to AniDB in the AUTH command. The (name, version) pair must be
 # registered with AniDB before it will authenticate, and `anidb_client_version` is

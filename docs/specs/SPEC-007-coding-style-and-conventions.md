@@ -1,8 +1,8 @@
 ---
 title: "Coding Style and Conventions"
-description: "House coding conventions for anidb-client: Docker-native development with no host Python toolchain, the Taskfile as the developer-command entry point, a current-rather-than-conservative interpreter floor restated to ruff, to mypy and in the pinned image tag rather than derived, ruff for formatting and linting, mypy under global strict with its two documented exemptions, the data layer written in SQLAlchemy 2.0 idiom rather than 1.x, codespell, the pin-and-verify supply-chain posture (exact pins, hashed uv.lock, a 45-day soak declared to the resolver, a digest-pinned base image), the no-network testing discipline enforced by the suite itself rather than by the runner, and the ratcheting coverage floor."
+description: "House coding conventions for anidb-client: Docker-native development with no host Python toolchain, the Taskfile as the developer-command entry point, a current-rather-than-conservative interpreter floor restated to ruff, to mypy and in the pinned image tag rather than derived, ruff for formatting and linting, mypy under global strict with its two documented exemptions and repository tooling inside its scope rather than beside it, the data layer written in SQLAlchemy 2.0 idiom rather than 1.x, codespell, the pin-and-verify supply-chain posture (exact pins, hashed uv.lock, a 45-day soak declared to the resolver, a digest-pinned base image), the no-network testing discipline enforced by the suite itself rather than by the runner, and the ratcheting coverage floor."
 status: accepted
-tags: [coding-style, conventions, python, interpreter-floor, requires-python, target-version, ruff, mypy, strict, type-annotations, sqlalchemy, mapped-column, select, codespell, docker-native, taskfile, uv, uv-lock, supply-chain, pin-and-verify, soak, digest-pin, editorconfig, testing, network-guard, fake-server, coverage, coverage-floor, postgres-marker]
+tags: [coding-style, conventions, python, interpreter-floor, requires-python, target-version, ruff, mypy, strict, type-annotations, scripts, tooling, sqlalchemy, mapped-column, select, codespell, docker-native, taskfile, uv, uv-lock, supply-chain, pin-and-verify, soak, digest-pin, editorconfig, testing, network-guard, fake-server, coverage, coverage-floor, postgres-marker]
 ---
 
 # Coding Style and Conventions
@@ -30,6 +30,8 @@ And, least visibly, in the **tag of the pinned toolchain image**, which the `Doc
 **ruff** is both formatter and linter, configured in `pyproject.toml`. Its rule selection subsumes what would otherwise be several tools; the `pyproject` is authoritative for which rules are enabled.
 
 **mypy is strict, everywhere.** Every module in the package is annotated and checked under `strict`, and a new one is strict from its first line rather than opted in afterwards. There is no per-module exemption list and adding one would be a regression, not a convenience: the point of a single global setting is that no module can be quietly left out of it.
+
+Repository tooling is inside that scope, not beside it. Scripts that are not shipped in the wheel are still checked and still tested, because a script that decides whether a version reaches PyPI is not glue — it is code with consequences, held to the standard of the code it gates.
 
 This was reached rather than declared. The package arrived with no annotations at all, where blanket strictness would have produced hundreds of errors and, inevitably, a blanket ignore that checks nothing — so strictness was applied module by module through a per-module list that could only grow. That list is now the global setting, and the history is recorded here only to explain why a reader will not find one.
 
@@ -63,6 +65,8 @@ Timing is injected, not slept through. The rate limiter takes its clock and its 
 **Tests that need a real PostgreSQL are marked, not silently skipped.** SQLite exercises neither the native enum types nor the wide-integer variant the schema declares, so a SQLite-only run covers neither branch. Those tests carry a marker and skip when no server URL is configured — which makes them cheap locally and easy to forget, so CI runs them a second time as an explicit gate that fails if they did not actually execute.
 
 **Coverage has a ratcheting floor.** The configured minimum is a floor to defend, not a target to sit at: it is raised as coverage grows, and set a little under the measured figure so an unrelated change does not fail the build on rounding.
+
+The floor tracks work, not scope. Measurement covers repository tooling as well as the library — a script that decides what reaches PyPI is not exempt from being tested — but widening what is measured raises the figure without anything being better tested, so the floor does not ratchet on that. It moves when coverage is earned.
 
 ## Related Artifacts
 

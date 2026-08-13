@@ -1,6 +1,6 @@
 ---
 title: "CI Pipeline and Security Scanning"
-description: "The GitLab CI pipeline for anidb-client across six stages: validate (lockfile freshness plus spec/ADR INDEX freshness), test (ruff, mypy, codespell, pytest against a real PostgreSQL service), build (the wheel and sdist that publish later uploads), security (shared ci-templates Semgrep SAST, Grype dependency scanning and the .grype.yaml exception audit, with a daily rescan schedule), drift-detection (the merge-request-only anchor-watch gate), and publish (tag-only PyPI upload over OIDC trusted publishing with a tag-versus-wheel version check). Explains why container scanning is deliberately absent."
+description: "The GitLab CI pipeline for anidb-client across six stages: validate (lockfile freshness plus spec/ADR INDEX freshness), test (ruff, mypy, codespell, pytest against a real PostgreSQL service), build (the wheel and sdist that publish later uploads), security (shared ci-templates Semgrep SAST, Grype dependency scanning and the .grype.yaml exception audit, with a daily rescan schedule), drift-detection (the merge-request-only anchor-watch gate), and publish (tag-only PyPI upload over OIDC trusted publishing, gated behind every earlier stage, with the tag rules themselves owned by SPEC-009). Explains why container scanning is deliberately absent."
 status: accepted
 tags: [ci, gitlab-ci, pipeline, stages, validate, lockfile, index-freshness, lint, ruff, mypy, codespell, pytest, postgres-service, build, wheel, sdist, security-scanning, semgrep, sast, grype, dependency-scanning, exception-audit, ci-templates, soak, schedule, rescan, drift-detection, anchor-watch, anchored-development, publish, pypi, trusted-publishing, oidc, tags, renovate]
 ---
@@ -63,15 +63,15 @@ It runs on merge requests only, and never on Renovate branches. Drift is a pre-m
 
 ## Publish
 
-Publishing happens only from an annotated version tag, and only after the security stage has passed.
+Publishing happens only from a version tag, and only after every earlier stage has passed. The job uploads the artifacts the build stage produced, over OIDC trusted publishing, and refuses to upload anything unless the tag and those artifacts agree.
 
-Upload uses **PyPI trusted publishing over OIDC**: PyPI verifies a short-lived GitLab identity token rather than a long-lived API token, so there is no upload credential stored in CI at all. This requires the publisher to be configured on PyPI against this project, this job name and its environment before the first release.
+**SPEC-009 owns that behavior** — the tag grammar, what the gate checks, why a malformed tag fails loudly here rather than quietly matching no job at all, and how PyPI's side of the trust is configured. What belongs to the pipeline is only where it sits: the last stage, reachable from a tag alone, and gated behind the whole suite and the scanners rather than running alongside them.
 
-Before uploading, the job checks that the tag matches the version inside the built wheel — read from the wheel's filename, so the check covers the artifact actually being uploaded rather than the source it came from. A mismatch fails the job rather than publishing a release labelled differently from the tag it was cut from.
+That placement is the point. Everything a release has to survive happens before the one step that cannot be undone.
 
 ## Related Artifacts
 
 - **Line of truth (self-enforcing):** `.gitlab-ci.yml` (stages, jobs, rules and images); `.grype.yaml` (scan exceptions and their expiry); `renovate.json` (the dependency-update policy the soak window backs); `pyproject.toml` and `uv.lock` (what the validate and test stages check).
 - **Decisions (why):** ADR-001 records why the README remains a full user-facing document, which is what the drift gate is told not to flag as duplication.
-- **Related specs:** SPEC-000 (the framework anchor-watch enforces, and the index-generation requirement the validate stage checks); SPEC-007 (the same lint, type, spell and test checks as they run locally, and the supply-chain posture the scanning backs); SPEC-003 (why a real PostgreSQL service is required rather than SQLite).
+- **Related specs:** SPEC-000 (the framework anchor-watch enforces, and the index-generation requirement the validate stage checks); SPEC-007 (the same lint, type, spell and test checks as they run locally, and the supply-chain posture the scanning backs); SPEC-003 (why a real PostgreSQL service is required rather than SQLite); SPEC-009 (what the publish stage actually verifies before it uploads, and the tag rules it enforces).
 - **Tests:** the pipeline is verified by running. The one project-side invariant it depends on — that the suite never reaches the network — is covered by `tests/test_network_guard.py`.

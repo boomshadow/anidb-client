@@ -85,8 +85,11 @@ path = "src/anidb_client/__init__.py"
 packages = ["src/anidb_client"]
 
 [tool.hatch.build.targets.sdist]
-# The sdist carries the tests so downstream packagers can run them.
-include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+# The sdist carries the tests so downstream packagers can run them -- which means it must
+# also carry anything they import. `scripts` is here for that reason alone: the release
+# gate is not useful to a packager, but its tests are part of the suite and fail at
+# collection without it.
+include = ["src", "tests", "scripts", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.ruff]
 # Declared, not inferred from requires-python: this value decides which rewrites
@@ -104,7 +107,10 @@ ignore = []
 
 [tool.mypy]
 python_version = "3.14"
-files = ["src"]
+# `scripts` is here rather than being left out as "just tooling". The release gate
+# lives there and decides whether a version reaches PyPI, so it is held to the same
+# standard as the library -- a script that is checked and tested is not glue.
+files = ["src", "scripts"]
 # Strict everywhere. This was a per-module list for as long as it took to annotate
 # the package one module at a time; every module is on it now, so the list is the
 # global setting. A new module is strict from its first line rather than opted in.
@@ -136,7 +142,10 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["anidb_client"]
+# `scripts` is measured alongside the library rather than left out as tooling. The release
+# gate decides whether a version reaches PyPI, and a gate whose tests could be gutted
+# without the floor noticing is not a gate.
+source = ["anidb_client", "scripts"]
 branch = true
 
 [tool.coverage.report]
@@ -154,6 +163,10 @@ skip_covered = false
 # session lifecycle brought their own tests -- db.py 96% -> 99% and animeobjs.py
 # 66% -> 72%. Set a little under the measured figure so an unrelated change does
 # not fail the build on rounding.
+#
+# The total also covers `scripts` now (see the source list above). That nudged the
+# measured figure up without the library being any better tested, so the floor
+# deliberately did NOT ratchet with it -- this number tracks work, not scope.
 fail_under = 78
 exclude_also = [
     "if __name__ == .__main__.:",

@@ -59,6 +59,13 @@ anime-titles and anime-list XML caches and title matching), `mapper.py` (field
 converters and bitmask building), `fileinfo.py` (ed2k hashing, file stats and the
 filename regexes), `commands.py`, `responses.py`, `errors.py`.
 
+`scripts/` holds repository tooling that is not shipped in the wheel but is held to
+the same standard as the library — checked under strict typing, measured by the
+coverage floor, and carried in the sdist so the tests that import it still run there.
+`release_tag.py` is the release gate: it decides whether a tag may publish and what
+version it must publish under, so a change to it is a strong signal to check SPEC-009
+and ADR-002.
+
 Tests live under `tests/` — `tests/unit/` for the bulk, `tests/integration/` for
 the ones needing a real PostgreSQL or the fake AniDB server. They are pytest
 files named `test_*.py`, grouping behavior into `class Test*` blocks with

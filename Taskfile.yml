@@ -120,6 +120,14 @@ tasks:
     cmds:
       - "{{.RUN}} uv build"
 
+  publish:check-tag:
+    desc: Check a release tag is legal and print the version it would publish (e.g. -- v0.0.1-rc.1)
+    # The same gate CI applies before uploading. Run it before creating a tag: a
+    # protected tag cannot be moved or deleted by a local push, so a malformed one is
+    # not a mistake you can quietly take back.
+    cmds:
+      - "{{.RUN}} python3 scripts/release_tag.py {{.CLI_ARGS}}"
+
   shell:
     desc: Open an interactive shell in the dev container
     cmds:

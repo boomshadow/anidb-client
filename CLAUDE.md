@@ -54,8 +54,9 @@ hold authority — when the two disagree, fix the README.
 | File identification & mylist — size+ed2k as the identity AniDB recognises, hash reuse gated on size and mtime, ed2k degenerate cases; generic entries when AniDB has never seen the file; two-part inference (anime from parent directory at the normal threshold then from a stripped filename at a deliberately lower one; episode from an ordered regex ladder whose fallbacks are gated behind the single-episode test); AniDB's special/opening/ending/trailer numbering with the halfway-through-credits ending guess; multi-episode ranges (filename parsing supports them, the file API does not) and part files; mylist add/edit via one entry point, the one-entry-per-episode rule, per-episode adds for generic files, local-first edits vs. add-then-read, a write the transport cannot deliver raising rather than reporting a change that never happened; removal clearing cached state regardless of reply; promotion of a generic entry once AniDB learns the real file | [SPEC-004](docs/specs/SPEC-004-file-identification-and-mylist.md) |
 | Title matching & external mapping — fuzzy scoring against AniDB's anime-titles export with the threshold as a parameter (lowered for filename-derived guesses) and only the top result becoming an `Anime`; unresolvable title ambiguity; ISO-639 language normalisation; Anime-Lists mapping to TVDB (tv only) / TMDB (tv and movie) / IMDB (movie only) with list-valued movie ids selected per episode; episode mapping's three mechanisms in priority order (per-episode map, start/end range with offset, anime-level default season+offset), season-zero banding for specials, episodes mapped to zero meaning no mapping, part-number and list-valued results, and the movie-parts ragged edge; fanart.tv's two preconditions, empty-list-not-raise, and partial-result handling | [SPEC-005](docs/specs/SPEC-005-title-matching-and-external-mapping.md) |
 | Configuration & credentials — `init()` as the single entry point and the database URL as its only required argument, with an in-memory SQLite URL refused outside `db_only` and the cache pool's size exposed as an argument; three credential arrangements (direct, netrc, or `db_only` which must not demand them); exact netrc machine-name sets for AniDB credentials, database credentials (hostname only — no port, no IPv6 brackets, case-insensitive) and the fanart key; database password injection only when the URL has none, only when the credential belongs to the URL's user, rebuilt structurally with percent-encoding rather than string surgery; registered client identity deliberately unrelated to the distribution version; encryption key; per-call random outgoing UDP port; logging setup with AUTH contents never logged; the per-socket-operation HTTP timeout; `close()` | [SPEC-006](docs/specs/SPEC-006-configuration-and-credentials.md) |
-| Coding style & conventions — Docker-native development with no host Python toolchain and the Taskfile as the developer-command entry point; a current-rather-than-conservative interpreter floor, restated to ruff and mypy and carried in the pinned image tag rather than derived; ruff for format+lint; **mypy under global `strict`** across every module, with the two exemptions it does keep named and reasoned in `pyproject.toml`; codespell and its "real words that look like typos" ignore list; pin-and-verify supply chain (exact pins, hashed `uv.lock`, the 45-day soak declared to the *resolver* not just to Renovate, digest-pinned base image by index); the no-network test discipline enforced by the suite itself rather than the runner; injected clocks; PostgreSQL-marked tests re-run as an explicit gate so a silent skip cannot pass; the ratcheting coverage floor | [SPEC-007](docs/specs/SPEC-007-coding-style-and-conventions.md) |
-| CI pipeline & security scanning — six stages (validate/test/build/security/drift-detection/publish); lockfile and spec/ADR INDEX freshness gates; lint/typecheck/test against a real PostgreSQL service; wheel+sdist built once and carried to publish; shared `ci-templates` Semgrep/Grype/exception-audit consumed from their default branch with a daily rescan schedule; **no container scanning** (the deliverable is a wheel, the image is a harness); MR-only, no-Renovate `anchor-watch` drift gate that does not allow failure; tag-only PyPI publish over OIDC trusted publishing with a tag-versus-wheel version check | [SPEC-008](docs/specs/SPEC-008-ci-pipeline-and-security-scanning.md) |
+| Coding style & conventions — Docker-native development with no host Python toolchain and the Taskfile as the developer-command entry point; a current-rather-than-conservative interpreter floor, restated to ruff and mypy and carried in the pinned image tag rather than derived; ruff for format+lint; **mypy under global `strict`** across every module, with the two exemptions it does keep named and reasoned in `pyproject.toml`, and repository tooling inside that scope rather than beside it; a coverage floor that tracks work rather than scope; codespell and its "real words that look like typos" ignore list; pin-and-verify supply chain (exact pins, hashed `uv.lock`, the 45-day soak declared to the *resolver* not just to Renovate, digest-pinned base image by index); the no-network test discipline enforced by the suite itself rather than the runner; injected clocks; PostgreSQL-marked tests re-run as an explicit gate so a silent skip cannot pass; the ratcheting coverage floor | [SPEC-007](docs/specs/SPEC-007-coding-style-and-conventions.md) |
+| CI pipeline & security scanning — six stages (validate/test/build/security/drift-detection/publish); lockfile and spec/ADR INDEX freshness gates; lint/typecheck/test against a real PostgreSQL service; wheel+sdist built once and carried to publish; shared `ci-templates` Semgrep/Grype/exception-audit consumed from their default branch with a daily rescan schedule; **no container scanning** (the deliverable is a wheel, the image is a harness); MR-only, no-Renovate `anchor-watch` drift gate that does not allow failure; tag-only PyPI publish over OIDC trusted publishing, gated behind every earlier stage | [SPEC-008](docs/specs/SPEC-008-ci-pipeline-and-security-scanning.md) |
+| Release & publication — the version declared once in the package in SemVer and normalised to PEP 440 only in the built artifact; the release tag grammar, admitting `alpha`/`beta`/`rc` pre-releases alone and refusing build metadata, with a refusal that names the spelling that would have worked; the permanence of tags and published versions and the fix-forward rule that follows from it; a gate applied on both sides of the tag that checks legality and that the artifacts carry the version implied, and that fails loudly on a malformed tag rather than matching no job at all; upload over OIDC trusted publishing with no stored credential and the four claims PyPI actually verifies; what a pre-release means to a consumer | [SPEC-009](docs/specs/SPEC-009-release-and-publication.md) |
 
 ## Working Agreement
 
@@ -103,6 +104,32 @@ introduce files or directories that should not be committed, add them to `.gitig
 Exact pins, hash-locked in `uv.lock`, 45-day soak. Never loosen a pin or bypass the lock.
 See SPEC-007 before touching `pyproject.toml`'s dependency sections.
 
+### Releases — Never Move or Delete a Tag
+
+A release tag is permanent. When a tagged build fails, or a published release turns out to
+be wrong, **fix forward to the next version**. Never re-point, force-push or delete a tag.
+
+Three mechanisms make this a fact rather than a preference:
+
+- PyPI never allows a version to be re-uploaded, even after it is deleted. Publishing
+  spends the number permanently.
+- `v*` tags are protected, so GitLab refuses to update one at all and permits deletion
+  only through its own interface — a local `git push --delete` is rejected outright.
+- `main` is mirrored to a public GitHub repository, so a tag that has been seen elsewhere
+  cannot be unseen.
+
+Skipped version numbers are ordinary and mean nothing. Cutting `v0.0.3` after a broken
+`v0.0.2` is the correct repair, not an embarrassment to avoid.
+
+Tags are **SemVer** — `v0.0.1`, `v0.0.1-rc.1` — never the PEP 440 spelling (`v0.0.1rc1`),
+and the tag is always `v` plus `__version__` exactly. Check a tag before creating it:
+
+```bash
+task publish:check-tag -- v0.0.1-rc.1
+```
+
+See SPEC-009 for the full rules and ADR-002 for why the two notations differ.
+
 ## Project Structure
 
 ```
@@ -118,6 +145,8 @@ src/anidb_client/
   mapper.py         Field converters and request bitmasks      → SPEC-005/SPEC-002/SPEC-003
   fileinfo.py       ed2k hashing, file stats, filename regexes → SPEC-004
   errors.py         Exception hierarchy
+scripts/            Repository tooling, not packaged
+  release_tag.py    The release-tag gate                      → SPEC-009
 tests/unit/         The bulk of the suite
 tests/integration/  Needs a real PostgreSQL or the fake server
 tests/fake_anidb.py Loopback stand-in for the AniDB UDP API    → SPEC-007
