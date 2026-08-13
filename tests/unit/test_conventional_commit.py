@@ -19,8 +19,8 @@ from scripts.conventional_commit import (
     ALLOWED_TYPES,
     NotConventional,
     check,
-    check_all,
     main,
+    review,
 )
 
 CLIFF_CONFIG = Path(__file__).resolve().parents[2] / "cliff.toml"
@@ -97,14 +97,39 @@ def test_gitlab_draft_prefixes_are_ignored(prefix: str) -> None:
 )
 def test_merge_subjects_are_skipped_rather_than_refused(subject: str) -> None:
     """Nobody authored these and they never reach a release note."""
-    assert check_all([subject]) == []
+    reviewed = review([subject])
+
+    assert reviewed.complaints == []
+    assert reviewed.checked == 0
+    assert reviewed.skipped == 1
 
 
 def test_every_bad_subject_in_a_batch_is_reported():
     """A push of several commits should not need one CI run per mistake."""
-    complaints = check_all(["feat: fine", "broken one", "also broken"])
+    assert len(review(["feat: fine", "broken one", "also broken"]).complaints) == 2
 
-    assert len(complaints) == 2
+
+def test_the_count_reports_what_was_validated_not_what_was_read():
+    """A run that validated nothing must not read like a run that validated everything.
+
+    Counting lines received rather than subjects checked would let a push of nothing
+    but merge commits announce that it had inspected them all -- the same shape of
+    false success as a publish that uploads no artifacts.
+    """
+    reviewed = review(["Merge branch 'x' into 'main'", "", "feat: a real one"])
+
+    assert reviewed.checked == 1
+    assert reviewed.skipped == 2
+
+
+def test_a_push_of_only_merges_checks_nothing_and_says_so(capsys):
+    """Legitimate, so it passes -- but the summary must not overstate what it did."""
+    stream = io.StringIO("Merge branch 'a' into 'main'\nMerge branch 'b' into 'main'\n")
+
+    assert main(["--stdin"], stdin=stream) == 0
+    out = capsys.readouterr().out
+    assert "0 subject(s) checked" in out
+    assert "2 skipped" in out
 
 
 def test_cli_accepts_a_title(capsys):

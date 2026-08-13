@@ -128,7 +128,11 @@ and the tag is always `v` plus `__version__` exactly. Check a tag before creatin
 task publish:check-tag -- v0.0.1-rc.1
 ```
 
-See SPEC-009 for the full rules and ADR-002 for why the two notations differ.
+**Cutting a release is `/publish`.** It handles the version, the notes, the tag, the wait
+for CI, and both release pages. Do not perform those steps by hand — the order matters and
+the last one cannot be undone. See SPEC-009 for the full rules, ADR-002 for why the tag and
+the artifact spell the version differently, and ADR-004 for why the release runs here rather
+than in CI.
 
 ### The MR Title Is a Line of the Release Notes
 
@@ -182,4 +186,5 @@ tests/schema_snapshots/     The stored DDL, per backend        → SPEC-003
 docs/specs/         Behavioral specs + auto-generated INDEX
 docs/decisions/     ADRs + auto-generated INDEX
 cliff.toml          Shape of a generated release note          → SPEC-009
+.claude/skills/publish/  The /publish release procedure        → SPEC-009/ADR-004
 ```

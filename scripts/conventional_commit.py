@@ -26,7 +26,7 @@ Where it runs is deliberate, and follows from squash-on-merge:
 import argparse
 import re
 import sys
-from typing import TextIO
+from typing import NamedTuple, TextIO
 
 # The vocabulary. Every entry must be routed to a heading by `cliff.toml`, and every
 # heading `cliff.toml` names must be reachable from an entry here -- a type nothing
@@ -105,20 +105,42 @@ def check(subject: str) -> None:
         )
 
 
-def check_all(subjects: list[str]) -> list[str]:
-    """Return one complaint per subject that is not a conventional commit.
+class Reviewed(NamedTuple):
+    """What a batch of subjects amounted to.
 
-    Merge subjects are skipped rather than reported.
+    `checked` and `skipped` are counted separately so the summary can report what was
+    actually put through the grammar rather than how many lines arrived. A push of
+    nothing but merge commits validates nothing, and it must say so instead of
+    announcing that it checked them.
     """
+
+    checked: int
+    skipped: int
+    complaints: list[str]
+
+
+def review(subjects: list[str]) -> Reviewed:
+    """Validate every subject that is a subject, and say how many that was.
+
+    Merge-generated and blank lines are skipped rather than reported: nobody authored
+    them. Skipping is not a failure -- a push may legitimately carry only merges -- so
+    the count is what makes it visible.
+    """
+    checked = 0
+    skipped = 0
     complaints: list[str] = []
+
     for subject in subjects:
         if not subject.strip() or MERGE_SUBJECT_PATTERN.match(subject):
+            skipped += 1
             continue
+        checked += 1
         try:
             check(subject)
         except NotConventional as error:
             complaints.append(str(error))
-    return complaints
+
+    return Reviewed(checked=checked, skipped=skipped, complaints=complaints)
 
 
 def main(argv: list[str] | None = None, stdin: TextIO | None = None) -> int:
@@ -147,11 +169,11 @@ def main(argv: list[str] | None = None, stdin: TextIO | None = None) -> int:
         stream = sys.stdin if stdin is None else stdin
         subjects = stream.readlines()
 
-    complaints = check_all([subject.rstrip("\n") for subject in subjects])
-    for complaint in complaints:
+    reviewed = review([subject.rstrip("\n") for subject in subjects])
+    for complaint in reviewed.complaints:
         print(f"ERROR: {complaint}", file=sys.stderr)
 
-    if complaints:
+    if reviewed.complaints:
         print(
             "\nThis subject becomes a line of the release notes -- see SPEC-009. "
             "Reword it, or amend the commit, before merging.",
@@ -159,7 +181,14 @@ def main(argv: list[str] | None = None, stdin: TextIO | None = None) -> int:
         )
         return 1
 
-    print(f"{len(subjects)} subject(s) checked, all conventional.")
+    # Report the two numbers separately. "2 subject(s) checked" over a merge and a real
+    # commit is a job claiming to have inspected something it deliberately passed over,
+    # and a run that validated nothing would read exactly like a run that validated
+    # everything.
+    summary = f"{reviewed.checked} subject(s) checked"
+    if reviewed.skipped:
+        summary += f", {reviewed.skipped} skipped as merge or blank"
+    print(f"{summary}. All conventional.")
     return 0
 
 
