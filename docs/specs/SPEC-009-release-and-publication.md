@@ -1,8 +1,8 @@
 ---
 title: "Release and Publication"
-description: "How a version of this library reaches its users: the version declared in the package as SemVer and normalised to PEP 440 in the built artifact; the release tag grammar, which admits only alpha/beta/rc pre-releases and refuses build metadata; the permanence of tags and published versions and the fix-forward rule that follows from it; the gate that rejects a malformed tag loudly rather than publishing nothing silently; and upload to PyPI over OIDC trusted publishing with no stored credential."
+description: "How a version of this library reaches its users: choosing the number by SemVer against the public surface, and the freedom to change one nobody can install yet; the version declared in the package as SemVer and normalised to PEP 440 in the built artifact; the release tag grammar, which admits only alpha/beta/rc pre-releases and refuses build metadata; the permanence of tags and published versions and the fix-forward rule that follows from it; the gate that rejects a malformed tag loudly rather than publishing nothing silently; release notes carried on the release pages rather than in a changelog file, half generated from the commits and half written; and upload to PyPI over OIDC trusted publishing with no stored credential."
 status: accepted
-tags: [release, publication, versioning, semver, pep440, tags, protected-tags, pre-release, release-candidate, immutability, fix-forward, gate, pypi, trusted-publishing, oidc, publish]
+tags: [release, publication, versioning, semver, pep440, tags, protected-tags, pre-release, release-candidate, immutability, fix-forward, gate, pypi, trusted-publishing, oidc, publish, release-notes, changelog, keep-a-changelog, git-cliff, conventional-commits, mirror]
 ---
 
 # Release and Publication
@@ -62,6 +62,24 @@ Upload happens only from a tag, and only after every other stage has passed. It 
 
 PyPI's side of that trust is configured against four things — the namespace, the project name, the path of the top-level pipeline file, and the deployment environment the job declares. The job's *name* is not among them, so renaming the job is safe while moving the environment declaration to a different job is not.
 
+## Release notes
+
+There is no changelog file. The release pages carry the changelog, and both the GitLab and the GitHub release get the same body. ADR-003 records why.
+
+A release note has two halves.
+
+The **generated** half lists every commit in the release, grouped into Keep a Changelog's headings — Added, Changed, Fixed, Removed, Deprecated, Security — with documentation and internal work under headings of their own below those. Each entry links to the commit on the public mirror, because the same body is posted to a release page most readers reach without access to the private project.
+
+Nothing is filtered out except merge commits, which carry no information their squashed commit does not already carry. An infrastructural or test-only change is still something a reader may be trying to locate months later; grouping is what keeps the list readable, not omission. A commit that is not a well-formed conventional commit still appears, under a catch-all heading.
+
+The **written** half is a short paragraph above the list saying what the release is about. A generator cannot produce it, and it is the half that answers the question a reader actually arrives with. It is authored, so it is not reproducible — unlike the list below it, which is.
+
+**Where a release begins** is the previous tag. The tag marking the state this project inherited before its own work began counts for that purpose, which is what keeps the first release's notes scoped to this project's changes rather than to the entire history of the code it was forked from.
+
+Because a merge request is squashed on merge, its title becomes one line of a release note. That makes the title user-facing copy and the conventional-commit type a routing decision — the type selects the heading the change appears under.
+
+Nothing checks that. A title carrying a type no heading claims falls into the catch-all, and a title carrying the *wrong* type appears under a heading that misdescribes it — neither produces an error anywhere. The routing table is mechanical; whether a title is well-formed and honest is a discipline, and the release note is where getting it wrong shows up.
+
 ## Pre-releases
 
 A pre-release publishes to PyPI exactly as a full release does. The difference is on the consumer's side: an ordinary install resolves to the newest full release and ignores pre-releases entirely, so publishing one cannot disturb anyone who has not asked for it. Someone testing an unreleased change opts in explicitly.
@@ -70,7 +88,7 @@ That makes a pre-release the correct way to exercise a change against a real con
 
 ## Related Artifacts
 
-- **Line of truth (self-enforcing):** `.gitlab-ci.yml` (when the publish job runs and what it must pass first); `scripts/release_tag.py` (the tag grammar and the version it implies); `pyproject.toml` (the build backend and where it reads the version from).
-- **Decisions (why):** ADR-002 records why the repository declares versions in SemVer and lets the build backend normalise, rather than tagging in PEP 440 or deriving the version from the tag.
+- **Line of truth (self-enforcing):** `.gitlab-ci.yml` (when the publish job runs and what it must pass first); `scripts/release_tag.py` (the tag grammar and the version it implies); `pyproject.toml` (the build backend and where it reads the version from); `cliff.toml` (how commits become the generated half of a release note, and where a release begins); `docker-compose.yml` (the pinned generator).
+- **Decisions (why):** ADR-002 records why the repository declares versions in SemVer and lets the build backend normalise, rather than tagging in PEP 440 or deriving the version from the tag. ADR-003 records why there is no changelog file and why a release note is half generated and half written.
 - **Related specs:** SPEC-008 (the pipeline this publish stage belongs to, and the checks a release must clear first); SPEC-006 (the registered AniDB client identity, and why it moves independently of this version); SPEC-007 (the toolchain the gate runs under).
 - **Tests:** the tag grammar and the artifact check are covered by `tests/unit/test_release_tag.py`. That the declared version is itself a legal tag, and that the build backend normalises it the way the gate predicts, are covered in `tests/unit/test_package.py`.

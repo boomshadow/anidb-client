@@ -60,5 +60,28 @@ services:
       retries: 20
       start_period: 5s
 
+  # Release-note generation (SPEC-009). A second one-shot container, for the same
+  # reason `dev` is one: there is nothing to keep running. It reads the commit history
+  # and writes the rendered notes to stdout.
+  #
+  # Digest-pinned like every other image here, tag and digest together so Renovate
+  # keeps the pair moving as one. Pulled from GHCR rather than Docker Hub -- both
+  # registries serve this identical index digest, and GHCR is bound to the same
+  # organisation that publishes the source.
+  #
+  # Mounted READ-ONLY. This tool exists to read history and say what changed; giving
+  # it write access to the working tree would let a rendering step modify the thing it
+  # is describing. Notes go to stdout, so it never needs to write anything.
+  cliff:
+    image: ghcr.io/orhun/git-cliff/git-cliff:2.13.1@sha256:d49216b61658fc1b10bab6c5f82dfca03b8e37278618fdc3db235d95cf3c33f5
+    volumes:
+      - .:/app:ro
+    working_dir: /app
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   uv-cache:

@@ -1,0 +1,96 @@
+# Release-note generation. This file is the line of truth for what a release note
+# looks like -- the mechanical half of it, at least. A human (or an agent acting for
+# one) writes the paragraph that goes above; everything below is generated from the
+# commits, so it is complete rather than curated. See SPEC-009.
+#
+# Run it with `task publish:notes -- v0.0.1`.
+
+[changelog]
+# No file header. This renders one release's section, which is then posted as the
+# body of a GitLab release and a GitHub release -- it is never concatenated into a
+# CHANGELOG.md, because this project does not keep one. The releases pages are the
+# changelog (ADR-003).
+header = ""
+
+# Commit subjects are shown as written, with the conventional-commit type stripped
+# off the front -- the group heading already says "Fixed", so "fix: " on every line
+# is noise. Breaking changes are called out inline rather than sorted into their own
+# section, so they stay next to the change that broke something.
+#
+# Commit links point at the PUBLIC mirror, not at GitLab. The same body is posted to
+# both release pages, and the GitLab project is private -- a link most readers cannot
+# follow is worse than no link. See the mirror note in AGENTS.md.
+#
+# `striptags` drops the `<!-- N -->` ordering prefix the group names carry. The prefix
+# exists only so the sections come out in Keep a Changelog's order rather than
+# alphabetically; it is never meant to be read.
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.breaking %}**Breaking.** {% endif %}\
+{{ commit.message | upper_first }} \
+([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/boomshadow/anidb-client/commit/{{ commit.id }}))
+{%- endfor %}
+{% endfor %}
+"""
+
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+
+# Everything shows up. A release note that hides the boring commits is worse at the
+# one job it has months later -- telling someone where a change landed and why. The
+# grouping is what keeps it readable; omission is not.
+filter_unconventional = false
+filter_commits = false
+
+# Merge commits are the exception, and the only one. `main` alternates a real squashed
+# commit with "Merge branch 'x' into 'main'", which carries no information the squashed
+# commit does not already carry.
+split_commits = false
+protect_breaking_commits = true
+
+commit_parsers = [
+  # Merge noise, dropped before anything else can claim it.
+  { message = "^Merge branch", skip = true },
+  { message = "^Merge remote-tracking", skip = true },
+
+  # Keep a Changelog's vocabulary where a conventional type maps onto it cleanly.
+  { message = "^feat", group = "<!-- 0 -->Added" },
+  { message = "^fix", group = "<!-- 2 -->Fixed" },
+  { message = "^perf", group = "<!-- 1 -->Changed" },
+  { message = "^refactor", group = "<!-- 1 -->Changed" },
+  { message = "^revert", group = "<!-- 1 -->Changed" },
+  { message = "^remove", group = "<!-- 3 -->Removed" },
+  { message = "^deprecate", group = "<!-- 4 -->Deprecated" },
+  { message = "^security", group = "<!-- 5 -->Security" },
+
+  # Beyond that vocabulary. Keep a Changelog has no heading for a test or a CI tweak,
+  # and inventing one per type would bury the sections a reader actually came for --
+  # so everything internal shares a heading at the bottom.
+  { message = "^docs", group = "<!-- 6 -->Documentation" },
+  { message = "^test", group = "<!-- 7 -->Internal" },
+  { message = "^ci", group = "<!-- 7 -->Internal" },
+  { message = "^build", group = "<!-- 7 -->Internal" },
+  { message = "^chore", group = "<!-- 7 -->Internal" },
+  { message = "^style", group = "<!-- 7 -->Internal" },
+
+  # Anything that is not a conventional commit at all. It still appears -- being
+  # unparsable is not a reason to vanish from the record.
+  { message = ".*", group = "<!-- 8 -->Other" },
+]
+
+# Which tags count as a release boundary, and therefore where "unreleased" starts.
+#
+# `^v` and not `^v\d+\.\d+\.\d+`, deliberately. `v0-upstream` marks the state this
+# project inherited before its own work began; treating it as a boundary is what makes
+# the first release's notes cover this project's changes rather than the entire history
+# of the code it was forked from. It is not a release and will never be published, but
+# it is exactly the right floor. The pattern still excludes a stray non-`v` tag.
+tag_pattern = "^v"
+
+topo_order = false
+sort_commits = "oldest"
