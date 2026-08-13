@@ -57,10 +57,18 @@ workflow:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH
 
-# Publishing only ever happens from an annotated version tag, never from a branch.
+# Publishing only ever happens from a version tag, never from a branch. Not "annotated":
+# `$CI_COMMIT_TAG` is set for a lightweight tag too, so no rule here could tell the two
+# apart, and a comment claiming a constraint nothing enforces is worse than no comment.
+#
+# Deliberately broad: any `v`-prefixed tag reaches the publish job, and whether it is a
+# legal release tag is decided there, loudly. A rule narrow enough to filter out a
+# malformed tag would instead run no job at all -- which looks exactly like a
+# successful publish to whoever pushed it, and is the failure most likely to bite after
+# a long gap, when the exact spelling has been forgotten. See SPEC-009.
 .rules-tag-only:
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+    - if: $CI_COMMIT_TAG =~ /^v/
 
 # Merge requests only, and never for Renovate's branches. Used by the drift gate: drift is
 # a pre-merge check rather than something to run on every branch push, and a dependency
@@ -260,11 +268,13 @@ anchor-watch:
 ############################
 # PyPI trusted publishing (OIDC): PyPI verifies a short-lived GitLab identity token
 # rather than a long-lived API token, so there is no upload credential stored in CI at
-# all. Configure the publisher at https://pypi.org/manage/account/publishing/ against
-# this project, the `publish:pypi` job name and the `pypi` environment before the first
-# release, or this job will fail authentication.
+# all. The publisher is configured at https://pypi.org/manage/account/publishing/
+# against four things -- the namespace, the project name, the path of the top-level
+# pipeline file, and the environment named below. Note that the job name is NOT among
+# them: PyPI never sees it, so renaming this job is safe and moving the `environment:`
+# key to a different job is not.
 #
-# Runs only from a vN.N.N tag, and only after the security stage has passed.
+# Runs only from a version tag, and only after the security stage has passed.
 publish:pypi:
   extends: .rules-tag-only
   stage: publish
@@ -275,14 +285,20 @@ publish:pypi:
   id_tokens:
     PYPI_ID_TOKEN:
       aud: pypi
-  needs:
-    - job: build:dist
-      artifacts: true
+  # `dependencies:` and NOT `needs:`, deliberately. A job that declares `needs:` starts
+  # the moment those jobs finish and ignores stage order entirely -- so `needs: build:dist`
+  # would let the upload run alongside the scanners rather than after them, which is the
+  # opposite of what a publish stage is for. `dependencies:` narrows which artifacts are
+  # fetched without touching ordering, so this job still waits for every earlier stage and
+  # still pulls only the distributions the build stage produced.
+  dependencies:
+    - build:dist
   script:
-    # The tag must match the version inside the built wheel, or the release on PyPI
-    # would be labelled differently from the tag it was cut from. Read from the wheel
-    # filename rather than the source, so this checks the artifact being uploaded.
-    - WHEEL="$(find dist -name 'anidb_client-*.whl' -printf '%f\n' | head -1)"
-    - VERSION="$(echo "$WHEEL" | cut -d- -f2)"
-    - test "v$VERSION" = "$CI_COMMIT_TAG" || { echo "tag $CI_COMMIT_TAG != wheel version v$VERSION"; exit 1; }
+    # One gate, and the release workflow applies the same one before the tag is ever
+    # created. It answers two questions: is this a legal release tag, and does every
+    # built artifact carry the version that tag implies? A malformed tag fails naming
+    # the spelling that would have worked; a tag on the wrong commit fails because the
+    # artifacts disagree with it. Read from the artifact filenames rather than the
+    # source, so what is checked is what is about to be uploaded.
+    - python3 scripts/release_tag.py "$CI_COMMIT_TAG" --dist dist
     - uv publish --trusted-publishing always

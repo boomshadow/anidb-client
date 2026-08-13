@@ -8,20 +8,31 @@ AniDB is what we think it is.
 import importlib.metadata
 
 import anidb_client
+from scripts.release_tag import distribution_version
 
 
-def test_package_imports_and_exposes_version():
+def test_package_imports_and_exposes_a_taggable_version():
+    """`__version__` is the release tag without its `v`, so it must be a legal one.
+
+    Catching a malformed version here rather than at publish time means a bad bump
+    fails on the merge request that introduced it, not months later on the tag.
+    """
     assert isinstance(anidb_client.__version__, str)
-    assert anidb_client.__version__.count(".") == 2, "expected a semantic version"
+    distribution_version(f"v{anidb_client.__version__}")
 
 
 def test_installed_metadata_version_matches_package():
-    """The build backend reads __version__ from the package.
+    """The build backend reads __version__ from the package and normalises it.
 
-    If these two ever disagree, the wheel on PyPI is labelled with a version that
-    the code inside it does not report.
+    `__version__` is SemVer and the installed metadata is PEP 440, so these agree
+    exactly for an ordinary release and differ in spelling for a pre-release --
+    `0.0.1-rc.1` against `0.0.1rc1`. Comparing through the same translation the
+    publish gate applies checks both halves at once: that the build backend
+    normalises the way the gate predicts, and that the wheel on PyPI is not
+    labelled with a version the code inside it does not report.
     """
-    assert importlib.metadata.version("anidb-client") == anidb_client.__version__
+    expected = distribution_version(f"v{anidb_client.__version__}")
+    assert importlib.metadata.version("anidb-client") == expected
 
 
 def test_anidb_client_identity_is_independent_of_package_version():
