@@ -33,7 +33,7 @@ what you derived and why you are overriding it, before asking for approval.
 Do not proceed past a failure. Report it and stop; do not attempt a repair.
 
 1. **On `main`, clean, and current.** `git status --porcelain` empty, `git rev-parse --abbrev-ref HEAD` is `main`, and `git fetch origin main` leaves nothing to pull. A release cut from a stale or dirty tree publishes something nobody reviewed.
-2. **`main`'s newest pipeline is green.** Query it; do not assume. A red `main` means the thing about to be published is already known broken.
+2. **`main`'s newest *push* pipeline is green.** Filter by source — `glab api "projects/:id/pipelines?ref=main&source=push&per_page=1"`. Not simply the newest pipeline: `main`'s newest is frequently the daily security schedule, which runs three scanners and skips the entire test suite, so reading it as green clears preflight on a branch whose tests are failing. A red `main` means the thing about to be published is already known broken.
 3. **`glab auth status` and `gh auth status` both succeed.** Finding out at step 5 means the tag already exists and the release is half-made.
 4. **The version is not already released.** No tag of that name, locally or on the remote. Tags are permanent; see the fix-forward rule in `AGENTS.md`.
 
@@ -87,11 +87,18 @@ Everything before this point is reversible; nothing after it is.
 #    validate:commit-messages job will reject it.
 git commit -am "chore: release <tag>"
 
-# 3. Push to main. This is the one place anything is pushed to main directly,
+# 3. Verify BEFORE anything leaves this machine. The bump is the only commit that
+#    changes the declared version and nothing else, so it is a shape no merge request
+#    ever exercises and the first place it can break. The commit is still local here:
+#    a failure means amend or reset, which costs nothing. The same failure after the
+#    next line leaves main red and needs its own merge request to clear.
+task check
+
+# 4. Push to main. This is the one place anything is pushed to main directly,
 #    and it is deliberate -- see ADR-004.
 git push origin main
 
-# 4. Annotated tag, on that commit, pushed on its own.
+# 5. Annotated tag, on that commit, pushed on its own.
 git tag -a <tag> -m "<tag>"
 git push origin <tag>
 ```

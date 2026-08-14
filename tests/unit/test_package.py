@@ -6,9 +6,14 @@ AniDB is what we think it is.
 """
 
 import importlib.metadata
+import tomllib
+from pathlib import Path
 
 import anidb_client
 from scripts.release_tag import distribution_version
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+VERSION_FILE = "src/anidb_client/__init__.py"
 
 
 def test_package_imports_and_exposes_a_taggable_version():
@@ -53,3 +58,29 @@ def test_anidb_client_identity_is_independent_of_package_version():
     # because "1" is a substring of "100".
     derived_the_old_way = f"{anidb_client.anidb_client_version / 10:.1f}.0"
     assert anidb_client.__version__ != derived_the_old_way
+
+
+def test_the_version_file_invalidates_the_build_cache():
+    """uv must rebuild this project when the declared version changes.
+
+    This guards a line in `pyproject.toml` that looks redundant and is not. uv's default
+    cache keys already cover the whole `src` directory, so naming one file inside it
+    reads like belt and braces -- but a content change to a file in `src` does not
+    invalidate the cached build. Measured: bump `__version__` alone, sync, and the
+    installed metadata still reports the old number.
+
+    What that costs is narrow and badly timed. The release bump is the only commit that
+    changes the version file and nothing else, so a stale build shows up on the release
+    itself and never on a merge request -- the one moment where a failure is expensive.
+
+    Anyone tidying that key away as duplicated should fail here first.
+    """
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        config = tomllib.load(handle)
+
+    keys = config["tool"]["uv"]["cache-keys"]
+    named = [entry["file"] for entry in keys if "file" in entry]
+
+    assert VERSION_FILE in named, f"{VERSION_FILE} must be a uv cache key -- see the comment on cache-keys"
+    # A key naming a path that no longer exists invalidates nothing and reports nothing.
+    assert (REPO_ROOT / VERSION_FILE).is_file(), f"the cache key names {VERSION_FILE}, which does not exist"
