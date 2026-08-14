@@ -330,7 +330,12 @@ anchor-watch:
 # them: PyPI never sees it, so renaming this job is safe and moving the `environment:`
 # key to a different job is not.
 #
-# Runs only from a version tag, and only after the security stage has passed.
+# Runs only from a version tag, ordered after every earlier stage -- but note what that is
+# and is not worth. The security stage is EMPTY on a tag: the shared scanners match merge
+# requests, the default branch and the schedule, and a tag is none of those. So this job
+# waits for a stage with no jobs in it, and clearing it proves nothing. What stands behind
+# a release is that the tagged commit is `main` plus a version bump, and `main` is scanned
+# on every push and daily. SPEC-008 states that guarantee and its limits.
 publish:pypi:
   extends: .rules-tag-only
   stage: publish
@@ -341,12 +346,15 @@ publish:pypi:
   id_tokens:
     PYPI_ID_TOKEN:
       aud: pypi
-  # `dependencies:` and NOT `needs:`, deliberately. A job that declares `needs:` starts
-  # the moment those jobs finish and ignores stage order entirely -- so `needs: build:dist`
-  # would let the upload run alongside the scanners rather than after them, which is the
-  # opposite of what a publish stage is for. `dependencies:` narrows which artifacts are
-  # fetched without touching ordering, so this job still waits for every earlier stage and
-  # still pulls only the distributions the build stage produced.
+  # `dependencies:` and NOT `needs:`, deliberately. A job that declares `needs:` starts the
+  # moment those jobs finish and ignores stage order entirely, which is the opposite of what
+  # a publish stage is for. `dependencies:` narrows which artifacts are fetched without
+  # touching ordering, so this job still waits for every earlier stage and still pulls only
+  # the distributions the build stage produced.
+  #
+  # On a tag that ordering buys less than it looks: see the note above on the empty security
+  # stage. It is kept because it is correct for every other ref, and because the day the
+  # scanners do run on tags this job should already be behind them.
   dependencies:
     - build:dist
   script:

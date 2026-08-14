@@ -1,6 +1,6 @@
 ---
 title: "CI Pipeline and Security Scanning"
-description: "The GitLab CI pipeline for anidb-client across six stages: validate (lockfile freshness, spec/ADR INDEX freshness, and conventional-commit grammar on both merge-request titles and the subjects reaching the default branch), test (ruff, mypy, codespell, pytest against a real PostgreSQL service), build (the wheel and sdist that publish later uploads), security (shared ci-templates Semgrep SAST, Grype dependency scanning and the .grype.yaml exception audit, with a daily rescan schedule), drift-detection (the merge-request-only anchor-watch gate), and publish (tag-only PyPI upload over OIDC trusted publishing, gated behind every earlier stage, with the tag rules themselves owned by SPEC-009). Explains why container scanning is deliberately absent."
+description: "The GitLab CI pipeline for anidb-client across six stages: validate (lockfile freshness, spec/ADR INDEX freshness, and conventional-commit grammar on both merge-request titles and the subjects reaching the default branch), test (ruff, mypy, codespell, pytest against a real PostgreSQL service), build (the wheel and sdist that publish later uploads), security (shared ci-templates Semgrep SAST, Grype dependency scanning and the .grype.yaml exception audit, with a daily rescan schedule), drift-detection (the merge-request-only anchor-watch gate), and publish (tag-only PyPI upload over OIDC trusted publishing, gated behind validate, test and build — the scanners do not run on tags, so the security stage is empty there — with the tag rules themselves owned by SPEC-009). Explains why container scanning is deliberately absent."
 status: accepted
 tags: [ci, gitlab-ci, pipeline, stages, validate, lockfile, index-freshness, conventional-commits, commit-lint, mr-title, lint, ruff, mypy, codespell, pytest, postgres-service, build, wheel, sdist, security-scanning, semgrep, sast, grype, dependency-scanning, exception-audit, ci-templates, soak, schedule, rescan, drift-detection, anchor-watch, anchored-development, publish, pypi, trusted-publishing, oidc, tags, renovate]
 ---
@@ -67,11 +67,11 @@ It runs on merge requests only, and never on Renovate branches. Drift is a pre-m
 
 ## Publish
 
-Publishing happens only from a version tag, and only after every earlier stage has passed. The job uploads the artifacts the build stage produced, over OIDC trusted publishing, and refuses to upload anything unless the tag and those artifacts agree.
+Publishing happens only from a version tag, and only after validate, test and build have passed. The job uploads the artifacts the build stage produced, over OIDC trusted publishing, and refuses to upload anything unless the tag and those artifacts agree.
 
-**SPEC-009 owns that behavior** — the tag grammar, what the gate checks, why a malformed tag fails loudly here rather than quietly matching no job at all, and how PyPI's side of the trust is configured. What belongs to the pipeline is only where it sits: the last stage, reachable from a tag alone, and gated behind the whole suite and the scanners rather than running alongside them.
+**SPEC-009 owns that behavior** — the tag grammar, what the gate checks, why a malformed tag fails loudly here rather than quietly matching no job at all, and how PyPI's side of the trust is configured. What belongs to the pipeline is only where it sits: the last stage, reachable from a tag alone, and ordered after every other stage rather than running alongside them. Ordered after is not the same as gated by, and the difference matters here — see below.
 
-That placement is the point. Everything a release has to survive happens before the one step that cannot be undone.
+**The security stage is empty on a tag.** The shared scanners run on merge requests, on the default branch, and on the schedule — not on tags — so the stage exists in the ordering but produces no jobs there, and clearing it proves nothing. What actually stands behind a release is that the tagged commit is the default branch plus a version bump, and the default branch is scanned on every push and again every day. That is a weaker guarantee than scanning the tag itself, and it is the guarantee in force: a tag cut from anything other than a freshly-scanned default branch would publish code no scanner has seen.
 
 ## Related Artifacts
 

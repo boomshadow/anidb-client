@@ -58,7 +58,7 @@ The same check runs on both sides of a tag: before one is created, and again in 
 
 ## Publishing
 
-Upload happens only from a tag, and only after every other stage has passed. It uses **OIDC trusted publishing**: PyPI verifies a short-lived identity token issued by GitLab rather than a stored API token, so there is no upload credential in the pipeline at all.
+Upload happens only from a tag, and only after the checks that run on a tag have passed — validate, test and build. The scanners are not among them: they run on merge requests, on the default branch and on the schedule, so the security stage is empty on a tag. SPEC-008 records what that does and does not guarantee. It uses **OIDC trusted publishing**: PyPI verifies a short-lived identity token issued by GitLab rather than a stored API token, so there is no upload credential in the pipeline at all.
 
 PyPI's side of that trust is configured against four things — the namespace, the project name, the path of the top-level pipeline file, and the deployment environment the job declares. The job's *name* is not among them, so renaming the job is safe while moving the environment declaration to a different job is not.
 
@@ -102,7 +102,7 @@ A release is cut from a maintainer's machine, in one step, with the pipeline doi
 
 That version-bump commit is the only thing pushed to the default branch outside a merge request. Its subject is a conventional commit like any other, so the same check applies to it. It also has to actually take effect: the declared version is read out of a source file at build time, so the build cache is keyed on that file explicitly, or the release commit would install metadata describing the version before it.
 
-**Publishing precedes announcing.** The tag's pipeline is watched to a terminal state, and the release pages are created only once it is green — because PyPI is the step that cannot be taken back, and a release page describing a package that was never published is worse than a late one. Both pages get the same body, and the built artifacts are attached from the pipeline rather than rebuilt, so what is offered for download is what was published.
+**Publishing precedes announcing.** The tag's pipeline is watched to a terminal state, and the release pages are created only once it is green — because PyPI is the step that cannot be taken back, and a release page describing a package that was never published is worse than a late one. Both pages get the same body, and the built artifacts are attached from the pipeline rather than rebuilt, so what is offered for download is what was published. They are fetched into an emptied directory: build output is scratch, and a leftover artifact from an earlier version is close enough to the real thing to be attached to a release by mistake.
 
 **A red pipeline ends the release.** The tag stays where it is and the repair is the next version. Nothing about a failed release is undone, because none of it can be.
 

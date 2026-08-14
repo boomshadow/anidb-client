@@ -130,10 +130,15 @@ the announcement, and announcing a package that does not exist is the one orderi
 mistake worth avoiding.
 
 Fetch the built artifacts so the GitHub release carries the same files that were
-published, rather than a local rebuild:
+published, rather than a local rebuild. **Empty `dist/` first** — it is scratch, it is
+gitignored, and anything already in it is from an earlier build. A leftover wheel from a
+previous version is close enough to the real thing to be attached to the release without
+anyone noticing:
 
 ```bash
+rm -rf dist
 glab ci artifact <tag> build:dist
+ls dist/          # every file here must carry this release's version
 ```
 
 Then create both, with the **same body** — the paragraph followed by the generated list:
