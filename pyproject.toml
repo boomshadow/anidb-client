@@ -68,6 +68,23 @@ dev = [
 # cutoff in uv.lock.
 exclude-newer = "45 days"
 
+# What makes uv rebuild this project rather than reuse a cached build of it.
+#
+# DO NOT REMOVE THE SECOND ENTRY. It looks redundant and is not. uv's default keys
+# include the whole `src` directory, so listing one file inside it reads like belt and
+# braces -- but a *content* change to a file in `src` does not invalidate the cached
+# build. Measured against this exact uv version: bump `__version__` alone, sync, and the
+# installed metadata still reports the old number, with a fresh virtualenv and a warm
+# cache both.
+#
+# The version is read out of that file at build time, and the release bump is the one
+# commit in the project's history that changes it and nothing else. So without this key
+# the release commit installs metadata for the *previous* version, and the check that
+# the built artifact matches the tag fails on the release itself -- never on a merge
+# request, because no merge request ever bumps the version. Setting `cache-keys` at all
+# replaces uv's defaults, so `pyproject.toml` is restated here rather than inherited.
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/anidb_client/__init__.py" }]
+
 # Deliberate soak exceptions, each dated just past the release it admits so a further
 # bump has to be argued again rather than riding in on a standing waiver. **These are
 # temporary**: delete an entry once its pinned version passes 45 days on the date
