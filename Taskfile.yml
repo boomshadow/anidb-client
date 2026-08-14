@@ -116,8 +116,14 @@ tasks:
       - "{{.RUN}} uv lock --check"
 
   dist:
-    desc: Build the wheel and sdist into ./dist
+    desc: Build the wheel and sdist into ./dist (emptied first)
+    # `uv build` adds to the directory rather than replacing it, so without this the
+    # output of every previous build accumulates. That matters beyond tidiness: the
+    # release process attaches what it finds in here, and a wheel from an earlier
+    # version looks close enough to the real thing to be published alongside it.
+    # Treat ./dist as scratch that belongs to exactly one build.
     cmds:
+      - rm -rf dist
       - "{{.RUN}} uv build"
 
   check:title:
