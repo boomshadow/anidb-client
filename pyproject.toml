@@ -8,7 +8,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Jacob Tirey", email = "jacob@tirey.io" }]
 keywords = ["anidb", "anime", "udp", "api", "client", "mylist"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
