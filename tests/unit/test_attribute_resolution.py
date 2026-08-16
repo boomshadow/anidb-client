@@ -96,11 +96,13 @@ class TestRelations:
         assert anidb.Episode(anime=6187, epno="5").relations is None
 
     def test_an_anime_still_uses_its_own_property(self, anidb, session, link):
-        """Anime declares `relations`, so __getattr__ never sees it.
+        """Anime declares `relations`, so ordinary lookup answers with the property.
 
-        Pinned because the fix changes the branch Anime was already bypassing,
-        and the property returns a different shape -- (type, Anime) pairs rather
-        than rows.
+        Pinned because the fix changes the branch Anime bypasses, and the two
+        return different shapes -- (type, Anime) pairs here, rows there. "Never
+        sees it" is what this test used to claim, and it was not true: a property
+        that raises AttributeError falls through to __getattr__ like any missing
+        attribute, which is how the rows escaped. See TestDeclaredProperties.
         """
         anime = factories.make_anime(aid=6187)
         session.add(anime)
@@ -114,3 +116,45 @@ class TestRelations:
         relations = anidb.Anime(6187).relations
 
         assert [relation_type for relation_type, _anime in relations] == ["sequel"]
+
+
+class TestDeclaredProperties:
+    """The fall-through must not answer for a name the class declares itself.
+
+    Python calls __getattr__ whenever ordinary lookup raises AttributeError, and
+    a property whose getter raises one is indistinguishable from an attribute
+    that was never there. So a broken property silently became a read of the
+    cached row -- a different value, of a different shape, under the same name,
+    with no error anywhere near the property at fault. That is one bug per
+    property rather than one bug; refusing here retires the category.
+    """
+
+    def test_a_property_that_raises_is_refused_rather_than_answered_off_the_row(self, anidb, session, monkeypatch):
+        """The exact substitution that produced the reported TypeError.
+
+        The row's `relations` are AnimeRelationTable objects and the property's
+        are (type, Anime) pairs. Answering with the former where the latter was
+        promised does not fail here -- it fails in the caller, unpacking.
+        """
+        anime_row = factories.make_anime(aid=6187)
+        session.add(anime_row)
+        session.commit()
+        session.add(factories.make_relation(anime_pk=anime_row.pk, related_aid=7))
+        session.commit()
+        anime = anidb.Anime(6187)
+
+        def raises_attributeerror(_self):
+            raise AttributeError("something inside the getter went wrong")
+
+        monkeypatch.setattr(type(anime), "relations", property(raises_attributeerror))
+
+        with pytest.raises(AttributeError, match="Anime.relations is a property"):
+            _ = anime.relations
+
+    def test_an_undeclared_name_still_falls_through_to_the_row(self, cached_file):
+        """The guard is a refusal, not a wall.
+
+        Almost every read in the object layer is of a name no class declares, and
+        those must go on being answered from the cached row.
+        """
+        assert cached_file.fid == 12345
