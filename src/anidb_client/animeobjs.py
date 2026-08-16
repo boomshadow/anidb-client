@@ -16,7 +16,9 @@
 # along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 
 import contextlib
+import dataclasses
 import datetime
+import enum
 import json
 import math
 import os
@@ -68,6 +70,50 @@ from anidb_client.responses import Response
 # gives the UDP ban back-off a ceiling to avoid: a client that has, for practical
 # purposes, stopped, while reporting only that it is waiting.
 FANART_MAX_BACKOFF = 300
+
+# How many anime a relation walk reaches before it stops. The graph's components are
+# not all the size of a show: an `other` edge out of a franchise entry reaches that
+# franchise's ancestor and, through it, decades of series (SPEC-010 records the
+# measurement). Sized so an ordinary series and its side stories complete several
+# times over -- the largest cluster measured is under ten -- while a franchise-scale
+# component does not, because every anime reached can cost a request to an API that
+# bans clients for asking too often. A caller who wants a larger walk raises it.
+#
+# It caps work, not relevance. What a walk should *mean* is the caller's to decide,
+# and ADR-005 is why the library does not decide it for them.
+DEFAULT_RELATION_BUDGET = 20
+
+
+class RelationWalkStop(enum.StrEnum):
+    """What ended a relation walk short of the whole connected component."""
+
+    BUDGET = "budget"
+    DEPTH = "depth"
+    UNKNOWN_ANIME = "unknown anime"
+
+
+@dataclasses.dataclass(frozen=True)
+class RelatedAnime:
+    """What a relation walk reached, and whether that was all there was.
+
+    `related` pairs every anime reached with the relation type it was *first
+    reached by* -- the last edge of the route, not a summary of the route.
+
+    `stopped_by` is the whole point of this being an object rather than a list.
+    "Nine anime because that is all there are" and "nine because the budget ran
+    out" must not look identical to a caller: an answer shaped like a complete
+    one that is not is worse than an error, because the caller acts on it and has
+    no reason to doubt it. None means the walk ran out of graph, which is the only
+    complete answer there is.
+    """
+
+    root: Anime
+    related: list[tuple[str, Anime]]
+    stopped_by: RelationWalkStop | None = None
+
+    @property
+    def truncated(self) -> bool:
+        return self.stopped_by is not None
 
 
 def _required[T](value: T | None, what: str) -> T:
@@ -681,40 +727,99 @@ class Anime(AniDBObj):
                 relations = [(x.relation_type, Anime(x.related_aid)) for x in self.db_data.relations]
         return relations
 
-    def related_anime(self, exclude: Iterable[Anime] | None = None, only_in_mylist: bool = True) -> list[Anime]:
-        """Walk this anime's relations transitively and return the connected set.
+    def related_anime(
+        self,
+        exclude: Iterable[Anime] | None = None,
+        follow: Iterable[str] | None = None,
+        depth: int | None = None,
+        budget: int = DEFAULT_RELATION_BUDGET,
+        only_in_mylist: bool = False,
+    ) -> RelatedAnime:
+        """Walk this anime's relations transitively and report what was reached.
 
-        The returned list starts with this Anime, followed by every Anime
-        reachable by following relation links. `exclude` is an iterable of Anime
-        treated as walls: neither returned nor traversed through. While
-        `only_in_mylist` is set the walk follows only anime that are in mylist,
-        which stops a single sequel link from dragging in an entire franchise.
+        Every anime comes back paired with the relation type it was *first
+        reached by* -- the last edge, not a description of the route. AniDB's
+        types are its own judgement of how two entries relate, so they are
+        returned as data; this library applies none of them on the caller's
+        behalf (SPEC-010, ADR-005).
+
+        `follow` names the relation types to traverse, and follows all of them
+        when it is None. An anime reached only by a type outside the set is
+        neither returned nor traversed through. `exclude` is an iterable of Anime
+        treated the same way: walls. `only_in_mylist` follows only anime already
+        in the caller's mylist, which is a use-case filter rather than a safety
+        one, and is off unless asked for.
+
+        The walk is bounded by `budget` -- the number of anime it may reach --
+        and optionally by `depth`, counting this anime's own relations as one.
+        Those bounds cap work; they decide nothing about relevance. AniDB's graph
+        has components far larger than any caller means by "this show", and every
+        anime reached can cost a request to an API that bans clients for asking
+        too often.
+
+        A walk that stopped early says which bound stopped it. See RelatedAnime.
         """
         excluded = list(exclude) if exclude else []
-        found: list[Anime] = [self]
-        queue: list[Anime] = []
+        followed = set(follow) if follow is not None else None
+        found: list[tuple[str, Anime]] = []
+        # (relation type, anime, distance from self). Appended to while it is
+        # being walked: that is the traversal, not an accident. Anime relations
+        # form a cyclic graph -- every sequel link has a matching prequel link
+        # back -- so the membership checks below are what terminate the walk.
+        queue: list[tuple[str, Anime, int]] = []
+        stopped_by: RelationWalkStop | None = None
 
-        def _followable(anime: Anime) -> bool:
+        def _followable(relation_type: str, anime: Anime) -> bool:
             # Anime defines __eq__ but not __hash__, so it is unhashable and
             # membership here is list scans rather than set lookups. Relation
             # neighbourhoods are small enough that this does not matter.
-            if anime in excluded or anime in found or anime in queue:
+            if followed is not None and relation_type not in followed:
+                return False
+            if anime == self or anime in excluded:
+                return False
+            if any(anime == seen for _type, seen in found) or any(anime == queued for _type, queued, _at in queue):
                 return False
             return not only_in_mylist or bool(anime.in_mylist)
 
         try:
-            queue.extend(a for _relation_type, a in self.relations if _followable(a))
-            # `queue` is appended to while it is being iterated: that is the
-            # traversal, not an accident. Anime relations form a cyclic graph
-            # (every sequel link has a matching prequel link back), so the
-            # _followable membership checks above are what terminate the walk.
-            for anime in queue:
-                found.append(anime)
-                queue.extend(a for _relation_type, a in anime.relations if _followable(a))
+            queue.extend((rtype, a, 1) for rtype, a in self.relations if _followable(rtype, a))
+            index = 0
+            while index < len(queue):
+                relation_type, anime, distance = queue[index]
+                index += 1
+                if len(found) >= budget:
+                    # Checked before taking the entry, not after adding it, so a
+                    # walk whose last anime exactly spends the budget reports
+                    # itself complete -- which it is. There is a queue entry left
+                    # here, so this one really is short of the whole graph.
+                    stopped_by = RelationWalkStop.BUDGET
+                    break
+                if depth is not None and distance >= depth:
+                    # Reached, but not walked through. Reported as a bound whether
+                    # or not anything lay beyond it: finding out means reading the
+                    # relations of every anime on the boundary, which costs exactly
+                    # the requests the bound was set to prevent -- and for the same
+                    # reason these are the one kind of entry here that has not been
+                    # resolved, only named by the anime that pointed at them.
+                    found.append((relation_type, anime))
+                    stopped_by = RelationWalkStop.DEPTH
+                    continue
+                # Read before recording, so an id AniDB turns out not to have is
+                # not in the answer. It is the read that discovers that, and an
+                # anime marked illegal raises on every attribute -- returning one
+                # hands the caller something that explodes rather than something
+                # that is merely unhelpful.
+                relations = anime.relations
+                found.append((relation_type, anime))
+                queue.extend((rtype, a, distance + 1) for rtype, a in relations if _followable(rtype, a))
         except IllegalAnimeObject as e:
+            # One bad edge does not cost the caller the whole answer -- but a
+            # partial answer that does not say it is partial is worse than the
+            # exception, so this is reported rather than only logged.
             anidb_client.log.warning(f"Stopped walking relations for {self} after {len(found)} anime: {e}")
+            stopped_by = RelationWalkStop.UNKNOWN_ANIME
 
-        return found
+        return RelatedAnime(root=self, related=found, stopped_by=stopped_by)
 
     def extid(self, source: str, id_type: str = "tv") -> str | list[str] | None:
         if source == "thetvdb":
