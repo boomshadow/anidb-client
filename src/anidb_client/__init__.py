@@ -30,19 +30,31 @@ import anidb_client.db
 import anidb_client.errors
 from anidb_client import errors as adbb_errors
 from anidb_client.anames import get_titles, update_anilist, update_animetitles
-from anidb_client.animeobjs import Anime, AnimeTitle, Episode, File, Group
+from anidb_client.animeobjs import (
+    DEFAULT_RELATION_BUDGET,
+    Anime,
+    AnimeTitle,
+    Episode,
+    File,
+    Group,
+    RelatedAnime,
+    RelationWalkStop,
+)
 from anidb_client.link import AniDBLink
 
 # The library's public surface. Declared explicitly so that re-exports here are
 # understood as the API rather than as unused imports, and so `from anidb_client import *`
 # cannot leak internals.
 __all__ = [
+    "DEFAULT_RELATION_BUDGET",
     "AniDBLink",
     "Anime",
     "AnimeTitle",
     "Episode",
     "File",
     "Group",
+    "RelatedAnime",
+    "RelationWalkStop",
     "close",
     "close_session",
     "download_fanart",

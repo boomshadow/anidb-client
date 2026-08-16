@@ -260,14 +260,47 @@ Return external ID(s) for this anime. Valid `id_type` values are `'tv'` and
 at the source, or `None` when no valid mapping exists for the combination.
 
 ```python
-related_anime(exclude=None, only_in_mylist=True)
+related_anime(exclude=None, follow=None, depth=None, budget=20, only_in_mylist=False)
 ```
 
-Walk this anime's relations transitively and return the connected set, starting
-with the anime itself. `exclude` is an iterable of `Anime` treated as walls:
-neither returned nor traversed through. While `only_in_mylist` is set the walk
-follows only anime already in your mylist, which stops one sequel link from
-dragging in an entire franchise.
+Walk this anime's relations transitively and report what was reached.
+
+Returns a `RelatedAnime` with three attributes: `root` (the anime you started
+from), `related` (every anime reached, as the same `(relation_type, Anime)`
+pairs `relations` uses), and `stopped_by` (the bound that ended the walk, or
+`None` if it ran out of graph — `truncated` is the same thing as a boolean).
+
+AniDB is the authority on what belongs to a show, so this hands you its answer
+whole rather than deciding on your behalf. The relation type comes back with
+every anime, and no type is filtered unless you ask:
+
+* `follow` names the relation types to traverse, and follows all of them when
+  unset. An anime reached only by a type outside the set is neither returned nor
+  traversed through.
+* `exclude` is an iterable of `Anime` treated as walls, the same way.
+* `only_in_mylist` follows only anime already in your mylist. It is a use-case
+  filter for cataloguing a collection, not a safety one, and is off by default.
+
+The walk is bounded by `budget` — how many anime it may reach — and optionally
+by `depth`, counting this anime's own relations as one. These cap work, not
+relevance: AniDB's graph contains components far larger than any caller means by
+"this show", and every anime reached can cost a rate-limited request.
+
+```python
+result = anidb_client.Anime(11372).related_anime(
+    follow=("sequel", "prequel", "side story", "parent story"),
+)
+for relation_type, anime in result.related:
+    print(relation_type, anime.title)
+if result.truncated:
+    print(f"stopped early: {result.stopped_by}")
+```
+
+A note on `other`: it carries both a franchise's ancestor and entries belonging
+to the show itself, so no relation-type filter is right for everyone. That is
+why the type is returned to you rather than applied here. A reasonable pattern is
+a story-relations walk for the reliable core, plus a look at the root's own
+`other` links judged by title and date.
 
 ### Episode
 
