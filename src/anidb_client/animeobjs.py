@@ -424,6 +424,32 @@ class AniDBObj:
         return super().__getattribute__(attr)
 
     def __getattr__(self, name: str) -> Any:
+        """The implicit half of attribute resolution: everything the class does not declare.
+
+        Python calls this only after ordinary lookup has raised AttributeError,
+        and for a name the class declares as a property that means the property's
+        own getter raised one: the language cannot tell "there is no such
+        attribute" from "the getter tripped over one". Answering off the cached
+        row in its place is how one name comes to have two shapes --
+        `Anime.relations` answers (type, Anime) pairs and the row answers
+        AnimeRelationTable objects, so an anime the cache had never seen answered
+        its relations as rows, and the caller unpacking them failed somewhere else
+        entirely, with nothing in the traceback naming the property at fault.
+
+        So this refuses, and names the property to go and look at, because the
+        original AttributeError has already been swallowed by the time we are
+        here. A property that means to use the fall-through calls
+        `_resolve_cached_attribute` directly, which is not this path.
+        """
+        if isinstance(getattr(type(self), name, None), property):
+            raise AttributeError(
+                f"{type(self).__name__}.{name} is a property, and it raised AttributeError. "
+                f"The attribute fall-through will not answer in its place: it reads the cached "
+                f"row, which need not hold the same shape the property returns. Fix the property."
+            )
+        return super().__getattribute__("_resolve_cached_attribute")(name)
+
+    def _resolve_cached_attribute(self, name: str) -> Any:
         # `Any` is the honest answer and the boundary of what this module can be
         # checked at: this forwards to whichever column of whichever cached row
         # carries `name`, answering None for one that does not exist. A caller
@@ -620,6 +646,24 @@ class Anime(AniDBObj):
 
     @property
     def relations(self) -> list[tuple[str, Anime]]:
+        if not self.db_data:
+            # An anime the cache has never seen, resolved here the way every other
+            # attribute read resolves one. Without this the read was
+            # `None.relations`, and an AttributeError raised inside a property is
+            # indistinguishable to Python from the property not existing: it called
+            # __getattr__ on the same name, which answered with the row's own
+            # relation objects instead of these pairs.
+            #
+            # It never showed up on a direct read, only from the second hop of
+            # related_anime() -- the walk's own starting anime is one the caller
+            # asked for and so has a row, while the anime it reaches through that
+            # anime's relations may be ones nobody has ever asked about.
+            self.update_if_old(block=True)
+            if not self.db_data:
+                # Asked and still nothing cached: a reply that carried no anime, or
+                # a cache write that failed (SPEC-003 makes those best-effort). No
+                # relations is the honest answer and is the shape callers expect.
+                return []
         try:
             relations = [(x.relation_type, Anime(x.related_aid)) for x in self.db_data.relations]
         except sqlalchemy.orm.exc.DetachedInstanceError:
@@ -876,12 +920,20 @@ class Episode(AniDBObj):
 
     @property
     def eid(self) -> int | None:
-        eid: int | None = self.__getattr__("eid")
+        # The resolver rather than `self.eid`, which is this property, and rather
+        # than `__getattr__`, which now refuses to answer for a declared property
+        # -- this is the one place that wants the fall-through *deliberately*, to
+        # read the cached row for the same name the property is declared under.
+        eid: int | None = self._resolve_cached_attribute("eid")
         if eid:
             return eid
         elif self.db_data and not self.db_data.eid:
             self.update(True)
-        result: int | None = self.db_data.eid
+        # `self.db_data.eid` unguarded. The fetch above is not obliged to leave a
+        # row behind, and reading through None raised AttributeError -- which the
+        # fall-through answered by fetching a second time and returning None
+        # anyway. Same answer, one fewer rate-limited request to reach it.
+        result: int | None = self.db_data.eid if self.db_data else None
         return result
 
     def __init__(
@@ -1149,7 +1201,12 @@ class File(AniDBObj):
         # wait for any update process to finish
         self._updating.acquire()
         self._updating.release()
-        if not self.db_data and not self.db_data.ed2khash:
+        # `not self.db_data and not self.db_data.ed2khash`: the second clause was
+        # only ever evaluated when the first was true -- when db_data was None --
+        # so it never tested a hash, it raised AttributeError reading through None.
+        # The fetch below is what the read then reached anyway, by way of the
+        # fall-through. Stated directly, it is the condition that was meant.
+        if not self.db_data:
             self.update_if_old(block=True)
         if self.db_data:
             self._ed2khash = self.db_data.ed2khash
