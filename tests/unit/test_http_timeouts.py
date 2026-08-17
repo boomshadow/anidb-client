@@ -12,7 +12,6 @@ reproducing a half-open server here would test CPython's socket module rather
 than this library.
 """
 
-import logging
 import pathlib
 import tempfile
 import urllib.request
@@ -94,7 +93,10 @@ class TestTitleCacheFetch:
     """
 
     def test_the_xml_fetch_passes_a_timeout(self, urlopen, tmp_path, monkeypatch):
-        monkeypatch.setattr(anidb_client, "log", logging.getLogger("anidb_client.test"), raising=False)
+        # Nothing installs a logger here. This test used to, which is why it never
+        # saw that the fetch it covers logged through a global that was None until
+        # init() -- see tests/unit/test_xml_cache_fetch.py.
+        #
         # Take the non-posix branch of the cache-path choice so the download lands
         # in tmp_path instead of /var/tmp. Everything else here is the real thing:
         # a real temp file is written, renamed, and left in the test's own tmp_path.

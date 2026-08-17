@@ -62,10 +62,7 @@ def _enum_converter[T: enum.StrEnum](table: Mapping[str, T], field: str) -> Call
         try:
             return table[value]
         except KeyError:
-            # `log` is None until init() runs. Nothing reaches a response converter
-            # before then, but a warning path must not be the thing that raises.
-            if anidb_client.log is not None:
-                anidb_client.log.warning(f"Unknown AniDB {field} code {value!r}; leaving the field unset")
+            anidb_client.log.warning(f"Unknown AniDB {field} code {value!r}; leaving the field unset")
             return None
 
     return convert

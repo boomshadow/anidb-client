@@ -93,12 +93,23 @@ anidb_api_version = 3
 # transfer, so it ends a stalled connection but not a pathologically slow one.
 HTTP_TIMEOUT = 30
 
-# Typed as a Logger though it starts as None: init() is the only entry point to
-# this library and sets it before anything that logs can be reached, so annotating
-# it optional would put a None check on every logging call to describe a state
-# they cannot be in. mapper.py, whose converters a caller's own test can reach
-# before init(), guards explicitly and has a test for it.
-log: logging.Logger = None  # type: ignore[assignment]
+# A real logger from the moment the package is imported, rather than None until
+# init() fills it in. init() either replaces this with the caller's own logger or
+# configures this very object -- it is what logging.getLogger(__name__) returns
+# there too -- so nothing is lost by having it exist early.
+#
+# What it buys is that no logging call has to ask whether logging is available
+# yet. The claim that nothing which logs is reachable before init() was not true:
+# the two bulk XML fetches are reachable through update_anilist() and
+# update_animetitles(), which this package exports, and a log call on that path
+# raised AttributeError over the fetch it was reporting on. A guard at each call
+# site is the wrong shape for that -- there are around a hundred of them, and the
+# one that mattered was the one nobody thought to guard.
+#
+# Before a handler is configured, logging's own last-resort handler carries a
+# warning to standard error and drops anything below it. That is the ordinary
+# behaviour of a library that logs before its host has set logging up.
+log: logging.Logger = logging.getLogger(__name__)
 _anidb: AniDBLink | None = None
 _sessionmaker: sqlalchemy.orm.sessionmaker[sqlalchemy.orm.Session] | None = None
 fanart_key: str | None = None

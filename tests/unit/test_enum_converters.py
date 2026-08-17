@@ -30,7 +30,7 @@ from tests.objectlayer import FakeResponse
 
 @pytest.fixture
 def log(monkeypatch):
-    """mapper logs through the library logger, which is None until init()."""
+    """Route the library's logging to a logger these tests can read with caplog."""
     import anidb_client
 
     logger = logging.getLogger("anidb_client.test")
@@ -66,15 +66,13 @@ def test_an_unknown_code_is_reported(table, field, log, caplog):
 
 
 @pytest.mark.parametrize(("table", "field"), CONVERTERS)
-def test_an_unknown_code_does_not_raise_before_init_has_set_a_logger(table, field, monkeypatch):
+def test_an_unknown_code_does_not_raise_before_init_has_configured_logging(table, field):
     """The warning path must not itself be the thing that raises.
 
-    `log` is None until init() runs. Nothing should reach a response converter
-    before then, but a guard that only works after initialisation is not a guard.
+    Nothing should reach a response converter before init(), but a guard that only
+    works after initialisation is not a guard. No logger is installed here: the
+    converter reports through the package's own, which exists from import.
     """
-    import anidb_client
-
-    monkeypatch.setattr(anidb_client, "log", None, raising=False)
     convert = getattr(mapper, table)[field]
 
     assert convert("9999") is None
