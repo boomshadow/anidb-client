@@ -87,11 +87,15 @@ def update_xml(url: str) -> str | None:
     if not os.access(tmp_dir, os.W_OK):
         raise AniDBError(f"Can't get writeable temp path: {tmp_dir}")
 
-    old_file_exists = os.path.isfile(cache_file)
-    if old_file_exists:
+    # None when there is no copy on disk. Read once, here, rather than again on a
+    # failure path: it is what decides whether a failed refresh has anything to
+    # fall back on, and stating it as the date avoids asking the filesystem a
+    # second question whose answer may have changed in between.
+    old_file_moddate = None
+    if os.path.isfile(cache_file):
         stat = os.stat(cache_file)
-        file_moddate = datetime.datetime.fromtimestamp(stat.st_mtime)
-        if file_moddate > (datetime.datetime.now() - _update_interval):
+        old_file_moddate = datetime.datetime.fromtimestamp(stat.st_mtime)
+        if old_file_moddate > (datetime.datetime.now() - _update_interval):
             return cache_file
 
     now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S.%f")
@@ -107,19 +111,18 @@ def update_xml(url: str) -> str | None:
             anidb_client.log.info(f"Fetching cache file from {url}")
             f.write(res.read())
     except (OSError, urllib.error.URLError) as err:
-        anidb_client.log.error(f"Failed to fetch {url}: {err}")
+        _discard(tmp_file)
+        answer = _refresh_failed(cache_file, old_file_moddate, f"Failed to fetch {url}: {err}")
+        # After the line above, so the reason reads before the hint rather than
+        # under it. A failed fetch of the titles export is most often a ban.
         anidb_client.log.info(
             "You may be temporarily IP-banned from AniDB; bans are automatically lifted after 24 hours!"
         )
-        _discard(tmp_file)
-        if old_file_exists:
-            return cache_file
-        return None
+        return answer
 
     if not _verify_xml_file(tmp_file):
-        anidb_client.log.error(f"Failed to verify xml file: {tmp_file}")
         _discard(tmp_file)
-        return None
+        return _refresh_failed(cache_file, old_file_moddate, f"The document fetched from {url} did not verify")
 
     os.rename(tmp_file, cache_file)
     return cache_file
@@ -222,6 +225,41 @@ def update_animetitles() -> None:
     titles = _read_anidb_xml(xml_file)
 
 
+def _refresh_failed(cache_file: str, modified: datetime.datetime | None, reason: str) -> str | None:
+    """Answer a refresh that produced nothing with the copy already on disk.
+
+    Both ways a refresh can fail come through here, because they leave the caller
+    in the same position. A server that cannot be reached and a document that
+    arrives unusable are the same situation from here: the copy from last time is
+    still on disk, is still the last thing that passed verification, and is still
+    a better answer than an error. nginx makes the same call, listing an invalid
+    response alongside an unreachable one as a reason to serve what it has.
+
+    Falling back never means trusting the bad download -- that is discarded before
+    this is called. What stays in use is the copy that already met the same bar.
+    This is why it is not the reasoning that governs a lockfile hash: the check
+    here is a sanity check against truncation, not an integrity boundary, and
+    carrying on does not lower the bar that was already met.
+
+    The level states the outcome rather than the event. Having fallen back is a
+    warning: nothing the caller asked for has failed, and it is about to get an
+    answer. Having nothing to fall back on is an error, because the caller is
+    about to be told so instead (SPEC-003).
+    """
+    if modified is None:
+        anidb_client.log.error(f"{reason}, and there is no cached copy to fall back on")
+        return None
+
+    hours = (datetime.datetime.now() - modified).total_seconds() / 3600
+    # The age, not just the fact: refreshes that keep failing are survived
+    # indefinitely, so how old the answer has become is the part an operator can
+    # act on, and the only place it is visible.
+    anidb_client.log.warning(
+        f"{reason}; continuing with the cached copy from {modified:%Y-%m-%d %H:%M} ({hours:.0f}h old)"
+    )
+    return cache_file
+
+
 def _discard(tmp_file: str) -> None:
     """Remove a download that is not going to be moved into place.
 
@@ -246,7 +284,10 @@ def _verify_xml_file(path: str) -> bool:
     try:
         tmp_xml = _read_anidb_xml(path)
     except Exception as e:
-        anidb_client.log.error(f"Exception when reading xml file: {e}")
+        # Why the document failed, not what became of the caller -- the outcome
+        # line follows from _refresh_failed(), and is the one that states whether
+        # this was survived.
+        anidb_client.log.warning(f"Exception when reading xml file: {e}")
         return False
 
     if tmp_xml is None:
