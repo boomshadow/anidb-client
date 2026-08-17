@@ -50,7 +50,18 @@ type TitleMatch = tuple[int, list[anidb_client.animeobjs.AnimeTitle], float, str
 # client name rather than being a generic default.
 _animetitles_useragent = "anidbclientpy"
 _animetitles_url = "https://anidb.net/api/anime-titles.xml.gz"
-_anime_list_url = "https://github.com/Anime-Lists/anime-lists/raw/master/anime-list.xml"
+# The mapping document lives in the Anime-Lists project's repository, whose page is
+# https://github.com/Anime-Lists/anime-lists -- recorded here because the raw host
+# below names the project and the branch but leads nowhere a human can read, and it
+# is the form that goes quietly wrong when the repository is renamed or its default
+# branch moves off master.
+#
+# Fetched from raw.githubusercontent.com rather than through github.com's own
+# /raw/ redirect: it is the canonical endpoint for file contents, it is one fewer
+# hop, and it is served by a path that stays up when github.com's application tier
+# does not -- which is how a GitHub incident once looked exactly like this URL
+# having died.
+_anime_list_url = "https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list.xml"
 iso_639_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ISO-639-2_utf-8.txt")
 _update_interval = datetime.timedelta(hours=36)
 
@@ -100,13 +111,14 @@ def update_xml(url: str) -> str | None:
         anidb_client.log.info(
             "You may be temporarily IP-banned from AniDB; bans are automatically lifted after 24 hours!"
         )
-        os.remove(tmp_file)
+        _discard(tmp_file)
         if old_file_exists:
             return cache_file
         return None
 
     if not _verify_xml_file(tmp_file):
         anidb_client.log.error(f"Failed to verify xml file: {tmp_file}")
+        _discard(tmp_file)
         return None
 
     os.rename(tmp_file, cache_file)
@@ -120,7 +132,7 @@ def update_anilist() -> None:
     anilist = {}
 
     xml_file = update_xml(_anime_list_url)
-    if not xml_file and not anilist:
+    if not xml_file:
         # Was sys.exit(2). Same reasoning as the transport: a library must not
         # terminate its host process over a failed cache fetch -- which is a
         # routine outcome when AniDB has temporarily IP-banned you.
@@ -195,10 +207,36 @@ def update_anilist() -> None:
 
 def update_animetitles() -> None:
     global titles
+    # Reset before the fetch, the way update_anilist() does, so that the guard
+    # below decides what happens on a failure. Reading the document into `titles`
+    # unconditionally meant a refresh that could not produce one assigned None
+    # over a table that was already loaded and then returned as though it had
+    # worked -- the caller found out one call later, from a vaguer error.
+    #
+    # A fetch that merely could not reach the network is not this case: update_xml
+    # answers with the copy already on disk (SPEC-003), which is re-read here.
+    titles = None
     xml_file = update_xml(_animetitles_url)
-    if not xml_file and not titles:
+    if not xml_file:
         raise AniDBFileError("Missing, and unable to fetch, list of anime titles")
     titles = _read_anidb_xml(xml_file)
+
+
+def _discard(tmp_file: str) -> None:
+    """Remove a download that is not going to be moved into place.
+
+    Every way out of update_xml that is not the rename comes through here. The
+    temporary name carries a timestamp, so a file left behind is never picked up
+    by a later attempt -- it is simply never cleaned up either, and one accumulates
+    per failure in a directory the user did not choose.
+
+    Best-effort by design: a cleanup that raises would replace the fetch failure
+    being handled with a less informative one.
+    """
+    try:
+        os.remove(tmp_file)
+    except OSError as err:
+        anidb_client.log.warning(f"Could not remove the partial download {tmp_file}: {err}")
 
 
 def _verify_xml_file(path: str) -> bool:
