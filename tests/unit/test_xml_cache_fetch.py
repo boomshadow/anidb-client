@@ -1,4 +1,4 @@
-"""Fetching the two bulk XML documents: where from, and what a failure leaves behind.
+"""Fetching the two bulk XML documents: where from, what a failure answers with, and what it leaves behind.
 
 These cover `update_xml` and the two refresh entry points the package exports,
 around the fetch rather than through it -- urlopen is replaced, so nothing here
@@ -16,6 +16,7 @@ a logger: that is the point of them.
 import logging
 import os
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -181,6 +182,85 @@ class TestFetchingBeforeInit:
         monkeypatch.setattr(anidb_client.anames.os, "remove", refuse)
 
         assert anidb_client.anames.update_xml("https://example.invalid/anime-list.xml") is None
+
+
+class TestARefreshThatFailed:
+    """What a failed refresh answers with, and how loudly it says so.
+
+    The two ways a refresh can fail used to be handled differently: a server that
+    could not be reached fell back to the copy on disk, while a document that
+    arrived and did not verify reported total failure -- with the good copy still
+    sitting there, untouched, one line away. Detecting a bad download left the
+    caller worse off than never having tried. They are one situation now.
+    """
+
+    @pytest.fixture
+    def cached_copy(self, cache_dir):
+        """A cached document old enough that a refresh is attempted, 40h back."""
+        copy = cache_dir / "anime-list.xml"
+        copy.write_bytes(MINIMAL_XML)
+        stamp = time.time() - 40 * 3600
+        os.utime(copy, (stamp, stamp))
+        return copy
+
+    @pytest.fixture
+    def corrupt_download(self, monkeypatch):
+        """A download that arrives and does not verify -- truncated, or an error page."""
+        fetch(monkeypatch)
+        monkeypatch.setattr(anidb_client.anames, "_verify_xml_file", lambda _path: False)
+
+    def test_a_corrupt_download_falls_back_to_the_copy_on_disk(self, corrupt_download, cached_copy):
+        """The fix: a bad download is a failed fetch, not a worse outcome than one."""
+        result = anidb_client.anames.update_xml("https://example.invalid/anime-list.xml")
+
+        assert result == str(cached_copy)
+
+    def test_falling_back_does_not_overwrite_the_good_copy(self, corrupt_download, cached_copy):
+        """The bad bytes are discarded; what stays in use already passed the check."""
+        anidb_client.anames.update_xml("https://example.invalid/anime-list.xml")
+
+        assert cached_copy.read_bytes() == MINIMAL_XML
+
+    def test_a_corrupt_download_with_nothing_to_fall_back_on_still_answers_none(self, corrupt_download, cache_dir):
+        """A first fetch has no last-known-good, so this one does reach the caller."""
+        assert anidb_client.anames.update_xml("https://example.invalid/anime-list.xml") is None
+
+    def test_falling_back_warns_rather_than_errors(self, corrupt_download, cached_copy, caplog):
+        """The level states the outcome: the caller is about to get an answer."""
+        with caplog.at_level(logging.DEBUG, logger="anidb_client"):
+            anidb_client.anames.update_xml("https://example.invalid/anime-list.xml")
+
+        assert [r.levelname for r in caplog.records if r.levelname == "ERROR"] == []
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_falling_back_names_how_stale_the_answer_has_become(self, corrupt_download, cached_copy, caplog):
+        """Nothing bounds staleness, so the age is the only place drift is visible."""
+        with caplog.at_level(logging.WARNING, logger="anidb_client"):
+            anidb_client.anames.update_xml("https://example.invalid/anime-list.xml")
+
+        assert "40h old" in caplog.text
+
+    def test_having_nothing_to_fall_back_on_errors(self, corrupt_download, cache_dir, caplog):
+        """The caller is about to be told, so this one is not survivable."""
+        with caplog.at_level(logging.DEBUG, logger="anidb_client"):
+            anidb_client.anames.update_xml("https://example.invalid/anime-list.xml")
+
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+
+    def test_an_unreachable_server_warns_when_it_falls_back(self, cached_copy, monkeypatch, caplog):
+        """The fallback that already existed reports at the level of its outcome too.
+
+        It survives the failure and answers the caller, so it warns; it does not
+        get to log an error about something nothing noticed.
+        """
+        fetch(monkeypatch, error=OSError("connection reset"))
+
+        with caplog.at_level(logging.DEBUG, logger="anidb_client"):
+            result = anidb_client.anames.update_xml("https://example.invalid/anime-list.xml")
+
+        assert result == str(cached_copy)
+        assert [r.levelname for r in caplog.records if r.levelname == "ERROR"] == []
+        assert "connection reset" in caplog.text
 
 
 class TestARefreshThatCannotProduceADocument:
