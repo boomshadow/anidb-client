@@ -18,11 +18,11 @@ finished would read a cache the callback had not written yet.
 class FakeResponse:
     """The response surface the object-layer callbacks actually touch."""
 
-    def __init__(self, rescode, datalines=None, attrs=None):
+    def __init__(self, rescode, datalines=None, attrs=None, resstr=""):
         self.rescode = rescode
         self.datalines = datalines if datalines is not None else []
         self.attrs = attrs or {}
-        self.resstr = ""
+        self.resstr = resstr
         self.restag = None
 
 

@@ -324,9 +324,63 @@ or an `Anime` object. `epno` is a string or int; `eid` is an int.
 * `tmdb_episode` — as above, mapped to TMDB
 * `tmdbid` — TMDB ID for this episode, or `None`
 * `imdbid` — IMDB ID for this episode, or `None`
+* `in_mylist` — whether the local cache holds a mylist entry for this episode
 
 The following attributes are returned from the AniDB API: `length`, `rating`,
 `votes`, `title_eng`, `title_romaji`, `title_kanji`, `aired`, `type`.
+
+#### Methods
+
+```python
+add_to_mylist(state=None, watched=None, source=None, other=None)
+```
+
+Add a **generic** mylist entry for this episode — the same thing AniDB's *Add To
+My List* button creates, with no file on disk and no ed2k hash involved. This is
+the way to record "I have this episode" when the file you have is a re-encode
+AniDB will never recognise.
+
+`state`, `watched`, `source` and `other` mean what they do in
+`File.update_mylist()`. An unrecognised `state` raises rather than being quietly
+dropped.
+
+It **only ever adds**. The command carries no edit flag, so an episode that
+already has an entry is reported back as such and the existing entry — including
+one you added from another client, against a real file — is left untouched.
+Calling it twice is therefore harmless, which makes it safe to re-run after a
+crash. It costs exactly one AniDB request per call.
+
+Returns a `MylistAddition`:
+
+* `outcome` — a `MylistAddOutcome`: `ADDED`, `ALREADY_PRESENT` or `REJECTED`
+* `aid`, `episode_number` — what was asked for
+* `rescode`, `reason` — AniDB's own answer, so `330 NO SUCH ANIME` and
+  `340 NO SUCH EPISODE` stay distinguishable
+* `lid` — the existing entry's mylist ID when AniDB volunteers one, else `None`
+
+AniDB refusing the add is a returned result, not an exception. A request the
+transport could not deliver — a ban, a timeout — still raises, as every mylist
+write does.
+
+The episode number must name exactly one episode. `MYLISTADD` reads a missing or
+zero episode number as *every episode of the anime* and a negative one as *every
+episode up to it*, so `0`, `-12` and ranges like `5-7` are refused locally before
+anything reaches AniDB.
+
+```python
+anime = anidb_client.Anime(9227)
+for epno in ["1", "2", "3", "S1"]:
+    result = anidb_client.Episode(anime=anime, epno=epno).add_to_mylist(state="on hdd")
+    print(epno, result.outcome)
+```
+
+There is deliberately no batch call. A mylist write that cannot reach AniDB
+raises, and a batch that raises half way through a season would throw away the
+record of the episodes that had already landed — your own loop keeps it.
+
+Note that the local cache is **not** updated: AniDB returns no identifier for a
+file-less entry, so `in_mylist` will not know about the entry until something
+refreshes it from AniDB. See ADR-006.
 
 ### File
 

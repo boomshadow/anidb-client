@@ -61,7 +61,13 @@ from anidb_client.db import (
     GroupRelationTable,
     GroupTable,
 )
-from anidb_client.errors import AniDBCommandTimeoutError, AniDBError, AniDBFileError, IllegalAnimeObject
+from anidb_client.errors import (
+    AniDBCommandTimeoutError,
+    AniDBError,
+    AniDBFileError,
+    AniDBIncorrectParameterError,
+    IllegalAnimeObject,
+)
 from anidb_client.link import AniDBLink
 from anidb_client.responses import Response
 
@@ -114,6 +120,122 @@ class RelatedAnime:
     @property
     def truncated(self) -> bool:
         return self.stopped_by is not None
+
+
+class MylistAddOutcome(enum.StrEnum):
+    """What AniDB did with a generic mylist add.
+
+    Three answers, not two: "the entry is already there" is an ordinary result of
+    asking for an entry that exists, not a failure and not the same thing as
+    having created one. A caller recording what it put in someone's list has to
+    be able to tell those apart, and a boolean cannot.
+    """
+
+    ADDED = "added"
+    ALREADY_PRESENT = "already present"
+    REJECTED = "rejected"
+
+
+@dataclasses.dataclass(frozen=True)
+class MylistAddition:
+    """What one generic mylist add did, for the caller's own records.
+
+    `rescode` and `reason` are AniDB's own answer, carried through rather than
+    translated: a rejection is nearly always "no such anime" or "no such
+    episode", and which one it was is the caller's diagnostic, not ours.
+
+    `lid` is populated only when AniDB volunteers one, which for this command
+    means only alongside ALREADY_PRESENT -- the reply to a generic add carries a
+    count of entries created and no identifier for them (SPEC-004).
+    """
+
+    aid: int
+    episode_number: str
+    outcome: MylistAddOutcome
+    rescode: str
+    reason: str
+    lid: int | None = None
+
+
+def _viewed_parameters(watched: bool | datetime.datetime | None) -> tuple[int | None, int | None]:
+    """The `viewed` and `viewdate` MYLISTADD parameters for a `watched` argument.
+
+    Three states in one parameter, which is why this is worth naming: True and a
+    datetime both mean watched and differ only in whether AniDB is told when,
+    False means explicitly unwatched, and None means "do not send this at all" so
+    that an edit leaves the field as it was.
+    """
+    if watched:
+        viewdate = int(watched.timestamp()) if isinstance(watched, datetime.datetime) else None
+        return 1, viewdate
+    if watched is False:
+        return 0, None
+    return None, None
+
+
+def _wire_mylist_state(state: str | None) -> str | None:
+    """The wire value for a mylist state name, refusing one that has no value.
+
+    An unrecognised name used to select nothing and be dropped from the command,
+    so a typo produced a successful add whose entry AniDB filed under its own
+    default -- the caller was told the state it asked for had been recorded when
+    a different one had. The vocabulary is four words and the check costs no
+    request, so it fails here rather than in someone's collection.
+    """
+    if state is None:
+        return None
+    for wire_value, known in anidb_client.mapper.mylist_state_map.items():
+        if known == state:
+            return wire_value
+    vocabulary = ", ".join(repr(str(x)) for x in anidb_client.mapper.mylist_state_map.values())
+    raise AniDBIncorrectParameterError(f"{state!r} is not a mylist state; expected one of {vocabulary}")
+
+
+# An AniDB episode number: an optional single-letter type prefix -- S for a
+# special, C for a credit, T for a trailer, P for a parody, O for other -- and a
+# positive number. Deliberately does not admit a range ("5-7"), a negative number
+# or zero; see _single_episode_epno.
+_SINGLE_EPNO = re.compile(r"(?P<prefix>[A-Za-z]?)(?P<number>[0-9]+)")
+
+
+def _single_episode_epno(epno: str) -> str:
+    """One episode number, or a refusal naming why the value cannot be one.
+
+    MYLISTADD's episode number is not merely optional, it is *overloaded*: the
+    command reads a missing or zero epno as "every episode of this anime" and a
+    negative one as "every episode up to that one". So the difference between
+    adding one episode and adding five hundred is a value that an ordinary
+    upstream bug -- an unset variable, an empty string -- produces on its own,
+    against an API where the result cannot be undone in bulk.
+
+    A range is refused for a different reason: AniDB records one file covering
+    several episodes as a single ranged epno, so an Episode can legitimately
+    carry "5-7", and the API does not define what this command does with one.
+    Sending it would be shipping undefined behaviour rather than declining a
+    feature. Expanding it here would be neither -- it would make one call write
+    three entries, which is exactly the "did more than I asked" this guards.
+    """
+    match = _SINGLE_EPNO.fullmatch(epno.strip()) if epno else None
+    if match is None or not int(match["number"]):
+        raise AniDBIncorrectParameterError(
+            f"Episode number {epno!r} does not name exactly one episode. MYLISTADD reads a missing "
+            f"or zero episode number as every episode of the anime and a negative one as every "
+            f"episode up to it, so a generic add names one episode at a time -- '5', or 'S1' for a "
+            f"special. A ranged number is not accepted either; add each of its episodes."
+        )
+    return f"{match['prefix'].upper()}{int(match['number'])}"
+
+
+def _reply_read_by_the_caller(res: Response) -> None:
+    """Callback for a request whose reply is read on the thread that asked for it.
+
+    `AniDBLink.request` takes a callback and runs it on a thread of its own,
+    before settling the command's outcome with the same reply -- and a callback
+    that raises there fails that outcome instead of returning the answer, which
+    is how several hangs in this module began. A path that only needs to *read*
+    the reply therefore does so where it can be reasoned about, on its own
+    thread, from the response `_await_reply` hands back.
+    """
 
 
 def _required[T](value: T | None, what: str) -> T:
@@ -1139,6 +1261,95 @@ class Episode(AniDBObj):
         finally:
             self._updating.release()
 
+    def add_to_mylist(
+        self,
+        state: str | None = None,
+        watched: bool | datetime.datetime | None = None,
+        source: str | None = None,
+        other: str | None = None,
+    ) -> MylistAddition:
+        """Record this episode in the caller's mylist with no file to point at.
+
+        The AniDB web form's *Add To My List* button, reachable from code: a
+        generic entry naming an anime and an episode and nothing else. What it is
+        for is a collection AniDB cannot identify -- re-encoded, remuxed, or
+        simply never indexed -- where the file's hash will never match anything
+        and the anime and episode are the only real signal there is.
+
+        **It only ever adds.** The command carries no `edit`, which is what makes
+        that a property of the protocol rather than a promise of this method: an
+        episode that already has an entry is answered ALREADY_PRESENT and the
+        entry is left exactly as it was, whichever client created it. Nothing
+        here removes anything, so calling it twice is harmless and calling it
+        after a crash is the ordinary way to finish the job.
+
+        That is the whole difference from `File.update_mylist`, which enforces
+        one entry per episode by *removing* whatever already covers the episode,
+        and which cannot be reached at all without a file. See SPEC-004.
+
+        One request per call and no probe before it, because the protocol needs
+        no more than that. The cost of that is stated where it is felt: the local
+        cache is not written, because AniDB returns no identifier for a file-less
+        entry to write one against, so `in_mylist` will not know about this until
+        something refreshes it from AniDB.
+
+        A transport that cannot deliver the write -- banned, unanswered, refused
+        -- raises, as every mylist write in this library does. AniDB answering
+        "no such anime" is not that: the request arrived and was answered, and
+        the answer comes back as a REJECTED result naming the code.
+        """
+        # Before the aid: reading the episode number may be what resolves the
+        # cached row that the aid is then read from, for an Episode built from an
+        # eid alone.
+        epno = _single_episode_epno(self.episode_number)
+        state_value = _wire_mylist_state(state)
+        anime = self._anime
+        aid = anime.aid if anime is not None else self.db_data.aid if self.db_data else None
+        if aid is None:
+            raise IllegalAnimeObject(f"{self} does not know which anime it belongs to, so it cannot be added to mylist")
+        viewed, viewdate = _viewed_parameters(watched)
+
+        req = MyListAddCommand(
+            aid=aid,
+            generic=1,
+            epno=epno,
+            state=state_value,
+            viewed=viewed,
+            viewdate=viewdate,
+            source=source,
+            other=other,
+        )
+        res = self._await_reply(self._link().request(req, _reply_read_by_the_caller, prio=True))
+
+        lid = None
+        if res.rescode == "210":
+            outcome = MylistAddOutcome.ADDED
+            anidb_client.log.info(f"Added a generic mylist entry for {self}")
+        elif res.rescode == "310":
+            outcome = MylistAddOutcome.ALREADY_PRESENT
+            # AniDB returns the existing entry here, in the MYLIST reply's own
+            # format. Its identifier is the one this command ever volunteers, and
+            # it is not guaranteed even so -- a generic entry can come back with a
+            # zero in that field -- so it is reported when it is real and left
+            # None when it is not, rather than passed on as a 0 that reads like
+            # an id.
+            line = res.datalines[0] if res.datalines else {}
+            with contextlib.suppress(TypeError, ValueError):
+                lid = int(line.get("lid") or 0) or None
+            anidb_client.log.info(f"{self} is already in mylist; the existing entry was left as it was")
+        else:
+            outcome = MylistAddOutcome.REJECTED
+            anidb_client.log.warning(f"AniDB refused a generic mylist entry for {self}: {res.rescode} {res.resstr}")
+
+        return MylistAddition(
+            aid=aid,
+            episode_number=epno,
+            outcome=outcome,
+            rescode=res.rescode,
+            reason=res.resstr,
+            lid=lid,
+        )
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Episode):
             return NotImplemented
@@ -1757,7 +1968,6 @@ class File(AniDBObj):
     ) -> None:
         wait = threading.Event()
         self.update_if_old()
-        viewdate = None
         edit = False
         req = None
 
@@ -1789,14 +1999,7 @@ class File(AniDBObj):
         except IndexError:
             state_num = None
 
-        if watched:
-            if isinstance(watched, datetime.datetime):
-                viewdate = int(watched.timestamp())
-            viewed = 1
-        elif watched is False:
-            viewed = 0
-        else:
-            viewed = None
+        viewed, viewdate = _viewed_parameters(watched)
 
         # Make sure this episode isn't already in mylist
         if not self.lid:

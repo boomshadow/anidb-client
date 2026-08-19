@@ -16,7 +16,7 @@ import datetime
 import pytest
 from sqlalchemy import select
 
-from anidb_client.errors import AniDBBannedError, AniDBCommandTimeoutError
+from anidb_client.errors import AniDBBannedError, AniDBCommandTimeoutError, AniDBIncorrectParameterError
 from tests import factories
 from tests.objectlayer import FakeResponse
 
@@ -405,3 +405,223 @@ class TestMylistWritesThatCannotReachAniDB:
         link.on("MYLISTADD", FakeResponse("320"))
 
         cached_file.update_mylist(state="on hdd")
+
+
+class TestAddingAGenericEntryWithoutAFile:
+    """`Episode.add_to_mylist()`: the file-less add, for a collection AniDB cannot see.
+
+    The reason this exists beside `update_mylist()` rather than inside it is the
+    one-entry-per-episode rule: that rule is enforced by *removing* whatever
+    already covers the episode, which is the correct thing for a file that is
+    replacing another and the wrong thing entirely for "record that I have this".
+    Most of what follows is about the difference -- that this path adds, only
+    adds, and can be run twice.
+    """
+
+    def test_one_episode_is_one_request_naming_the_anime_and_the_episode(self, anidb, link):
+        """The whole command, asserted whole.
+
+        Equality rather than a field at a time, because what is *absent* is the
+        point: no lid, no fid, and above all no `edit`, which is what makes this
+        unable to overwrite an entry even in principle.
+        """
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))
+
+        anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd")
+
+        assert link.params_for("MYLISTADD") == [{"aid": 6187, "generic": 1, "epno": "5", "state": "1"}]
+
+    def test_nothing_is_sent_but_the_add(self, anidb, link):
+        """No probe before it and no read after it.
+
+        `update_mylist()` spends a lookup deciding whether an entry exists and
+        another afterwards recovering the identifier of the one it made. Neither
+        is needed to add a generic entry, and a season's worth of them is the
+        difference between two dozen requests and eighty against an API that bans
+        clients for asking too often.
+        """
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))
+
+        anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd")
+
+        assert link.commands() == ["MYLISTADD"]
+
+    def test_a_special_is_sent_in_anidbs_own_episode_vocabulary(self, anidb, link):
+        """S1 is episode 1 of the specials, not episode 1. The prefix is the whole
+        distinction, and dropping it would file a special as a regular episode."""
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))
+
+        result = anidb.Episode(anime=6187, epno="S1").add_to_mylist(state="on hdd")
+
+        assert link.params_for("MYLISTADD")[0]["epno"] == "S1"
+        assert result.episode_number == "S1"
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [("unknown", "0"), ("on hdd", "1"), ("on cd", "2"), ("deleted", "3")],
+    )
+    def test_each_mylist_state_maps_to_its_wire_value(self, anidb, link, state, expected):
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))
+
+        anidb.Episode(anime=6187, epno="5").add_to_mylist(state=state)
+
+        assert link.params_for("MYLISTADD")[0]["state"] == expected
+
+    def test_a_watched_datetime_is_sent_as_a_timestamp(self, anidb, link):
+        when = datetime.datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))
+
+        anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd", watched=when)
+
+        params = link.params_for("MYLISTADD")[0]
+        assert params["viewed"] == 1
+        assert params["viewdate"] == int(when.timestamp())
+
+    def test_an_entry_that_did_not_exist_reports_added(self, anidb, link):
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}], resstr="MYLIST ENTRY ADDED"))
+
+        result = anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd")
+
+        assert result.outcome is anidb.MylistAddOutcome.ADDED
+        assert (result.aid, result.episode_number) == (6187, "5")
+        assert result.rescode == "210"
+        assert result.lid is None, "a generic add is answered with a count of entries, never an identifier"
+
+    def test_an_entry_that_already_existed_reports_it_and_changes_nothing(self, anidb, link):
+        """The repeat case, and the one that has to be a result rather than an error.
+
+        A caller retried after a crash will meet this for everything it already
+        did. AniDB refuses the duplicate and returns the entry it already holds --
+        which is also the guarantee that a real, file-backed entry someone added
+        from another client is still there afterwards.
+        """
+        link.on(
+            "MYLISTADD",
+            FakeResponse("310", datalines=[{"lid": "9876", "eid": "96461"}], resstr="FILE ALREADY IN MYLIST"),
+        )
+
+        result = anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd")
+
+        assert result.outcome is anidb.MylistAddOutcome.ALREADY_PRESENT
+        assert result.lid == 9876
+        assert link.commands() == ["MYLISTADD"], "nothing is sent to make room for an entry we did not add"
+
+    def test_an_existing_entry_with_no_usable_identifier_reports_none(self, anidb, link):
+        """AniDB can answer a generic entry's identifier as 0.
+
+        A 0 passed through would read like an id to a caller storing it, and
+        would be one AniDB does not recognise. Absent is the honest answer.
+        """
+        link.on("MYLISTADD", FakeResponse("310", datalines=[{"lid": "0"}]))
+
+        result = anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd")
+
+        assert result.outcome is anidb.MylistAddOutcome.ALREADY_PRESENT
+        assert result.lid is None
+
+    def test_an_existing_entry_reported_without_any_fields_still_completes(self, anidb, link):
+        link.on("MYLISTADD", FakeResponse("310", datalines=[]))
+
+        result = anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd")
+
+        assert result.outcome is anidb.MylistAddOutcome.ALREADY_PRESENT
+        assert result.lid is None
+
+    @pytest.mark.parametrize(
+        ("rescode", "resstr"),
+        [("330", "NO SUCH ANIME"), ("340", "NO SUCH EPISODE"), ("320", "NO SUCH FILE")],
+    )
+    def test_a_refusal_by_anidb_is_a_result_not_an_exception(self, anidb, link, rescode, resstr):
+        """The request arrived and was answered; the answer was no.
+
+        Which "no" it was is the caller's diagnostic -- an anime AniDB does not
+        have is a different problem from an episode number that anime does not
+        have -- so the code and its text are carried through rather than
+        flattened into a single failure.
+        """
+        link.on("MYLISTADD", FakeResponse(rescode, resstr=resstr))
+
+        result = anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd")
+
+        assert result.outcome is anidb.MylistAddOutcome.REJECTED
+        assert (result.rescode, result.reason) == (rescode, resstr)
+
+    def test_a_banned_add_raises(self, anidb, link):
+        """A write the transport could not deliver is not a rejection.
+
+        The distinction the whole result type rests on: AniDB said no is data,
+        we never got to ask is an exception.
+        """
+        link.fails("MYLISTADD", AniDBBannedError("555 BANNED"))
+
+        with pytest.raises(AniDBBannedError):
+            anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd")
+
+    def test_an_unanswered_add_raises(self, anidb, link):
+        link.fails("MYLISTADD", AniDBCommandTimeoutError("MYLISTADD went unanswered"))
+
+        with pytest.raises(AniDBCommandTimeoutError):
+            anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd")
+
+    @pytest.mark.parametrize("epno", ["0", "-12", "5-7", "   ", "S", "1.5"])
+    def test_an_episode_number_that_is_not_one_episode_is_refused_before_anything_is_sent(self, anidb, link, epno):
+        """The guard that stops a one-episode call becoming a whole-series one.
+
+        MYLISTADD overloads this field: absent or zero means *every episode of
+        the anime*, and a negative number means every episode up to it. So an
+        unset variable upstream does not fail quietly here -- it writes several
+        hundred entries into someone's list, against an API with no bulk undo. A
+        range is refused separately because AniDB does not define what this
+        command does with one.
+
+        Refused locally, so it costs no request either.
+        """
+        with pytest.raises(AniDBIncorrectParameterError):
+            anidb.Episode(anime=6187, epno=epno).add_to_mylist(state="on hdd")
+
+        assert link.commands() == []
+
+    def test_a_state_that_is_not_a_state_is_refused_before_anything_is_sent(self, anidb, link):
+        """A typo used to select nothing and be dropped from the command.
+
+        The add then succeeded and AniDB filed the entry under its own default,
+        so the caller was told the state it asked for had been recorded when a
+        different one had. Carrying the state is the entire point of the call.
+        """
+        with pytest.raises(AniDBIncorrectParameterError) as raised:
+            anidb.Episode(anime=6187, epno="5").add_to_mylist(state="on hdd ")
+
+        assert "'on hdd'" in str(raised.value), "the message names the vocabulary that would have worked"
+        assert link.commands() == []
+
+    def test_no_state_at_all_sends_none_and_lets_anidb_default(self, anidb, link):
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))
+
+        anidb.Episode(anime=6187, epno="5").add_to_mylist()
+
+        assert "state" not in link.params_for("MYLISTADD")[0]
+
+    def test_the_local_cache_is_not_written(self, anidb, session, link):
+        """The documented limitation, pinned so it stays a decision.
+
+        AniDB returns no identifier for a file-less entry, and this library's
+        cached mylist rows are built around one -- so there is nothing to write a
+        faithful row from, and a row written without one is invisible to every
+        reader anyway. The consequence a caller feels is here in full:
+        `in_mylist` does not know about the entry until something refreshes it
+        from AniDB. Closing that costs a second request per episode and is the
+        obvious next iteration; it is not this one.
+        """
+        from anidb_client.db import FileTable
+
+        session.add(factories.make_anime(aid=6187))
+        session.add(factories.make_episode(aid=6187, eid=96461, epno="5"))
+        session.commit()
+        link.on("MYLISTADD", FakeResponse("210", datalines=[{"entrycnt": "1"}]))
+
+        episode = anidb.Episode(anime=6187, epno="5")
+        assert episode.add_to_mylist(state="on hdd").outcome is anidb.MylistAddOutcome.ADDED
+
+        with anidb.get_session() as check:
+            assert check.scalars(select(FileTable)).all() == []
+        assert anidb.Episode(anime=6187, epno="5").in_mylist is False

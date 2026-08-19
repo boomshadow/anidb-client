@@ -265,6 +265,28 @@ class TestResponseParsing:
 
         assert offenders == [], "field names with stray whitespace: " + "; ".join(offenders)
 
+    def test_file_already_in_mylist_carries_the_existing_entry(self):
+        """310 answers a MYLISTADD with the entry AniDB already holds.
+
+        The API definition words it as "the *current* record ... in the same
+        format as the MYLIST response", and this class named no fields at all --
+        so the reply arrived complete and was thrown away, mylist id included.
+        That is the one identifier a generic add can ever learn, and the whole
+        difference between telling a caller "already there" and telling them
+        which entry is already there.
+        """
+        payload = "9876|0|96461|6187|0|1750000000|1|0|||the one I ripped|0\n"
+        resolver = ResponseResolver(f"T001 310 FILE ALREADY IN MYLIST\n{payload}".encode())
+        resp = resolver.resolve(Command("MYLISTADD", aid=6187, epno="5", generic=1))
+        resp.parse()
+
+        line = resp.datalines[0]
+        assert line["lid"] == "9876"
+        assert line["eid"] == "96461"
+        assert line["aid"] == "6187"
+        assert line["mylist_state"] == "1"
+        assert line["mylist_other"] == "the one I ripped"
+
     def test_banned_reply_parses_without_a_request(self):
         """A ban arrives untagged, so there is no command to resolve it against."""
         resolver = ResponseResolver(b"555 BANNED\n")
