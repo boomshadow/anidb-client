@@ -37,6 +37,8 @@ from anidb_client.animeobjs import (
     Episode,
     File,
     Group,
+    MylistAddition,
+    MylistAddOutcome,
     RelatedAnime,
     RelationWalkStop,
 )
@@ -53,6 +55,8 @@ __all__ = [
     "Episode",
     "File",
     "Group",
+    "MylistAddOutcome",
+    "MylistAddition",
     "RelatedAnime",
     "RelationWalkStop",
     "close",

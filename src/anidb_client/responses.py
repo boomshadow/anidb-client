@@ -1218,12 +1218,17 @@ class FileAlreadyInMylistResponse(Response):
     """
     attributes:
 
-    data:
+    data: the existing mylist entry, in the MYLIST reply's format
     """
 
     codestr = "FILE_ALREADY_IN_MYLIST"
     codehead = ()
-    codetail = ()
+    # MYLISTADD answers this with "the *current* record ... in the same format as
+    # the MYLIST response", so the field list is that one rather than a second
+    # copy of it: one reply, described once. It used to be empty, which is not a
+    # reply that carries nothing -- it is the entry AniDB already holds for the
+    # episode, arriving in full and being discarded, identifier included.
+    codetail = MylistResponse.codetail
     coderep = ()
 
 
