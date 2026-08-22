@@ -92,7 +92,7 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "src/anidb_client/__init__.p
 [tool.uv.exclude-newer-package]
 
 [build-system]
-requires = ["hatchling==1.30.1"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
