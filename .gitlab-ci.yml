@@ -49,6 +49,10 @@ workflow:
       when: never
     - if: $CI_COMMIT_BRANCH
 
+# Auto-cancel pipelines superseded by a newer commit on the same branch.
+default:
+  interruptible: true
+
 ############################
 # Shared rules
 ############################
@@ -339,6 +343,8 @@ anchor-watch:
 publish:pypi:
   extends: .rules-tag-only
   stage: publish
+  # Uploads to PyPI, which never accepts a version twice. A half-done upload is unrecoverable.
+  interruptible: false
   image: *uv_image
   environment:
     name: pypi
