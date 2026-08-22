@@ -53,7 +53,7 @@ dev = [
     # driver, since which one to install is the application's choice.
     "psycopg2-binary==2.9.12",
     "ruff==0.15.20",
-    "mypy==2.1.0",
+    "mypy==2.2.0",
     "codespell==2.4.2",
     # Reads spec/ADR frontmatter for the INDEX generators (task spec-index / adr-index).
     "pyyaml==6.0.3",
