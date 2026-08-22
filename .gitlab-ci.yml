@@ -297,7 +297,7 @@ build:dist:
 anchor-watch:
   extends: .rules-merge-request-only-no-renovate
   stage: drift-detection
-  image: registry.gitlab.com/boomshadow/anchor-watch-image:2.0.1@sha256:baafe435f4b77d22d882cc57266292536f39b94af3fe3aa4a629b21a5a6b5269
+  image: registry.gitlab.com/boomshadow/anchor-watch-image:2.0.2@sha256:03f548c0d371400590837fdeb78284cfe8b2f8f6cd1a35f7ff0642e40b76395c
   needs:
     - job: validate:lockfile
       artifacts: false
