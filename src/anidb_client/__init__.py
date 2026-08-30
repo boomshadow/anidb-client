@@ -19,7 +19,6 @@ import logging
 import logging.handlers
 import netrc
 import os
-import random
 import urllib.parse
 import urllib.request
 from typing import IO
@@ -42,7 +41,7 @@ from anidb_client.animeobjs import (
     RelatedAnime,
     RelationWalkStop,
 )
-from anidb_client.link import AniDBLink
+from anidb_client.link import DEFAULT_OUTGOING_PORT, AniDBLink
 
 # The library's public surface. Declared explicitly so that re-exports here are
 # understood as the API rather than as unused imports, and so `from anidb_client import *`
@@ -151,12 +150,15 @@ def init(
             "database URL, or db_only=True."
         )
 
-    # Chosen here rather than in the signature: a call in a default argument is
-    # evaluated once, when the module is imported, so every init() in a process
-    # previously reused the same "random" port -- and it was baked in at import
-    # time rather than chosen when the link was actually opened.
+    # One fixed port, not a fresh one per call. AniDB counts requests against a
+    # source address and treats a spray of source ports from one IP as the
+    # flooding it bans for; a client constructed per operation across short-lived
+    # processes therefore banned itself while every individual process behaved.
+    # AniDB's own guidance is to pick a local port above 1024 at install time and
+    # reuse it. None means "the default"; pass a port to choose your own.
+    # See ADR-007.
     if outgoing_udp_port is None:
-        outgoing_udp_port = random.randrange(9000, 10000)
+        outgoing_udp_port = DEFAULT_OUTGOING_PORT
 
     if logger is None:
         logger = logging.getLogger(__name__)

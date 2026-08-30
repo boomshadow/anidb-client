@@ -173,7 +173,7 @@ anidb_client.init(
     loglevel="info",
     logger=None,
     netrc_file=None,
-    outgoing_udp_port=None,
+    outgoing_udp_port=None,  # None means the pinned default, 9876
     api_key=None,
     fanart_api_key=None,
     db_only=False,
@@ -190,6 +190,15 @@ the first request. Pass
 `db_only=True` to work entirely from cache without opening a UDP session, and
 `client_name`/`client_version` to authenticate as your own
 [registered client](#registering-a-client-with-anidb).
+
+`outgoing_udp_port` is the local UDP port this client sends from. It defaults to
+a **fixed** port (9876) rather than a random one, because AniDB meters and bans
+by the address a datagram arrives from — and a UDP source address includes the
+port, so a client that rolls a new one per `init()` presents a single host as a
+stream of distinct clients and gets the IP banned for flooding. AniDB's own
+guidance is to pick one local port above 1024 and reuse it. Give each client its
+own port if you run several at once; two clients will not share one, and the
+second to start fails to bind with an error naming the port. See ADR-007.
 
 `db_pool_size` bounds the connection pool the cache uses. The default suits a
 client of this library; raise or lower it if your application knows better. The

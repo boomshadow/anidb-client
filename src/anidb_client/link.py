@@ -46,6 +46,15 @@ from anidb_client.responses import Disposition, Response, ResponseResolver, disp
 # rather than a union that would have to be widened for every mode never used.
 type Cipher = Any
 
+# The outgoing UDP source port this client binds when it is not given one.
+#
+# Fixed, and deliberately so. AniDB counts requests against a source address, and
+# its published guidance is to choose one local port above 1024 at install time
+# and reuse it. Above 1024 so no privilege is needed; below the usual Linux
+# ephemeral floor of 32768 so the kernel will not hand it to something else on
+# the same host. See ADR-007 and SPEC-002.
+DEFAULT_OUTGOING_PORT = 9876
+
 
 class AniDBLink(threading.Thread):
     # How long the sender waits on an empty queue before checking whether the
@@ -69,7 +78,7 @@ class AniDBLink(threading.Thread):
         # host='localhost',
         host: str = "api.anidb.net",
         port: int = 9000,
-        myport: int = 9876,
+        myport: int = DEFAULT_OUTGOING_PORT,
         nat_ping_interval: int = 600,
         timeout: int = 20,
         api_key: str | None = None,
@@ -618,7 +627,7 @@ class AniDBLink(threading.Thread):
 
 
 class AniDBListener(threading.Thread):
-    def __init__(self, sender: AniDBLink, myport: int = 9876, timeout: int = 20) -> None:
+    def __init__(self, sender: AniDBLink, myport: int = DEFAULT_OUTGOING_PORT, timeout: int = 20) -> None:
         super().__init__()
 
         self.timeout = timeout
@@ -675,10 +684,32 @@ class AniDBListener(threading.Thread):
             return list(self.cmd_queue.items())
 
     def _connect_socket(self, myport: int, timeout: int) -> socket.socket:
+        """Bind the one socket this client sends and receives on.
+
+        **Without SO_REUSEADDR.** On Linux that option lets a second process bind
+        a port this one already holds, with no error on either side; the kernel
+        then delivers each datagram to one of them. The starved client sees its
+        replies go missing, retries into the silence, and earns a ban for a
+        problem it has no way to see. A duplicate bind is a mistake, and it is
+        cheaper to find out at startup than from AniDB, so it is left to fail.
+
+        The failure is turned into something that names the cause: a bare
+        EADDRINUSE from a library's constructor says nothing about which port, or
+        why this client insists on one.
+        """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("", myport))
+        try:
+            sock.bind(("", myport))
+        except OSError as e:
+            sock.close()
+            raise AniDBError(
+                f"Cannot bind outgoing UDP port {myport}: {e}. This client pins one source "
+                f"port and sends from it alone, because AniDB counts requests against a "
+                f"source address; sharing the port with another process would silently "
+                f"split the replies between them. Give this client a port of its own, or "
+                f"stop whatever already holds this one."
+            ) from e
         return sock
 
     def _disconnect_socket(self) -> None:
