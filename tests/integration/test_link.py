@@ -7,6 +7,7 @@ the ban handling that must never be provoked against the real service.
 
 import contextlib
 import logging
+import socket
 import threading
 import time
 from concurrent.futures import Future
@@ -16,7 +17,7 @@ import pytest
 
 import anidb_client
 import anidb_client.commands
-from anidb_client.errors import AniDBAuthFailedError, AniDBBannedError, AniDBCommandTimeoutError
+from anidb_client.errors import AniDBAuthFailedError, AniDBBannedError, AniDBCommandTimeoutError, AniDBError
 from anidb_client.link import AniDBLink
 from anidb_client.ratelimit import RateLimiter
 from tests.fake_anidb import FakeAniDBServer
@@ -50,7 +51,8 @@ def make_link(monkeypatch):
             "pw",
             host=srv.host,
             port=srv.port,
-            myport=0,
+            # Ephemeral unless a test is about the port itself.
+            myport=kwargs.pop("myport", 0),
             timeout=kwargs.pop("timeout", 2),
             # Overridable: a test about the back-off needs a limiter that really
             # sleeps, or it cannot tell sleeping from not sleeping.
@@ -155,6 +157,46 @@ class TestAuthentication:
         link.reauthenticate()
         _await(lambda: link._authed.is_set(), message="never authenticated")
         assert link._do_ping is False
+
+
+class TestTheSourcePortIsPinned:
+    """One client, one socket, one identity on the wire.
+
+    AniDB counts requests against a source address, so which port this client
+    sends from is part of the identity it is banned by. The socket used to be
+    bound with SO_REUSEADDR, which on Linux lets a second process bind a port
+    this one already holds -- with no error on either side. The kernel then gives
+    each datagram to one of them, so the starved client sees replies go missing,
+    retries into the silence, and earns a ban for a collision it cannot see.
+    """
+
+    def test_a_second_bind_of_the_same_port_fails_loudly(self, server, make_link):
+        holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        holder.bind(("", 0))
+        port = holder.getsockname()[1]
+
+        try:
+            with pytest.raises(AniDBError) as raised:
+                make_link(server, myport=port)
+        finally:
+            holder.close()
+
+        # Named, not just refused: a bare EADDRINUSE out of a library constructor
+        # says nothing about which port or why this client insists on one.
+        assert str(port) in str(raised.value)
+        assert "source port" in str(raised.value)
+
+    def test_a_link_binds_the_port_it_was_given(self, server, make_link):
+        """The pinned default is only worth having if it is what reaches the socket."""
+        holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        holder.bind(("", 0))
+        port = holder.getsockname()[1]
+        holder.close()
+
+        link = make_link(server, myport=port)
+
+        assert link._listener.sock is not None
+        assert link._listener.sock.getsockname()[1] == port
 
 
 class TestTagCorrelation:
