@@ -47,6 +47,8 @@ import threading
 import time as _time
 from collections.abc import Callable
 
+from anidb_client.errors import BanCause
+
 
 class RateLimiter:
     """Paces outgoing commands, and backs off exponentially once banned."""
@@ -104,6 +106,11 @@ class RateLimiter:
         # than a duration to sleep, because nothing sleeps it: a ban is a state the
         # sender checks before deciding whether to send at all.
         self._banned_until = 0.0
+        # Why the window is open. Recorded here rather than at the call site so
+        # that every refusal handed to a caller can say which of the three it is,
+        # including the ones raised by a code path far from where the ban was
+        # registered.
+        self._ban_cause: BanCause | None = None
 
     @property
     def is_banned(self) -> bool:
@@ -114,6 +121,12 @@ class RateLimiter:
     def ban_multiplier(self) -> int:
         with self._lock:
             return self._ban_multiplier
+
+    @property
+    def ban_cause(self) -> BanCause | None:
+        """Why the current back-off was opened, or None if there is none."""
+        with self._lock:
+            return self._ban_cause if self._ban_multiplier else None
 
     def _seconds_since_last_send(self) -> float:
         """Caller holds the lock. The public form below takes it."""
@@ -129,14 +142,19 @@ class RateLimiter:
             self._sent_in_burst += 1
             self._last_send = self._monotonic()
 
-    def register_ban(self) -> int:
+    def register_ban(self, cause: BanCause = BanCause.REFUSED) -> int:
         """Record a ban or server-busy reply and return the new multiplier.
 
         Doubles per consecutive ban, so a server that stays unhappy is backed away
         from rather than hammered at a fixed interval, up to MAX_BAN_MULTIPLIER.
         Opens the window in which nothing at all is sent.
+
+        `cause` says which kind of refusal opened it. It is recorded rather than
+        acted on: the policy is the same for all three, but a caller told to wait
+        wants to know whether AniDB refused it, ignored it, or was never asked.
         """
         with self._lock:
+            self._ban_cause = cause
             self._ban_multiplier = (
                 1 if not self._ban_multiplier else min(self._ban_multiplier * 2, self.MAX_BAN_MULTIPLIER)
             )
@@ -150,6 +168,7 @@ class RateLimiter:
         with self._lock:
             self._ban_multiplier = 0
             self._banned_until = 0.0
+            self._ban_cause = None
 
     def ban_remaining(self) -> float:
         """Seconds until anything may be sent again, or 0 if something may be now.

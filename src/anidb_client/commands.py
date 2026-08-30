@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from typing import TYPE_CHECKING
 
-from anidb_client.errors import AniDBCommandTimeoutError, AniDBIncorrectParameterError
+from anidb_client.errors import AniDBCommandTimeoutError, AniDBIncorrectParameterError, BanCause
 
 if TYPE_CHECKING:
     from anidb_client.link import AniDBLink
@@ -112,7 +112,23 @@ class Command:
         self.raw = self.flatten(self.command, self.parameters)
         return self.raw
 
-    def handle_timeout(self, link: AniDBLink) -> None:
+    def handle_timeout(self, link: AniDBLink, silenced: bool = False) -> None:
+        """Decide what a command that went unanswered does next.
+
+        `silenced` is the transport's verdict that AniDB has stopped answering
+        altogether (SPEC-002). It overrides the attempt budget, and it has to:
+        the budget bounds how many times *this* command reaches AniDB, and a
+        service whose enforcement is to drop packets is being sent more traffic
+        by every one of those attempts. The retry that is correct against a lost
+        datagram is the wrong thing entirely against a ban with no notice.
+        """
+        if silenced:
+            # Registering the back-off before failing the caller inverts the
+            # order below, and may: nothing here sleeps any more, and the reason
+            # the caller is handed cannot say how long the window has left to run
+            # until the window exists.
+            self.fail(link.set_banned(reason=b"AniDB stopped answering", cause=BanCause.SILENCE))
+            return
         if self.attempts < self.MAX_ATTEMPTS:
             link.request(self, self.callback, prio=True)
             return
@@ -121,7 +137,9 @@ class Command:
         # for the length of the back-off before being told the answer is not
         # coming, which is a decision already made.
         self.fail(AniDBCommandTimeoutError(f"{self.command} went unanswered after {self.attempts} attempts"))
-        link.set_banned(code=604, reason=b"API not responding")
+        # No code: nothing answered, so there is no code AniDB gave. The cause
+        # already says why the gate closed.
+        link.set_banned(reason=b"API not responding", cause=BanCause.SILENCE)
 
 
 # first run
@@ -151,12 +169,21 @@ class AuthCommand(Command):
         }
         super().__init__("AUTH", **parameters)
 
-    def handle_timeout(self, link: AniDBLink) -> None:
+    def handle_timeout(self, link: AniDBLink, silenced: bool = False) -> None:
         # auth_failed() rather than set_banned(): both back off, but only this one
         # settles the handshake the sender is waiting on. set_banned() left it
         # unsettled, so an AUTH that simply went unanswered parked the sender as
-        # surely as one that was refused.
-        link.auth_failed("604", "API not responding")
+        # surely as one that was refused. The command itself is settled with the
+        # same error, so nothing is left holding a request with no outcome.
+        #
+        # A handshake never retries, so it does not consult `silenced`: an
+        # unanswered AUTH backs off on its first timeout, which is what the
+        # silence detector exists to make ordinary commands do too.
+        # "604" is passed for the classification, not as a code AniDB sent: the
+        # response table is what decides a handshake failure is retryable rather
+        # than latched, and only a code reaches it. auth_failed() knows a silent
+        # ban carries no code and does not pass it on to the caller.
+        self.fail(link.auth_failed("604", "API not responding", cause=BanCause.SILENCE))
 
 
 class LogoutCommand(Command):
@@ -532,10 +559,14 @@ class EncryptCommand(Command):
         parameters = {"user": user.lower(), "type": type}
         super().__init__("ENCRYPT", **parameters)
 
-    def handle_timeout(self, link: AniDBLink) -> None:
+    def handle_timeout(self, link: AniDBLink, silenced: bool = False) -> None:
         # See AuthCommand.handle_timeout: this half of the handshake has a waiter
         # to release too.
-        link.auth_failed("604", "API not responding")
+        # "604" is passed for the classification, not as a code AniDB sent: the
+        # response table is what decides a handshake failure is retryable rather
+        # than latched, and only a code reaches it. auth_failed() knows a silent
+        # ban carries no code and does not pass it on to the caller.
+        self.fail(link.auth_failed("604", "API not responding", cause=BanCause.SILENCE))
 
 
 class EncodingCommand(Command):

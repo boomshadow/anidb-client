@@ -37,6 +37,7 @@ from anidb_client.errors import (
     AniDBError,
     AniDBInternalError,
     AniDBMustAuthError,
+    BanCause,
 )
 from anidb_client.ratelimit import RateLimiter
 from anidb_client.responses import Disposition, Response, ResponseResolver, disposition_for
@@ -54,6 +55,15 @@ type Cipher = Any
 # ephemeral floor of 32768 so the kernel will not hand it to something else on
 # the same host. See ADR-007 and SPEC-002.
 DEFAULT_OUTGOING_PORT = 9876
+
+# How a refusal reads to a human, per cause. Kept beside the enum's three members
+# so that adding a fourth is a mapping that no longer type-checks rather than a
+# back-off that describes itself as something it is not.
+_REFUSAL_TEXT: dict[BanCause, str] = {
+    BanCause.REFUSED: "AniDB asked this client to back off",
+    BanCause.SILENCE: "AniDB has stopped answering this client",
+    BanCause.LOCAL: "this client could not reach AniDB",
+}
 
 
 class AniDBLink(threading.Thread):
@@ -112,6 +122,14 @@ class AniDBLink(threading.Thread):
         self._myport = myport
         self._nat_ping_interval = nat_ping_interval
         self._do_ping = False
+        # The address AniDB reported back on AUTH nat=1, as (ip, port). It is the
+        # only external confirmation a caller can get that the outgoing source
+        # port is the one it asked for, so it is kept rather than parsed for the
+        # port comparison and thrown away. Read through `reported_address`.
+        self._reported_address: tuple[str, int] | None = None
+        # When the current session was established, on the monotonic clock. None
+        # whenever there is no session. Read through `session_age`.
+        self._session_started: float | None = None
         self._listener = AniDBListener(self, myport=myport, timeout=timeout)
 
         self.timeout = timeout
@@ -244,22 +262,28 @@ class AniDBLink(threading.Thread):
         # KeyError here -- on a response thread, where it was invisible, and
         # before anything had been signalled.
         addr = resp.attrs.get("address", "")
-        _ip, _sep, port = addr.rpartition(":")
-        if port.isdigit() and int(port) != self._myport:
+        ip, sep, port = addr.rpartition(":")
+        reported = (ip, int(port)) if sep and ip and port.isdigit() else None
+        if reported is not None and reported[1] != self._myport:
             self._do_ping = True
             anidb_client.log.info(f"NAT detected: will send PING every {self._nat_ping_interval} seconds")
         with self._auth_lock:
+            if reported is not None:
+                self._reported_address = reported
+            self._session_started = monotonic()
             self._authed.set()
             self._authenticating.clear()
         self._settle_auth(None)
         anidb_client.log.info(f"Logged in to AniDB with session {self.session}")
 
-    def auth_failed(self, rescode: str, reason: str) -> None:
+    def auth_failed(self, rescode: str, reason: str, cause: BanCause = BanCause.REFUSED) -> AniDBError:
         """Report that a handshake round trip came back as anything but success.
 
         Called from the listener thread, which is the only one that sees the
         reply, and from a handshake command's timeout. It settles the waiting
-        sender rather than leaving it on an Event that nothing will ever set.
+        sender rather than leaving it on an Event that nothing will ever set, and
+        hands back the error it settled with so the caller can settle the
+        handshake command itself with the same reason.
 
         Whether another attempt is worth making is decided from the response
         table: a code that means the server is unhappy -- busy, down, banning us
@@ -269,16 +293,36 @@ class AniDBLink(threading.Thread):
         """
         error: AniDBError
         if disposition_for(rescode) is not Disposition.NORMAL:
-            error = AniDBBannedError(f"AniDB refused authentication: {rescode} {reason}")
             # register_ban() rather than set_banned(): this runs on the listener
             # thread, and set_banned() re-authenticates, which would send AUTH --
             # and pay the back-off sleep -- from the thread that has to keep
             # reading the socket. The sender re-authenticates on its next command
             # and waits out the back-off there, where waiting is free.
-            self._rate_limiter.register_ban()
+            #
+            # Registered before the error is built, because the error carries how
+            # long the window it just opened has left to run.
+            self._rate_limiter.register_ban(cause)
+            # Silence is reported to this method as 604 because that is what the
+            # response table classifies -- a handshake that goes unanswered has to
+            # come out retryable, not latched, and only a code decides that. But
+            # AniDB sent nothing, so the code is a local stand-in for a reply that
+            # never came and must not be handed on as one: `rescode` is the code
+            # AniDB *answered* with, and a silent ban has none.
+            silent = cause is BanCause.SILENCE
+            error = AniDBBannedError(
+                f"AniDB did not answer the handshake: {reason}"
+                if silent
+                else f"AniDB refused authentication: {rescode} {reason}",
+                cause=cause,
+                retry_after=self._rate_limiter.ban_remaining(),
+                rescode=None if silent else rescode,
+            )
             anidb_client.log.error(f"Backing off: {error}")
         else:
-            error = AniDBAuthFailedError(f"AniDB refused authentication and retrying will not help: {rescode} {reason}")
+            error = AniDBAuthFailedError(
+                f"AniDB refused authentication and retrying will not help: {rescode} {reason}",
+                rescode=rescode,
+            )
             anidb_client.log.error(str(error))
         with self._auth_lock:
             if isinstance(error, AniDBAuthFailedError):
@@ -286,8 +330,10 @@ class AniDBLink(threading.Thread):
             self._authed.clear()
             self._authenticating.clear()
             self._session = None
+            self._session_started = None
             self._listener.cipher = None
         self._settle_auth(error)
+        return error
 
     def _await_auth(self) -> None:
         """Block until the handshake settles, raising if it settled as a failure.
@@ -486,9 +532,9 @@ class AniDBLink(threading.Thread):
         # version still intended to send, and did, the moment the clock allowed it.
         # This one sends nothing and says so, and whoever asked can decide when to
         # come back.
-        remaining = self._rate_limiter.ban_remaining()
-        if remaining > 0:
-            raise AniDBBannedError(f"AniDB asked this client to back off; {remaining / 60:.0f} minutes remaining")
+        refusal = self.refusal()
+        if refusal is not None:
+            raise refusal
         self._rate_limiter.wait()
         # `sock is None` as well as thread liveness: stop() closes the socket
         # before the listener thread has finished winding down, and a command
@@ -537,7 +583,10 @@ class AniDBLink(threading.Thread):
             anidb_client.log.warning(f"Failed to send command {command.command}: {e}")
             if command.command not in ("AUTH", "PING", "ENCRYPT"):
                 self._enqueue(command, prio=True)
-            self.set_banned(code=999, reason=b"Network unavailable")
+            # LOCAL: nothing was asked of AniDB. The back-off is this client
+            # protecting itself from spinning on a socket that is not working,
+            # not AniDB refusing anything.
+            self.set_banned(reason=b"Network unavailable", cause=BanCause.LOCAL)
 
     def request(self, command: Command, callback: Callable[[Response], None], prio: bool = False) -> Future[Response]:
         """Queue a command and hand back its outcome.
@@ -583,6 +632,80 @@ class AniDBLink(threading.Thread):
     def set_session(self, session: str | None) -> None:
         with self._auth_lock:
             self._session = session
+            self._session_started = monotonic() if session else None
+
+    # ---- health surface -------------------------------------------------
+    #
+    # Read-only, and answered from state the transport already keeps. An
+    # application embedding this library has to be able to tell "quiet because
+    # there is nothing to do" from "quiet because AniDB has closed the gate", and
+    # the only ways to find out used to be to reach into private attributes or to
+    # send a command -- which, during a ban, is the one thing not to do.
+
+    @property
+    def is_banned(self) -> bool:
+        """True while a back-off has been registered and not yet cleared.
+
+        Stays true after the window has elapsed: the multiplier is only cleared
+        by an authentication that succeeds, so this reports "we are in trouble"
+        rather than "we may not send right now". For the second, read
+        `ban_remaining`.
+        """
+        return self._rate_limiter.is_banned
+
+    @property
+    def ban_cause(self) -> BanCause | None:
+        """Which of the three refusals opened the current back-off, or None."""
+        return self._rate_limiter.ban_cause
+
+    @property
+    def ban_remaining(self) -> float:
+        """Seconds until anything may be sent again, unrounded. 0 if it may now."""
+        return self._rate_limiter.ban_remaining()
+
+    @property
+    def ban_multiplier(self) -> int:
+        """How many times the back-off has doubled. 0 when there is no ban."""
+        return self._rate_limiter.ban_multiplier
+
+    @property
+    def session_age(self) -> float | None:
+        """Seconds since the current session was established, or None if there is none."""
+        with self._auth_lock:
+            started = self._session_started
+        return None if started is None else monotonic() - started
+
+    @property
+    def reported_address(self) -> tuple[str, int] | None:
+        """The (ip, port) AniDB last reported seeing, or None if it never did.
+
+        AniDB returns this only when AUTH asked for it with nat=1, and only when
+        the reply carries something that reads as an address. It is advisory --
+        a login that succeeded on the wire is not undone by its absence -- but it
+        is the only outside confirmation that the outgoing source port is the one
+        this client asked for.
+        """
+        with self._auth_lock:
+            return self._reported_address
+
+    def refusal(self) -> AniDBBannedError | None:
+        """The open back-off as an error, or None if sending is allowed.
+
+        One place builds it, so everything told to back off is told the same
+        things: how long is left, unrounded, and which refusal it is. The
+        transport used to format that into a message here and nowhere else, and
+        rounded to whole minutes -- which read as "0 minutes remaining" for any
+        window shorter than half of one.
+        """
+        remaining = self._rate_limiter.ban_remaining()
+        if remaining <= 0:
+            return None
+        cause = self._rate_limiter.ban_cause or BanCause.REFUSED
+        return AniDBBannedError(
+            f"{_REFUSAL_TEXT[cause]}; nothing will be sent for another {remaining:.0f}s",
+            cause=cause,
+            retry_after=remaining,
+        )
 
     def reauthenticate(self) -> None:
         # One critical section: a half-cleared state -- session gone but cipher
@@ -591,6 +714,7 @@ class AniDBLink(threading.Thread):
         with self._auth_lock:
             self._authed.clear()
             self._session = None
+            self._session_started = None
             self._listener.cipher = None
         self._reauthenticate()
 
@@ -603,14 +727,32 @@ class AniDBLink(threading.Thread):
         else:
             self._listener.stop()
 
-    def set_banned(self, code: int, reason: bytes | str | None = None) -> None:
+    def set_banned(
+        self,
+        code: int | None = None,
+        reason: bytes | str | None = None,
+        cause: BanCause = BanCause.REFUSED,
+    ) -> AniDBBannedError:
+        """Open a back-off window, and hand back the refusal it opened.
+
+        Returning it is what lets a caller settle the command that provoked the
+        ban with the same reason the next caller will be given, rather than
+        inventing a second description of one situation. Nothing here sleeps, so
+        registering before failing costs the waiting caller nothing -- and the
+        error cannot state how long is left until the window it describes exists.
+
+        `code` is the AniDB response code when there was one. Silence has none,
+        and neither does a datagram that never left this host.
+        """
         # Decoded rather than interpolated: the reasons raised from commands.py are
         # bytes literals, which formatted as b'API not responding' in the log line.
         if isinstance(reason, bytes):
             reason = reason.decode("utf-8", "replace")
-        self._rate_limiter.register_ban()
+        self._rate_limiter.register_ban(cause)
+        detail = f"{code} {reason}" if code is not None else str(reason)
         anidb_client.log.error(
-            f"Backing off: {reason} (nothing will be sent for {self._rate_limiter.ban_remaining() / 60:.0f} minutes)"
+            f"Backing off ({cause.name.lower()}): {detail} "
+            f"(nothing will be sent for {self._rate_limiter.ban_remaining():.0f}s)"
         )
         # The session is dropped but no new one is started here. This runs on the
         # listener thread for an untagged ban notice and for a command that timed
@@ -623,10 +765,28 @@ class AniDBLink(threading.Thread):
             self._authed.clear()
             self._authenticating.clear()
             self._session = None
+            self._session_started = None
             self._listener.cipher = None
+        return AniDBBannedError(
+            f"{_REFUSAL_TEXT[cause]}: {detail}",
+            cause=cause,
+            retry_after=self._rate_limiter.ban_remaining(),
+            rescode=str(code) if code is not None else None,
+        )
 
 
 class AniDBListener(threading.Thread):
+    # How many commands must time out in a row, with nothing arriving from AniDB
+    # in between, before the transport treats the silence as a ban.
+    #
+    # Two, because one is ordinary. UDP loses datagrams, and a single dropped
+    # reply is exactly what the retry budget exists to absorb. Two in a row with
+    # no traffic at all in between is not loss -- it is the API declining to
+    # answer, which is AniDB's documented enforcement: it drops packets from a
+    # banned client rather than replying to say so. A client that waits for a
+    # ban notice that is never sent keeps sending into the ban.
+    SILENT_TIMEOUTS_BEFORE_BAN = 2
+
     def __init__(self, sender: AniDBLink, myport: int = DEFAULT_OUTGOING_PORT, timeout: int = 20) -> None:
         super().__init__()
 
@@ -638,7 +798,22 @@ class AniDBListener(threading.Thread):
         # reached into from AniDBLink, which is what it was.
         self._cipher_lock = threading.Lock()
         self._cipher: Cipher | None = None
+        # When a reply this client could read last arrived. Drives the re-queue
+        # branch of the timeout sweep: a command sent before this timed out while
+        # the API was demonstrably answering, so something else is going on --
+        # most likely a re-authentication -- and it goes back on the queue rather
+        # than being counted against its budget.
         self._last_receive = monotonic()
+        # When a datagram last arrived at all -- tagged, untagged, or unreadable.
+        # Deliberately not the same thing as `_last_receive`: what the silence
+        # detector measures is whether anything is coming back from AniDB, and a
+        # packet this client could not parse is still a server that is answering.
+        # Both are touched only by this thread, which runs the receive loop and
+        # the timeout sweep alike, so neither needs a lock.
+        self._last_datagram = self._last_receive
+        # Commands that have timed out since the last datagram arrived. The
+        # silence detector's whole state.
+        self._silent_timeouts = 0
         self._stopping = threading.Event()
 
         self.cmd_queue: dict[str, Command] = {}
@@ -784,6 +959,7 @@ class AniDBListener(threading.Thread):
                 if self._stopping.is_set() or self.sock is None:
                     return
                 continue
+            self._note_datagram()
             anidb_client.log.debug(f"NetIO < {repr(data)}")
             if self.cipher:
                 with contextlib.suppress(ValueError):
@@ -802,50 +978,34 @@ class AniDBListener(threading.Thread):
             except (UnicodeDecodeError, ValueError) as e:
                 anidb_client.log.warning(f"Unparsable response from API ({e}): {repr(data)}")
                 continue
-            if resolved.restag:
-                cmd = self.pop_command(resolved.restag)
-                if cmd is None:
-                    continue
-            else:
-                # No responsetag... we're probably banned
-                #
-                # The verdict comes from the response table in responses.py,
-                # which is where AniDB's contract is transcribed. It used to be
-                # the literal tuple (600, 601, 602, 604) here -- and `555 BANNED`,
-                # the code AniDB actually answers with when it has had enough of
-                # a client, was in the table and not in the tuple. So the one
-                # reply that says "stop" was logged as unrecognised and the
-                # client carried on sending.
-                code = resolved.rescode
-                reason = resolved.resstr
-                if (disposition := disposition_for(code)) is not Disposition.NORMAL:
-                    anidb_client.log.warning(f"API says {code} {reason} ({disposition.name})")
-                    self._sender.set_banned(code=int(code), reason=reason)
-                elif code == "598":
-                    # We get here if an encrypted session has timed out
-                    # No need to log in again if all that's left in queue is a
-                    # logout command.
-                    if all(x.command == "LOGOUT" for _tag, x in self.pending_commands()):
-                        self.stop()
-                    else:
-                        anidb_client.log.warning("Lost encrypted session with AniDB; attempting to reauthenticate")
-                        # Suppressed for the reason given on the tagged
-                        # session-loss path below: re-authenticating sends, sending
-                        # is refused during a back-off, and that refusal reaching
-                        # this thread would end the listener.
-                        with contextlib.suppress(AniDBError):
-                            self._sender.reauthenticate()
-                else:
-                    # Also previously sys.exit(2); see above. An untagged reply we
-                    # do not recognise is worth shouting about, but it is not worth
-                    # killing the caller's process over.
-                    anidb_client.log.error(f"Unhandled response from API: {repr(data)}")
+
+            # Disposition first, tag second. A code that says stop is a statement
+            # about the connection, not about whichever command it happens to
+            # carry the tag of, so it must close the gate whether it arrives
+            # untagged, correctly tagged, or wrongly tagged. AniDB's own
+            # documentation notes that 555 "sometimes uses the wrong tag", and a
+            # wrongly-tagged 555 used to be handed to a caller as an ordinary
+            # successful reply: no ban registered, no back-off opened, and the
+            # sender still firing into a service that had just said stop.
+            #
+            # The verdict comes from the response table in responses.py, which is
+            # where AniDB's contract is transcribed. The transport keeps no list
+            # of its own; it used to, and the restatement disagreed with the table.
+            cmd = self.pop_command(resolved.restag) if resolved.restag else None
+            disposition = disposition_for(resolved.rescode)
+            if disposition is not Disposition.NORMAL:
+                self._handle_refusal(resolved, disposition, cmd)
+                continue
+            if not resolved.restag:
                 self._last_receive = monotonic()
+                self._handle_untagged(resolved, data)
+                continue
+            if cmd is None:
                 continue
             resp = resolved.resolve(cmd)
             resp.parse()
+            self._last_receive = monotonic()
             if cmd.command in ("AUTH", "ENCRYPT") and not self._is_successful_handshake(cmd, resp):
-                self._last_receive = monotonic()
                 continue
             if resp.rescode in ("200", "201"):
                 # Safe to subscript: the check above returned True only for a
@@ -866,15 +1026,78 @@ class AniDBListener(threading.Thread):
                         # socket is a permanent hang for every caller.
                         anidb_client.log.error(f"Cannot recover the session right now: {e}")
                         cmd.fail(e)
-                self._last_receive = monotonic()
                 continue
             elif resp.rescode in ("203", "500", "503"):
                 self.stop()
 
-            self._last_receive = monotonic()
             resp_thread = threading.Thread(target=self._deliver, args=(cmd, resp))
             resp_thread.daemon = True
             resp_thread.start()
+
+    def _note_datagram(self) -> None:
+        """Record that AniDB is still talking to us.
+
+        Any datagram counts -- a reply to something else, an untagged notice, or
+        a packet that turns out to be readable by nobody. All three say the same
+        thing about the connection: datagrams from this client are still reaching
+        a server that still sends some back, so whatever else is wrong, this is
+        not the silent drop AniDB enforces a ban with.
+
+        Recorded here, once, immediately after the socket read, rather than on
+        each of the several paths a packet takes through the loop below. A
+        detector that had to be told about every one of them would eventually
+        miss one, and the path it missed would be a live API looking silent.
+        """
+        self._last_datagram = monotonic()
+        self._silent_timeouts = 0
+
+    def _handle_refusal(self, resolved: ResponseResolver, disposition: Disposition, cmd: Command | None) -> None:
+        """Close the gate for a reply that says stop, and settle what it answered.
+
+        Both halves are required. The gate is what keeps the sender quiet; the
+        settlement is SPEC-002's rule that every request carries an outcome --
+        the reply, or the reason there will not be one. A refusal that closed the
+        gate and left its command in flight would trade one hang for another.
+        """
+        code = resolved.rescode
+        reason = resolved.resstr
+        self._last_receive = monotonic()
+        anidb_client.log.warning(f"API says {code} {reason} ({disposition.name})")
+        if cmd is not None and cmd.command in ("AUTH", "ENCRYPT"):
+            # The handshake has its own path, which registers the ban *and*
+            # settles the attempt the sender is parked on. Doing it here as well
+            # would count one refusal twice and double the back-off for it.
+            cmd.fail(self._sender.auth_failed(code, reason))
+            return
+        refusal = self._sender.set_banned(code=int(code), reason=reason, cause=BanCause.REFUSED)
+        if cmd is not None:
+            cmd.fail(refusal)
+
+    def _handle_untagged(self, resolved: ResponseResolver, data: bytes) -> None:
+        """An ordinary code that answers nothing: the server volunteering something.
+
+        A refusal never reaches here -- those are classified before the tag is
+        looked at. What is left is the encrypted session expiring, and codes this
+        table has never seen, which are logged and moved past. They are not
+        guessed at, and in particular they are not assumed to be a ban.
+        """
+        if resolved.rescode == "598":
+            # We get here if an encrypted session has timed out
+            # No need to log in again if all that's left in queue is a
+            # logout command.
+            if all(x.command == "LOGOUT" for _tag, x in self.pending_commands()):
+                self.stop()
+                return
+            anidb_client.log.warning("Lost encrypted session with AniDB; attempting to reauthenticate")
+            # Suppressed for the reason given on the tagged session-loss path:
+            # re-authenticating sends, sending is refused during a back-off, and
+            # that refusal reaching this thread would end the listener.
+            with contextlib.suppress(AniDBError):
+                self._sender.reauthenticate()
+            return
+        # Previously sys.exit(2). An untagged reply we do not recognise is worth
+        # shouting about, but it is not worth killing the caller's process over.
+        anidb_client.log.error(f"Unhandled response from API: {repr(data)}")
 
     def _deliver(self, cmd: Command, resp: Response) -> None:
         """Run a reply's callback, then settle the command it answers.
@@ -951,7 +1174,30 @@ class AniDBListener(threading.Thread):
                     self._sender.request(cmd, cmd.callback, prio=True)
                 else:
                     anidb_client.log.warning(f"Command {tag} timed out")
-                    cmd.handle_timeout(self._sender)
+                    cmd.handle_timeout(self._sender, silenced=self._note_silent_timeout(cmd))
             except AniDBError as e:
                 anidb_client.log.error(f"Giving up on {cmd.command} ({tag}): {e}")
                 cmd.fail(e)
+
+    def _note_silent_timeout(self, cmd: Command) -> bool:
+        """Count a command that went unanswered, and say whether the gate is closed.
+
+        Reached only from the branch that has already established genuine
+        silence: the command went out, the timeout passed, and no datagram of any
+        kind arrived after it was sent. `_note_datagram` resets the count, so
+        this only ever counts a consecutive run.
+
+        A handshake is not counted. It never retries -- an unanswered AUTH backs
+        off on the first timeout, by itself -- so it needs no detector, and
+        counting it here would register the same silence as a ban twice.
+        """
+        if cmd.command in ("AUTH", "ENCRYPT"):
+            return False
+        self._silent_timeouts += 1
+        if self._silent_timeouts < self.SILENT_TIMEOUTS_BEFORE_BAN:
+            return False
+        anidb_client.log.error(
+            f"{self._silent_timeouts} commands unanswered and nothing from AniDB for "
+            f"{monotonic() - self._last_datagram:.0f}s; treating the silence as a ban"
+        )
+        return True

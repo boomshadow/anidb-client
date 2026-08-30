@@ -62,6 +62,7 @@ __all__ = [
     "close_session",
     "download_fanart",
     "download_image",
+    "get_link",
     "get_session",
     "get_titles",
     "init",
@@ -280,6 +281,35 @@ def get_session() -> sqlalchemy.orm.Session:
 
 def close_session(session: sqlalchemy.orm.Session) -> None:
     session.close()
+
+
+def get_link() -> AniDBLink:
+    """The transport this process is using, so its state can be read.
+
+    SPEC-002 gives the transport a read-only health surface -- whether a ban
+    stands, which refusal opened it, how long is left, how long the session has
+    been up, the address AniDB reported back -- so that an embedding application
+    can tell a client with nothing to do from a client that has been gated,
+    without sending anything to find out.
+
+    That surface is only reachable if the object carrying it is. Without this,
+    the sole handles on the transport were the module-private global and the
+    object layer's private `_anidb_link`, so consulting the health surface meant
+    reaching into a private attribute -- which is the thing it exists to spare a
+    caller, and a promise a library should not make and then withhold the means
+    to keep.
+
+    Raises rather than answering None, for the reason `get_session` does: there
+    being no transport is a statement about how this process was configured, not
+    a condition every call site should have to branch on. A `db_only` client has
+    no transport by construction and never will.
+    """
+    if _anidb is None:
+        raise anidb_client.errors.AniDBError(
+            "There is no AniDB transport to read: init() has not been called, or it was "
+            "called with db_only=True, which opens no UDP session."
+        )
+    return _anidb
 
 
 def download_image(filehandle: IO[bytes], obj: Anime | Group) -> None:
