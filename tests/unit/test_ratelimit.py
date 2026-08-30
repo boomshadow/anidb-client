@@ -8,6 +8,7 @@ in microseconds and exactly.
 
 import threading
 
+from anidb_client.errors import BanCause
 from anidb_client.ratelimit import RateLimiter
 
 
@@ -216,6 +217,59 @@ class TestBanBackoff:
             limiter.register_ban()
 
         assert limiter.ban_remaining() == RateLimiter.BAN_BASE_DELAY * RateLimiter.MAX_BAN_MULTIPLIER
+
+
+class TestBanCause:
+    """Which of the three refusals opened the window.
+
+    The policy is the same for all three -- be quiet for a while -- but a caller
+    told to wait cannot act on that without knowing whether AniDB refused it,
+    ignored it, or was never asked. It is recorded here, beside the window it
+    describes, so that a refusal raised far from where the ban was registered can
+    still say which one it is.
+    """
+
+    def test_a_limiter_that_is_not_banned_has_no_cause(self):
+        limiter, _clock = make()
+        assert limiter.ban_cause is None
+
+    def test_the_cause_is_whatever_registered_the_ban(self):
+        limiter, _clock = make()
+        limiter.register_ban(BanCause.SILENCE)
+        assert limiter.ban_cause is BanCause.SILENCE
+
+    def test_a_refusal_is_the_default(self):
+        """The overwhelming majority of bans arrive as a response code."""
+        limiter, _clock = make()
+        limiter.register_ban()
+        assert limiter.ban_cause is BanCause.REFUSED
+
+    def test_a_later_ban_replaces_the_cause(self):
+        """The window is one state, so it has one reason -- the current one."""
+        limiter, _clock = make()
+        limiter.register_ban(BanCause.LOCAL)
+        limiter.register_ban(BanCause.REFUSED)
+        assert limiter.ban_cause is BanCause.REFUSED
+
+    def test_clearing_the_ban_clears_the_cause(self):
+        limiter, _clock = make()
+        limiter.register_ban(BanCause.SILENCE)
+        limiter.clear_ban()
+        assert limiter.ban_cause is None
+
+    def test_an_elapsed_window_still_reports_its_cause(self):
+        """Elapsing is not clearing: the multiplier stands until an auth succeeds.
+
+        A client that comes back and is refused again backs off for longer, and
+        the reason it was backing off in the first place is still the answer to
+        why the multiplier is where it is.
+        """
+        limiter, clock = make()
+        limiter.register_ban(BanCause.SILENCE)
+        clock.advance(RateLimiter.BAN_BASE_DELAY + 1)
+
+        assert limiter.ban_remaining() == 0
+        assert limiter.ban_cause is BanCause.SILENCE
 
 
 class TestSendAccounting:

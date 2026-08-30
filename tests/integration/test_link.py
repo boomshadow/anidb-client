@@ -17,8 +17,13 @@ import pytest
 
 import anidb_client
 import anidb_client.commands
-from anidb_client.errors import AniDBAuthFailedError, AniDBBannedError, AniDBCommandTimeoutError, AniDBError
-from anidb_client.link import AniDBLink
+from anidb_client.errors import (
+    AniDBAuthFailedError,
+    AniDBBannedError,
+    AniDBError,
+    BanCause,
+)
+from anidb_client.link import AniDBLink, AniDBListener
 from anidb_client.ratelimit import RateLimiter
 from tests.fake_anidb import FakeAniDBServer
 
@@ -273,6 +278,276 @@ class TestBanHandling:
         assert link._rate_limiter.ban_multiplier >= 1
 
 
+class TestTaggedRefusals:
+    """A refusal is a statement about the connection, not about one command.
+
+    The transport used to decide that by looking at the tag first: an untagged
+    reply was classified from the response table, and a tagged one was matched to
+    its command and delivered. So a `555 BANNED` that arrived carrying a tag was
+    handed to a caller as a perfectly ordinary successful response -- no ban
+    registered, no back-off opened, and the sender still firing at full rate into
+    a service that had just said stop.
+
+    AniDB's own documentation notes that 555 "sometimes uses the 'wrong' tag", so
+    this is not a hypothetical shape for the reply to arrive in. Classification
+    now happens before correlation, which makes all three shapes -- untagged,
+    correctly tagged, and tagged with something nothing is waiting on -- close the
+    same gate.
+    """
+
+    @pytest.mark.parametrize("code", ["555", "600", "601", "602", "604"])
+    def test_a_refusal_carrying_a_tag_closes_the_gate(self, server, make_link, code):
+        server.on("PING", f"{code} SERVER UNHAPPY")
+        link = make_link(server)
+
+        link.request(anidb_client.commands.PingCommand(), lambda _resp: None)
+
+        _await(lambda: link.is_banned, message=f"a tagged {code} registered no ban")
+        assert link.ban_remaining > 0, "a ban was registered but no back-off window opened"
+        assert link.ban_cause is BanCause.REFUSED
+
+    @pytest.mark.parametrize("code", ["555", "600", "601", "602", "604"])
+    def test_a_refusal_carrying_a_tag_settles_the_command_it_answered(self, server, make_link, code):
+        """The other half of it: closing the gate must not strand the caller.
+
+        SPEC-002's rule is that every request carries an outcome -- the reply, or
+        the reason there will not be one. A refusal that shut the sender up and
+        left its command in flight would trade one hang for another.
+        """
+        server.on("PING", f"{code} SERVER UNHAPPY")
+        link = make_link(server)
+
+        future = link.request(anidb_client.commands.PingCommand(), lambda _resp: None)
+
+        with pytest.raises(AniDBBannedError) as raised:
+            future.result(timeout=5)
+        assert raised.value.rescode == code
+        assert raised.value.cause is BanCause.REFUSED
+        assert raised.value.retry_after > 0
+
+    def test_a_refusal_carrying_the_wrong_tag_closes_the_gate(self, server, make_link):
+        """The case AniDB actually documents, and the one a tag-first transport misses.
+
+        Nothing is waiting on this tag, so there is no command to attribute the
+        reply to and nothing to deliver it as. Under tag-first classification
+        that made it a reply to nothing, silently dropped. It is still the API
+        saying stop.
+        """
+        server.on("PING", lambda req: b"T999 555 BANNED\n")
+        link = make_link(server)
+
+        link.request(anidb_client.commands.PingCommand(), lambda _resp: None)
+
+        _await(lambda: link.is_banned, message="a refusal tagged for nothing was dropped")
+        assert link.ban_cause is BanCause.REFUSED
+
+
+class TestSilenceIsABan:
+    """The refusal that arrives as no packet at all.
+
+    AniDB's primary enforcement is not an error reply: it drops datagrams from a
+    client it has had enough of. A transport that waits to be told it is banned
+    is therefore never told, and every retry it makes in the meantime is more
+    traffic into the thing doing the banning. Absence of traffic has to be a
+    first-class ban signal, and the retry budget has to answer to it.
+    """
+
+    def test_a_silent_ban_carries_no_response_code(self, server, make_link):
+        """The invariant SPEC-002 states: a silent ban has no code, because nothing replied.
+
+        Both constructors are checked here rather than each of the four call
+        sites, because this is where the code would leak in. The handshake path
+        is the interesting one: it is *handed* "604" on purpose, since only a
+        response code can tell the table that an unanswered handshake is
+        retryable rather than a latched credential refusal. That code is a local
+        stand-in for a reply that never came, and it must not reach the caller as
+        though AniDB had sent it -- `rescode` means what AniDB answered with.
+        """
+        link = make_link(server)
+
+        refusal = link.set_banned(reason=b"AniDB stopped answering", cause=BanCause.SILENCE)
+        assert refusal.cause is BanCause.SILENCE
+        assert refusal.rescode is None
+
+        error = link.auth_failed("604", "API not responding", cause=BanCause.SILENCE)
+        assert isinstance(error, AniDBBannedError)
+        assert error.cause is BanCause.SILENCE
+        assert error.rescode is None, "604 classifies the failure; it is not a code AniDB sent"
+
+    def test_one_unanswered_command_is_not_silence(self, server, make_link):
+        """UDP loses datagrams. Absorbing one is what the retry budget is for."""
+        link = make_link(server)
+
+        assert link._listener._note_silent_timeout(anidb_client.commands.PingCommand()) is False
+        assert not link.is_banned
+
+    def test_the_gate_closes_at_the_threshold(self, server, make_link):
+        link = make_link(server)
+        listener = link._listener
+
+        verdicts = [
+            listener._note_silent_timeout(anidb_client.commands.PingCommand())
+            for _ in range(listener.SILENT_TIMEOUTS_BEFORE_BAN)
+        ]
+
+        assert verdicts[:-1] == [False] * (listener.SILENT_TIMEOUTS_BEFORE_BAN - 1)
+        assert verdicts[-1] is True
+
+    def test_a_datagram_of_any_kind_resets_the_count(self, server, make_link):
+        """Only a consecutive run counts, and anything arriving ends the run.
+
+        Any datagram: a reply to some other command, an untagged notice, even a
+        packet this client cannot parse. All three say the API is still there.
+        """
+        link = make_link(server)
+        listener = link._listener
+
+        for _ in range(listener.SILENT_TIMEOUTS_BEFORE_BAN - 1):
+            listener._note_silent_timeout(anidb_client.commands.PingCommand())
+        listener._note_datagram()
+
+        assert listener._note_silent_timeout(anidb_client.commands.PingCommand()) is False
+
+    def test_a_handshake_timeout_is_not_counted(self, server, make_link):
+        """A handshake never retries: it backs off on its first unanswered attempt.
+
+        So it needs no detector, and feeding it into one would register a single
+        silence as two separate bans and double the back-off for it.
+        """
+        link = make_link(server)
+        listener = link._listener
+        auth = anidb_client.commands.AuthCommand("user", "pw", "3", "anidbclientpy", 1, nat=1)
+
+        for _ in range(listener.SILENT_TIMEOUTS_BEFORE_BAN * 2):
+            assert listener._note_silent_timeout(auth) is False
+
+    def test_a_command_that_timed_out_while_replies_arrived_is_not_silence(self, server, make_link):
+        """The sweep's first branch already covers this, and must keep covering it.
+
+        A command older than the last readable reply timed out while the API was
+        demonstrably answering -- a re-authentication in flight, most likely. It
+        is put back rather than counted, and counting it would let ordinary
+        session recovery close the gate on itself.
+        """
+        link = make_link(server)
+        listener = link._listener
+        command = anidb_client.commands.PingCommand()
+        command.tag = "T700"
+        command.callback = lambda _resp: None
+        command.started = monotonic() - listener.timeout - 1
+        listener.queue_command(command)
+        # A reply landed after that command went out.
+        listener._last_receive = monotonic()
+
+        listener._handle_timeouts()
+
+        assert listener._silent_timeouts == 0, "a command timing out against a live API was read as silence"
+        assert not link.is_banned
+
+    def test_silence_closes_the_gate_end_to_end(self, server, make_link):
+        """The whole thing, through the real transport: AniDB simply stops answering."""
+        server.on("PING", lambda req: None)
+        link = make_link(server)
+
+        future = link.request(anidb_client.commands.PingCommand(), lambda _resp: None)
+        with contextlib.suppress(AniDBBannedError):
+            future.result(timeout=20)
+
+        assert link.is_banned, "total silence never closed the gate"
+        assert link.ban_cause is BanCause.SILENCE
+        assert link.ban_remaining > 0
+        assert link.reported_address is None, "nothing was ever reported back to read"
+
+    def test_the_gate_stops_the_retries(self, server, make_link):
+        """The point of detecting it: stop sending.
+
+        Every attempt after the gate closes is a datagram into a service whose
+        way of saying no is to ignore them, so the command fails where it would
+        otherwise have been re-sent.
+        """
+        server.on("UPTIME", lambda req: None)
+        server.on("AUTH", AUTH_OK)
+        link = make_link(server)
+        link.reauthenticate()
+        _await(lambda: link._authed.is_set(), message="never authenticated")
+
+        future = link.request(anidb_client.commands.UptimeCommand(), lambda _resp: None)
+        with pytest.raises(AniDBBannedError):
+            future.result(timeout=20)
+        threading.Event().wait(0.5)
+
+        sent = len(server.requests_for("UPTIME"))
+        assert sent == AniDBListener.SILENT_TIMEOUTS_BEFORE_BAN, f"UPTIME reached AniDB {sent} times"
+
+
+class TestHealthSurface:
+    """What an embedder can read without reaching into private state or sending.
+
+    An application holding this transport has to be able to tell "quiet because
+    there is nothing to do" from "quiet because AniDB has closed the gate", and
+    the only ways to find out were to touch private attributes or to send a
+    command -- which, during a ban, is precisely the thing not to do.
+    """
+
+    def test_a_fresh_link_reports_no_ban(self, server, make_link):
+        link = make_link(server)
+
+        assert link.is_banned is False
+        assert link.ban_cause is None
+        assert link.ban_remaining == 0
+        assert link.ban_multiplier == 0
+        assert link.session_age is None
+
+    def test_a_ban_is_visible_with_its_cause_and_its_remaining_time(self, server, make_link):
+        server.on("AUTH", lambda req: b"555 BANNED\n")
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(lambda: link.is_banned, message="the ban was never registered")
+        assert link.ban_cause is BanCause.REFUSED
+        assert link.ban_multiplier == 1
+        # Unrounded, in seconds: the message this used to be rounded to whole
+        # minutes, so anything under thirty seconds read as "0 minutes".
+        assert 0 < link.ban_remaining <= RateLimiter.BAN_BASE_DELAY
+
+    def test_the_address_anidb_reported_is_kept(self, server, make_link):
+        """The only outside confirmation that source-port pinning is working.
+
+        AniDB echoes the address it saw this client arrive from, and the
+        transport parsed it, compared the port, and threw the whole thing away.
+        The IP matters as much as the port: together they are what AniDB counts
+        requests against.
+        """
+        server.on("AUTH", AUTH_OK)
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(lambda: link._authed.is_set(), message="never authenticated")
+        assert link.reported_address == ("127.0.0.1", 9000)
+
+    def test_no_address_is_reported_when_the_reply_carries_none(self, server, make_link):
+        """AniDB returns it only when AUTH asked for it, so its absence is normal."""
+        server.on("AUTH", "200 sess1234 LOGIN ACCEPTED")
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(lambda: link._authed.is_set(), message="never authenticated")
+        assert link.reported_address is None
+
+    def test_session_age_starts_at_the_login_and_ends_with_the_session(self, server, make_link):
+        server.on("AUTH", AUTH_OK)
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(lambda: link._authed.is_set(), message="never authenticated")
+        age = link.session_age
+        assert age is not None
+        assert 0 <= age < 5
+
+        link.set_session(None)
+        assert link.session_age is None
+
+
 class TestFailedAuthentication:
     """A handshake AniDB refuses must settle, not park the sender.
 
@@ -308,6 +583,38 @@ class TestFailedAuthentication:
         )
         assert not link._authed.is_set()
         assert link._listener.is_alive(), f"{code} killed the listener"
+
+    @pytest.mark.parametrize(
+        ("code", "text"),
+        [
+            ("500", "LOGIN FAILED"),
+            ("502", "ACCESS DENIED"),
+            ("503", "CLIENT VERSION OUTDATED"),
+            ("504", "CLIENT BANNED"),
+        ],
+    )
+    def test_a_refused_handshake_carries_the_code_it_was_refused_with(self, server, make_link, code, text):
+        """A refusal that needs a human still has to say which human, doing what.
+
+        "The login failed" and "this client version is no longer registered" are
+        both latched and both need someone to act, but not the same someone: one
+        is a credential to correct, the other a registration to renew. A caller
+        that can only read the message string cannot route them differently, so
+        the code AniDB refused with is carried as data (SPEC-002).
+        """
+        server.on("AUTH", f"{code} {text}")
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(
+            lambda: not link._authenticating.is_set(),
+            message=f"{code} never settled, so there is no refusal to read",
+        )
+        attempt = link._auth_attempt
+        assert attempt is not None and attempt.done()
+        error = attempt.exception()
+        assert error is not None, f"{code} settled as a success"
+        assert getattr(error, "rescode", None) == code
 
     def test_a_rejected_credential_is_not_offered_again(self, server, make_link):
         """The gentleness rule: retrying a refusal is how a refusal becomes a ban.
@@ -419,17 +726,25 @@ class TestCommandOutcome:
     def test_a_command_that_is_never_answered_fails_its_caller(self, server, make_link):
         """The reported hang, reduced to one command.
 
-        AniDB stops answering. The command is retried, the budget runs out, and
-        the caller is told -- rather than waiting on `_updated.wait()` for the
-        life of the process.
+        AniDB stops answering. The caller is told -- rather than waiting on
+        `_updated.wait()` for the life of the process.
+
+        What it is told is the silence gate, not a bare timeout: by the time the
+        transport gives up it has concluded AniDB is not answering this client at
+        all, and that is a more useful thing to hand back than "this one command
+        did not come back". The reason carries how long the window has to run, so
+        the caller can decide when to return.
         """
         server.on("PING", lambda req: None)
         link = make_link(server)
 
         future = link.request(anidb_client.commands.PingCommand(), lambda _resp: None)
 
-        with pytest.raises(AniDBCommandTimeoutError):
+        with pytest.raises(AniDBBannedError) as raised:
             future.result(timeout=20)
+        assert raised.value.cause is BanCause.SILENCE
+        assert raised.value.retry_after > 0
+        assert raised.value.rescode is None, "nothing answered, so there is no code AniDB gave"
 
     def test_an_unanswered_command_reaches_the_wire_a_bounded_number_of_times(self, server, make_link):
         """What the API sees while all that is going on.
@@ -437,17 +752,24 @@ class TestCommandOutcome:
         A service that bans clients for asking too often counts requests, so the
         bound that matters is this one. It used to be unbounded: the budget was
         restored every time it ran out.
+
+        Against total silence the bound is the silence threshold rather than the
+        attempt budget, and it is the tighter of the two on purpose. The budget
+        is sized for a lost datagram; silence is AniDB's documented way of
+        enforcing a ban, and spending the rest of the budget on it is firing more
+        traffic into the thing doing the banning.
         """
         server.on("PING", lambda req: None)
         link = make_link(server)
 
         future = link.request(anidb_client.commands.PingCommand(), lambda _resp: None)
-        with contextlib.suppress(AniDBCommandTimeoutError):
+        with contextlib.suppress(AniDBBannedError):
             future.result(timeout=20)
         threading.Event().wait(0.5)
 
         sent = len(server.requests_for("PING"))
-        assert sent == anidb_client.commands.Command.MAX_ATTEMPTS, f"PING reached AniDB {sent} times"
+        assert sent == AniDBListener.SILENT_TIMEOUTS_BEFORE_BAN, f"PING reached AniDB {sent} times"
+        assert sent < anidb_client.commands.Command.MAX_ATTEMPTS, "the gate did not cut the retries short"
 
     def test_a_callback_that_raises_fails_the_command(self, server, make_link):
         """A reply that arrives and is then mishandled is still no answer.

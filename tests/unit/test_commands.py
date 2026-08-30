@@ -26,7 +26,12 @@ from anidb_client.commands import (
     SendMsgCommand,
     VoteCommand,
 )
-from anidb_client.errors import AniDBCommandTimeoutError, AniDBIncorrectParameterError
+from anidb_client.errors import (
+    AniDBBannedError,
+    AniDBCommandTimeoutError,
+    AniDBIncorrectParameterError,
+    BanCause,
+)
 
 
 class TestSerialisation:
@@ -230,8 +235,12 @@ class FakeLink:
         command.attempts += 1
         return command.future
 
-    def set_banned(self, code, reason=None):
-        self.events.append(("banned", code))
+    def set_banned(self, code=None, reason=None, cause=BanCause.REFUSED):
+        self.events.append(("banned", code, cause))
+        # The real one hands back the refusal it just opened, so that whatever
+        # provoked the ban can settle its caller with the same reason the next
+        # caller will be given.
+        return AniDBBannedError(str(reason), cause=cause, retry_after=1800.0)
 
 
 class TestRetryPolicy:
@@ -273,7 +282,10 @@ class TestRetryPolicy:
         cmd.handle_timeout(link)
 
         assert ("request", True) not in link.events, "a spent command was sent again"
-        assert link.events == [("banned", 604)]
+        # No code: the API answered nothing, so there is no code it gave. The
+        # cause carries why the gate closed, and SPEC-002 states that a silent
+        # ban has no response code -- this path used to attach a synthetic 604.
+        assert link.events == [("banned", None, BanCause.SILENCE)]
         with pytest.raises(AniDBCommandTimeoutError):
             cmd.future.result(timeout=0)
 
@@ -291,9 +303,9 @@ class TestRetryPolicy:
         settled = []
 
         class SlowBanLink(FakeLink):
-            def set_banned(self, code, reason=None):
+            def set_banned(self, code=None, reason=None, cause=BanCause.REFUSED):
                 settled.append(cmd.future.done())
-                super().set_banned(code, reason)
+                return super().set_banned(code, reason, cause)
 
         cmd.handle_timeout(SlowBanLink())
 
@@ -320,3 +332,48 @@ class TestRetryPolicy:
         sends = [event for event in link.events if event[0] == "request"]
         assert len(sends) == Command.MAX_ATTEMPTS
         assert cmd.attempts == Command.MAX_ATTEMPTS
+
+
+class TestSilenceOverridesTheBudget:
+    """The gate outranks the attempt budget, and has to.
+
+    The budget is sized for a lost datagram -- ask again, it was probably
+    dropped. AniDB's documented enforcement is to drop packets from a banned
+    client rather than to answer at all, so against a ban every remaining
+    attempt is more traffic into the thing doing the banning. Once the transport
+    has concluded the API has gone silent, the correct number of further attempts
+    is none.
+    """
+
+    def test_a_silenced_command_is_not_retried(self):
+        cmd = PingCommand()
+        cmd.callback = None
+        cmd.attempts = 1
+        link = FakeLink()
+
+        cmd.handle_timeout(link, silenced=True)
+
+        assert ("request", True) not in link.events, "a silenced command was sent again"
+        assert cmd.attempts == 1
+
+    def test_a_silenced_command_fails_its_caller_with_the_reason(self):
+        cmd = PingCommand()
+        cmd.callback = None
+        cmd.attempts = 1
+
+        cmd.handle_timeout(FakeLink(), silenced=True)
+
+        with pytest.raises(AniDBBannedError) as raised:
+            cmd.future.result(timeout=0)
+        assert raised.value.cause is BanCause.SILENCE
+        assert raised.value.retry_after > 0
+
+    def test_a_silenced_command_closes_the_gate(self):
+        cmd = PingCommand()
+        cmd.callback = None
+        cmd.attempts = 1
+        link = FakeLink()
+
+        cmd.handle_timeout(link, silenced=True)
+
+        assert link.events == [("banned", None, BanCause.SILENCE)]

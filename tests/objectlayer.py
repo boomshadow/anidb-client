@@ -14,6 +14,8 @@ because the object layer relies on it: a caller released before the callback
 finished would read a cache the callback had not written yet.
 """
 
+from anidb_client.errors import AniDBBannedError, BanCause
+
 
 class FakeResponse:
     """The response surface the object-layer callbacks actually touch."""
@@ -119,5 +121,19 @@ class RecordingLink:
         ]
 
     # AniDBLink surface the object layer touches beyond request().
-    def set_banned(self, code, reason=None):  # pragma: no cover - not exercised here
-        pass
+    def set_banned(self, code=None, reason=None, cause=BanCause.REFUSED):  # pragma: no cover - not exercised here
+        """Mirror the real transport, including what it hands back.
+
+        Nothing calls this today, which is exactly why it is easy to leave
+        behind. A double that has drifted from the interface it stands in for is
+        worse than no double at all: the first object-layer path that backed off
+        would fail on an unexpected `cause` argument, or on a return value it was
+        promised and did not get, rather than exercising the behaviour the test
+        was written to cover.
+        """
+        return AniDBBannedError(
+            f"{code} {reason}" if code is not None else str(reason),
+            cause=cause,
+            retry_after=0.0,
+            rescode=str(code) if code is not None else None,
+        )
