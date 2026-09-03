@@ -16,6 +16,10 @@ classifiers = [
     "Topic :: Database :: Front-Ends",
     "Topic :: Multimedia :: Video",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    # Paired with src/anidb_client/py.typed. The marker is what a type checker
+    # reads; this is what a human browsing the index reads. Neither is much use
+    # without the other, so a test holds them together.
+    "Typing :: Typed",
 ]
 # Single source of truth is `__version__` in the package (see [tool.hatch.version]).
 # This is the distribution's own semantic version and is deliberately unrelated to

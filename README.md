@@ -62,6 +62,18 @@ pip install libnfs   # requires libnfs development headers
 
 Without it, only local paths work; nothing else is affected.
 
+### Type checking
+
+The package is annotated throughout and ships a [PEP 561](https://peps.python.org/pep-0561/)
+`py.typed` marker, so mypy, pyright and friends read those annotations directly. No
+stub package, and no `ignore_missing_imports` or `follow_untyped_imports` waiver.
+
+One honest limit. The attributes on `Anime`, `Episode`, `File` and `Group` that come
+from the cached row are resolved dynamically, so a type checker sees them as `Any`
+rather than as their real types. What is checked is the surface each class declares
+for itself, along with `init()`, the exceptions and the enumerations — which is the
+boundary a wrapping application actually calls across.
+
 ## Registering a client with AniDB
 
 **AniDB will not authenticate an unregistered client.** The `AUTH` command carries

@@ -279,6 +279,31 @@ build:dist:
     - ls -l dist/
     - test -n "$(find dist -name '*.whl')"
     - test -n "$(find dist -name '*.tar.gz')"
+    # The PEP 561 marker has to reach the artifacts, not merely exist in the tree.
+    # The test suite cannot check this: the development environment installs the
+    # project editable, so the import system resolves `anidb_client` back to `src`
+    # whether or not packaging would have shipped anything. Here the artifacts are
+    # real, so this is the only place the claim in SPEC-007 can be held to.
+    #
+    # Read with Python rather than `tar | grep`, and not for tidiness. `grep -q`
+    # exits at the first match, which hands `tar` a SIGPIPE; under `pipefail` the
+    # pipeline then reports failure for a search that *succeeded*. That is a check
+    # which fails when the artifact is correct, which is worse than no check.
+    - |
+      python3 - <<'PY'
+      import glob, sys, tarfile, zipfile
+
+      wheel, sdist = glob.glob("dist/*.whl")[0], glob.glob("dist/*.tar.gz")[0]
+      missing = []
+      if not any(n.endswith("anidb_client/py.typed") for n in zipfile.ZipFile(wheel).namelist()):
+          missing.append(wheel)
+      with tarfile.open(sdist) as archive:
+          if not any(n.endswith("src/anidb_client/py.typed") for n in archive.getnames()):
+              missing.append(sdist)
+      if missing:
+          sys.exit(f"No PEP 561 py.typed marker in {', '.join(missing)} -- see SPEC-007")
+      print("py.typed is present in both the wheel and the sdist")
+      PY
   artifacts:
     paths:
       - dist/
