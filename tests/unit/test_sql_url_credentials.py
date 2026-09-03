@@ -30,6 +30,7 @@ def clean_globals(monkeypatch):
         ("log", logging.getLogger("anidb_client.test")),
         ("_anidb", None),
         ("_sessionmaker", None),
+        ("_engine", None),
         ("fanart_key", None),
     ):
         monkeypatch.setattr(anidb_client, name, value, raising=False)
@@ -40,9 +41,19 @@ def captured_url(monkeypatch):
     """Capture the URL init() hands to the database layer, and open nothing."""
     seen = []
 
+    class _NoEngine:
+        """Stands in for the engine init() now takes ownership of.
+
+        It only has to answer `dispose()`, which is what the teardown registered
+        against a failed init() would call. Nothing here opens a database.
+        """
+
+        def dispose(self):
+            pass
+
     def fake_init_db(url, **kwargs):
         seen.append(url)
-        return object()
+        return _NoEngine(), object()
 
     monkeypatch.setattr(anidb_client.db, "init_db", fake_init_db)
     return seen

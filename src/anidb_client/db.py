@@ -256,7 +256,18 @@ def _configure_sqlite(engine: Engine) -> None:
         anidb_client.log.info(f"SQLite cache journal mode is {mode!r}; WAL was asked for and not granted")
 
 
-def init_db(url: str, pool_size: int = DEFAULT_POOL_SIZE) -> sessionmaker[Session]:
+def init_db(url: str, pool_size: int = DEFAULT_POOL_SIZE) -> tuple[Engine, sessionmaker[Session]]:
+    """Open the cache and hand back both the engine and a factory bound to it.
+
+    The engine is returned rather than only the factory because the engine is the
+    thing that owns something: a pool of live connections that has to be disposed
+    when the cache is closed. Returning only the factory made every caller that
+    needed to release those connections reverse the derivation -- reading the bind
+    back out of the factory's stored keyword arguments -- and five separate test
+    fixtures had independently invented that same dig, each with a comment saying
+    nothing owned the engine. Handing back the resource alongside the handle is
+    what makes `close()` able to release it (SPEC-006).
+    """
     # Connection-pool sizing is only meaningful for pools that queue. SQLAlchemy
     # gives in-memory SQLite a SingletonThreadPool, which takes neither argument
     # and raises TypeError if handed them -- so an in-memory cache, the obvious
@@ -276,7 +287,7 @@ def init_db(url: str, pool_size: int = DEFAULT_POOL_SIZE) -> sessionmaker[Sessio
         _configure_sqlite(engine)
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine, expire_on_commit=False)
-    return session
+    return engine, session
 
 
 class AnimeTable(Base):

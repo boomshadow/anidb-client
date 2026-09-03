@@ -29,28 +29,33 @@ def init_link(monkeypatch, tmp_path):
         ("log", logging.getLogger("anidb_client.test")),
         ("_anidb", None),
         ("_sessionmaker", None),
+        ("_engine", None),
         ("fanart_key", None),
     ):
         monkeypatch.setattr(anidb_client, name, value, raising=False)
 
-    sentinel = object()
+    class FakeLink:
+        """A stand-in with the one method the lifecycle calls on it."""
+
+        stopped = False
+
+        def stop(self, *args, **kwargs):
+            type(self).stopped = True
+
+    sentinel = FakeLink()
     monkeypatch.setattr(anidb_client.link, "AniDBLink", lambda *a, **kw: sentinel)
 
-    engines = []
+    calls = []
 
     def go(**kwargs):
-        cache = tmp_path / f"cache{len(engines)}.db"
+        cache = tmp_path / f"cache{len(calls)}.db"
+        calls.append(cache)
         anidb_client.init(f"sqlite:///{cache}", api_user="u", api_pass="p", **kwargs)
-        factory = anidb_client._sessionmaker
-        if factory is not None:
-            engines.append(factory.kw.get("bind"))
         return sentinel
 
     yield go
 
-    for bind in engines:
-        if bind is not None:
-            bind.dispose()
+    anidb_client.close()
 
 
 class TestReachingTheTransport:

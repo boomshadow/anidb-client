@@ -28,28 +28,41 @@ def opened_links(monkeypatch, tmp_path):
         ("log", logging.getLogger("anidb_client.test")),
         ("_anidb", None),
         ("_sessionmaker", None),
+        ("_engine", None),
         ("fanart_key", None),
     ):
         monkeypatch.setattr(anidb_client, name, value, raising=False)
 
     opened: list[dict[str, object]] = []
-    monkeypatch.setattr(anidb_client.link, "AniDBLink", lambda *a, **kw: opened.append(kw))
 
-    engines = []
+    class FakeLink:
+        """Records the arguments and binds nothing.
+
+        A class rather than the lambda this was, because `init()` now registers a
+        teardown against the object it built -- so the stand-in has to be an object
+        with a `stop()`, which is what a constructor returns and what the lambda,
+        answering the return value of `list.append`, never was.
+        """
+
+        def __init__(self, *args, **kwargs):
+            opened.append(kwargs)
+
+        def stop(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(anidb_client.link, "AniDBLink", FakeLink)
 
     def go(**kwargs):
-        cache = tmp_path / f"cache{len(engines)}.db"
+        cache = tmp_path / f"cache{len(opened)}.db"
         anidb_client.init(f"sqlite:///{cache}", api_user="u", api_pass="p", **kwargs)
-        factory = anidb_client._sessionmaker
-        if factory is not None:
-            engines.append(factory.kw.get("bind"))
         return opened
 
     yield go
 
-    for bind in engines:
-        if bind is not None:
-            bind.dispose()
+    # One call, where this used to collect every engine init() built and dispose
+    # them one by one. close() gives back what init() took, which is the whole
+    # point of the change these tests sit alongside.
+    anidb_client.close()
 
 
 class TestTheDefaultPort:
@@ -64,6 +77,11 @@ class TestTheDefaultPort:
         clients from one address.
         """
         opened_links()
+        # init() refuses a second call while one is live (ADR-008), so the cycle
+        # under test is init/close/init -- which is also the real-world shape of
+        # this question: a service restarting must present the same port it did
+        # before, not merely a second client in one process.
+        anidb_client.close()
         opened = opened_links()
 
         assert len(opened) == 2

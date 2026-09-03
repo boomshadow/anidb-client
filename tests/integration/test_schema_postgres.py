@@ -238,9 +238,9 @@ class TestInitDb:
         The SQLite in-memory case needed those arguments dropped; this confirms
         that the fix did not stop them being passed where they are meaningful.
         """
-        factory = init_db(postgres_url)
+        engine, factory = init_db(postgres_url)
         with factory() as sess:
             assert sess.scalar(select(func.count()).select_from(AnimeTable)) == 0
-        bind = factory.kw["bind"]
+        bind = engine
         assert bind.pool.size() == 10
         bind.dispose()

@@ -81,6 +81,16 @@ class AniDBLink(threading.Thread):
     # through _encryption_handler, so it is never assigned otherwise.
     _session_key: bytes
 
+    # How long `stop()` waits for each thread to leave, in seconds.
+    #
+    # Short on purpose. Both threads are woken rather than merely signalled -- the
+    # sender by a notify, the listener by a datagram to itself -- so in the ordinary
+    # case they leave in milliseconds and this is never reached. It exists so that a
+    # thread wedged somewhere unexpected slows a shutdown down instead of stopping
+    # it, which is the containment rule in SPEC-002 applied to shutting down: a
+    # library does not get to hold its host process open.
+    STOP_JOIN_TIMEOUT = 2.0
+
     def __init__(
         self,
         user: str,
@@ -428,7 +438,12 @@ class AniDBLink(threading.Thread):
                 self.request(anidb_client.commands.UptimeCommand(), self._ping_callback)
 
     def run(self) -> None:
-        while True:
+        # Checked rather than `while True`: the loop used to have exactly one exit,
+        # a LOGOUT reaching the wire, so a transport stopped any other way left this
+        # thread waking every idle tick forever. `_teardown` sets the event and
+        # notifies the queue, so a stopped sender leaves promptly and by the front
+        # door.
+        while not self._stop.is_set():
             command = self._take_next_command()
             if command is None:
                 self._send_idle_keepalive()
@@ -718,14 +733,91 @@ class AniDBLink(threading.Thread):
             self._listener.cipher = None
         self._reauthenticate()
 
-    def stop(self) -> None:
-        if self._authed.is_set():
-            anidb_client.log.debug("Logging out from AniDB")
-            req = anidb_client.commands.LogoutCommand()
-            self.request(req, self._logout_handler)
-            self._stop.wait(self.timeout)
-        else:
-            self._listener.stop()
+    def stop(self, timeout: float | None = None, logout: bool = True) -> None:
+        """End the transport and release what it holds.
+
+        **Logging out is best effort; ending is not.** This used to be a choice
+        between the two, and neither branch of it finished the job. Authenticated,
+        it sent LOGOUT and waited -- and then returned without ever closing the
+        socket, so a clean `init()`/`close()` cycle left the pinned source port
+        bound for the life of the process and the listener thread reading it.
+        Unauthenticated, it closed the socket but never signalled the sender, which
+        went on waking every idle tick forever. There was no path through here that
+        stopped both threads and gave the port back, which is what `close()` is
+        documented to do (SPEC-006).
+
+        So the courtesy is attempted under `logout`, and the teardown runs in a
+        `finally` regardless of how the courtesy went. That also bounds the case
+        that hurts an embedder most: a client AniDB has stopped answering can never
+        be told about the logout, so the wait ran to the full command timeout and
+        *then* left everything running. Now the wait is bounded by `timeout`,
+        which the caller may shorten, and the teardown happens either way.
+
+        `logout=False` is the half-built client: a failed `init()` tearing down
+        something that never authenticated. A politeness packet from a client with
+        no session is worse than silence, and while a back-off is open it is the
+        one thing that must not go out at all.
+        """
+        if timeout is None:
+            timeout = self.timeout
+        try:
+            if logout and self._authed.is_set():
+                anidb_client.log.debug("Logging out from AniDB")
+                # Suppressed: the transport may be banned, dead or mid-handshake,
+                # and every one of those is a reason the courtesy cannot be paid --
+                # not a reason to leave the socket bound.
+                with contextlib.suppress(AniDBError):
+                    req = anidb_client.commands.LogoutCommand()
+                    self.request(req, self._logout_handler)
+                    self._stop.wait(timeout)
+        finally:
+            self._teardown()
+
+    def _teardown(self) -> None:
+        """Stop both threads, close the socket, and fail everything still waiting.
+
+        Sends nothing, and is safe to run twice -- `close()` may be called on a
+        client that has already been closed, and a failed `init()` tears down
+        through here as well.
+
+        The source port is available again before this returns; that is the
+        property a caller retrying `init()` depends on, now that the port is pinned
+        and not shareable (ADR-007). Closing the socket is not by itself enough to
+        deliver it -- see `AniDBListener.stop`, which is where the waking and the
+        closing happen in the order that makes it true.
+
+        Each thread is signalled, woken, and then joined with a bounded timeout.
+        Waking is what makes the join short: a thread parked in `recv` or on a
+        condition would otherwise be joined for as long as its own timeout, which
+        is the wait a shutdown must not take. The bound is what keeps the join from
+        becoming that wait anyway if a thread is wedged somewhere unexpected --
+        both are daemons and neither holds anything by then, so a shutdown is
+        slowed rather than prevented.
+
+        Failing what is still in flight is the containment rule in SPEC-002 -- a
+        waiter is always released. A command outstanding when the transport stops
+        can never be answered now, and leaving it registered would hang whoever
+        asked for it rather than telling them.
+        """
+        self._stop.set()
+        # Wake the sender out of its idle wait rather than letting it find out on
+        # the next tick, so nothing is still moving while the socket is closed.
+        with self._queue_cv:
+            self._queue_cv.notify_all()
+        self._listener.stop()
+        self._abort_pending(AniDBInternalError("The transport has been stopped"))
+        # The sender holds no descriptor, so this is about the guarantee rather than
+        # about the port: it is waiting on a condition that has just been notified,
+        # and joining it is what makes "nothing is running" true at the moment this
+        # returns rather than shortly afterwards. Bounded, because a sender part-way
+        # through a paced send is not worth stalling a shutdown for -- it is a daemon
+        # and it holds nothing.
+        # `is_alive` as well as the identity check: a thread that was never started
+        # cannot be joined at all, and the transport is torn down from paths where
+        # that is the case -- a construction that failed part-way, and a `close()`
+        # on a client that has already been closed.
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(self.STOP_JOIN_TIMEOUT)
 
     def set_banned(
         self,
@@ -935,11 +1027,64 @@ class AniDBListener(threading.Thread):
         return data[:-pad_len]
 
     def stop(self) -> None:
+        """Leave the receive loop and give the port back.
+
+        **Closing the socket is not enough, and this is the whole reason this
+        method is more than two lines.** A thread blocked in `recv` keeps the
+        underlying socket alive in the kernel even after the descriptor is closed:
+        the bound port is not released until that call returns. Measured, not
+        assumed -- bind a UDP port, block a thread in `recv` on it, close it from
+        another thread, and the rebind fails with EADDRINUSE.
+
+        That is survivable when the port is ephemeral and shareable. It is not
+        survivable here. This client pins one source port and no longer sets
+        SO_REUSEADDR (ADR-007), so a listener still sitting in `recv` holds the only
+        port the next client may use -- for up to the socket timeout, which is
+        measured in seconds and looks exactly like the leak that has nothing to do
+        with it. `close()` promises the port back (SPEC-006); this is what makes
+        that true rather than eventually true.
+
+        So the loop is signalled, then *woken*, then waited for, and only then is
+        the socket closed. The wake is a zero-length datagram this socket sends to
+        itself over loopback -- the standard way to interrupt a blocking `recv`,
+        and worth being unambiguous about: **it is addressed to this process, never
+        to AniDB.** Nothing on the teardown path may reach the service, least of all
+        a client that never authenticated or one that is backing off.
+        """
         anidb_client.log.debug("Closing listening socket")
-        # Signalled before the socket is closed so the loop below can tell a
-        # deliberate shutdown from a transient socket error.
+        # Signalled before anything else, so the loop below can tell a deliberate
+        # shutdown from a transient socket error -- and so the woken loop finds the
+        # flag already set rather than racing it.
         self._stopping.set()
+        self._wake()
+        # See the note on the sender's join: a listener that was never started --
+        # which is how it is constructed, deliberately, so a reply cannot arrive
+        # mid-construction -- raises rather than returning from join().
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(AniDBLink.STOP_JOIN_TIMEOUT)
         self._disconnect_socket()
+
+    def _wake(self) -> None:
+        """Nudge the receive loop out of `recv` by sending this socket a datagram.
+
+        Sent from a throwaway socket rather than from the one being torn down, so
+        this never touches a descriptor the listener thread is using. Addressed to
+        loopback explicitly: a socket bound to all interfaces reports its own
+        address as 0.0.0.0, which is not a destination.
+
+        Best effort. If the socket is already gone, or the datagram cannot be sent,
+        the loop still leaves on its own timeout -- slower, but not wrong.
+        """
+        sock = self.sock
+        if sock is None:
+            return
+        with contextlib.suppress(OSError):
+            port = sock.getsockname()[1]
+            waker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                waker.sendto(b"", ("127.0.0.1", port))
+            finally:
+                waker.close()
 
     def run(self) -> None:
         while not self._stopping.is_set() and self.sock:
@@ -959,6 +1104,12 @@ class AniDBListener(threading.Thread):
                 if self._stopping.is_set() or self.sock is None:
                     return
                 continue
+            # Checked here as well as at the top of the loop, because the datagram
+            # just received may be the one stop() sent to wake this thread. Falling
+            # through would parse it -- harmlessly, the loop survives garbage -- and
+            # then take another turn, which is a turn the shutdown is waiting on.
+            if self._stopping.is_set():
+                return
             self._note_datagram()
             anidb_client.log.debug(f"NetIO < {repr(data)}")
             if self.cipher:
