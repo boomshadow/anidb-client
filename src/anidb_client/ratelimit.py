@@ -51,7 +51,13 @@ from anidb_client.errors import BanCause
 
 
 class RateLimiter:
-    """Paces outgoing commands, and backs off exponentially once banned."""
+    """Paces outgoing commands, and backs off exponentially once banned.
+
+    Part of the public surface, because `init()` accepts one (SPEC-006). An
+    application that wants this state to outlive its process constructs a limiter
+    with what it stored and hands it over; see `__init__` for what may be resumed
+    and why every seed is a duration rather than an instant.
+    """
 
     # A short opening burst is permitted before the slower steady rate applies.
     FREE_BURST = 5
@@ -93,24 +99,105 @@ class RateLimiter:
         sleep: Callable[[float], object] | None = None,
         log: logging.Logger | None = None,
         random: Callable[[], float] | None = None,
+        banned_for: float = 0.0,
+        ban_multiplier: int = 0,
+        ban_cause: BanCause | None = None,
+        seconds_since_last_send: float | None = None,
     ) -> None:
+        """Build a limiter, optionally resuming state from a previous process.
+
+        Everything this class knows is per-process and lost when the process ends:
+        the burst allowance, the last send, the back-off deadline and the
+        multiplier. For a long-lived service that state is what stands between one
+        address and an IP ban, and a restart currently begins with a clean slate --
+        one burst per deploy, which is inside AniDB's allowance on its own and is
+        not on the tenth restart of a crash loop.
+
+        `init()` accepts a limiter (SPEC-006), so an application may keep this state
+        wherever it likes and hand back a limiter that already knows it. This
+        library deliberately does not choose that storage.
+
+        **The seeds are durations, not instants, and that is the whole trick.**
+        `time.monotonic()` has an undefined zero point -- it is not comparable
+        across processes, and on most systems it is time since boot. A deadline
+        persisted from the last process and restored into this one is a number that
+        means nothing here, and it would mean nothing *quietly*: a restored ban
+        would read as already elapsed, or as hours away, with no error either way.
+        So what is handed back is "the ban has this many seconds left" and "the last
+        send was this many seconds ago", which survive a restart, a reboot and a
+        move to another host, and are converted to this process's clock here.
+
+        Every seedable field has a public reader, so state that can be resumed can
+        also be captured: `ban_remaining()`, `ban_multiplier`, `ban_cause` and
+        `seconds_since_last_send()`.
+
+        **Incoherent combinations are refused rather than repaired.** A back-off
+        with no multiplier is the one that matters: `is_banned` reads the
+        multiplier, so such a limiter would hold a deadline while reporting itself
+        unbanned, and the transport would send straight through it. A ban that
+        exists always has a multiplier of at least 1 -- `register_ban` sets that on
+        the first ban -- so a zero here means the state being restored is already
+        wrong, and quietly repairing it would hide that from whoever stored it.
+
+        The burst allowance is deliberately not seedable. It is the least valuable
+        of the counters -- a fresh burst of five sits inside AniDB's documented
+        "short burst, then one per four seconds" -- and giving it a seed would mean
+        inventing a reader for it purely for symmetry.
+        """
+        if banned_for < 0:
+            raise ValueError(f"banned_for is seconds of back-off remaining and cannot be negative: {banned_for!r}")
+        if seconds_since_last_send is not None and seconds_since_last_send < 0:
+            raise ValueError(
+                f"seconds_since_last_send is how long ago the last command went out "
+                f"and cannot be negative: {seconds_since_last_send!r}"
+            )
+        if ban_multiplier < 0 or ban_multiplier > self.MAX_BAN_MULTIPLIER:
+            raise ValueError(
+                f"ban_multiplier must be between 0 (not banned) and {self.MAX_BAN_MULTIPLIER} "
+                f"(the ceiling the doubling stops at), not {ban_multiplier!r}"
+            )
+        # `banned_for > 0` rather than a truthiness test on it: zero is a legitimate
+        # value here -- a window that has elapsed while its multiplier stands -- and
+        # writing it as `if banned_for` leaves a reader working out whether that case
+        # was considered or merely fell through.
+        if (banned_for > 0 or ban_cause is not None) and not ban_multiplier:
+            raise ValueError(
+                "A back-off was described with no ban_multiplier. A ban that exists has a "
+                "multiplier of at least 1, so this state is already inconsistent: is_banned "
+                "reads the multiplier, and a limiter seeded this way would hold a deadline "
+                "while reporting itself unbanned. Pass ban_multiplier together with "
+                "banned_for and ban_cause, or pass none of the three."
+            )
+        if ban_multiplier and ban_cause is None:
+            raise ValueError(
+                "A ban_multiplier was given with no ban_cause. Every refusal names which of "
+                "the three it was, and ban_cause answers None while unbanned -- so a cause "
+                "omitted here cannot be read back, and a caller asking why the client is "
+                "gated would be told nothing."
+            )
+
         self._monotonic = monotonic or _time.monotonic
         self._sleep = sleep or _time.sleep
         self._random = random or _random.random
         self._log = log
         self._lock = threading.Lock()
-        self._last_send = 0.0
+        # Zero rather than "now" when nothing is seeded: against a monotonic clock
+        # that reads as an idle long enough to trip IDLE_RESET, which is what a
+        # limiter that has never sent anything should look like.
+        self._last_send = 0.0 if seconds_since_last_send is None else self._monotonic() - seconds_since_last_send
         self._sent_in_burst = 0
-        self._ban_multiplier = 0
+        self._ban_multiplier = ban_multiplier
         # When the back-off ends, on the monotonic clock. Kept as an instant rather
         # than a duration to sleep, because nothing sleeps it: a ban is a state the
-        # sender checks before deciding whether to send at all.
-        self._banned_until = 0.0
+        # sender checks before deciding whether to send at all. Seeded from a
+        # duration, because an instant on this clock does not survive the process
+        # that produced it.
+        self._banned_until = self._monotonic() + banned_for if banned_for else 0.0
         # Why the window is open. Recorded here rather than at the call site so
         # that every refusal handed to a caller can say which of the three it is,
         # including the ones raised by a code path far from where the ban was
         # registered.
-        self._ban_cause: BanCause | None = None
+        self._ban_cause: BanCause | None = ban_cause if ban_multiplier else None
 
     @property
     def is_banned(self) -> bool:

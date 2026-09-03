@@ -193,6 +193,7 @@ anidb_client.init(
     client_name=None,
     client_version=None,
     db_pool_size=10,
+    rate_limiter=None,  # None means the transport builds its own
 )
 ```
 
@@ -232,6 +233,40 @@ request is not fatal when it is refused: if SQLite answers with some other mode,
 the cache runs in that mode and logs which one it is; if the request fails
 outright, the cache keeps whatever mode it had and logs that WAL was not granted.
 Foreign keys are enforced on every SQLite connection.
+
+`rate_limiter` lets the pacing and ban state outlive the process. Everything the
+limiter knows — the burst allowance, the last send, how much back-off is left and
+how far it has doubled — is per-process, so a restart starts fresh: the first
+command goes out with no delay and a short burst follows. That is inside AniDB's
+allowance once per deploy; it is not inside it on the tenth restart of a crash
+loop. Keep the state wherever you like and hand back a limiter that knows it:
+
+```python
+from anidb_client import BanCause, RateLimiter
+
+# Whatever you stored last time this process shut down.
+limiter = RateLimiter(
+    banned_for=900,               # seconds of back-off remaining, not a deadline
+    ban_multiplier=2,             # so the next ban is longer, not a fresh one
+    ban_cause=BanCause.SILENCE,
+    seconds_since_last_send=30,
+)
+anidb_client.init("sqlite:///anidb.db", rate_limiter=limiter)
+```
+
+Read the same values back with `ban_remaining()`, `ban_multiplier`, `ban_cause`
+and `seconds_since_last_send()` — everything you can seed, you can capture.
+
+**Pass durations, never timestamps.** These are measured on a monotonic clock,
+whose zero point is undefined and does not survive the process. A deadline stored
+by one process means nothing in the next, and it would mean nothing *quietly* —
+reading as already elapsed, or as hours away, with no error either way. "900
+seconds left" survives a restart, a reboot and a move to another host.
+
+Incoherent combinations raise rather than being silently corrected. A back-off
+with no multiplier is the one that bites: whether a client is banned is read from
+the multiplier, so such a limiter would hold a deadline while reporting itself
+unbanned, and the client would send straight through the ban.
 
 **`init()` refuses to run twice.** This library holds one client in module state,
 and its transport binds one fixed UDP source port that it will not share, so a

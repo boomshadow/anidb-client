@@ -6,8 +6,12 @@ and the jitter roll are all injected, so a half-hour back-off window is asserted
 in microseconds and exactly.
 """
 
+import logging
 import threading
 
+import pytest
+
+import anidb_client
 from anidb_client.errors import BanCause
 from anidb_client.ratelimit import RateLimiter
 
@@ -30,15 +34,19 @@ class FakeClock:
         self.now += seconds
 
 
-def make(clock=None, random=None):
+def make(clock=None, random=None, **seeds):
     """A limiter on a controlled clock, and by default an unjittered back-off.
 
     `random=lambda: 1.0` means "the top of the jitter range", which makes the
     back-off exactly the computed window and lets these tests assert on it. The
     jitter itself has its own tests below.
+
+    Any further keyword arguments are the resumable state, forwarded as given so
+    that the tests for it read the way a caller's own code would.
     """
     clock = clock or FakeClock()
-    return RateLimiter(monotonic=clock.monotonic, sleep=clock.sleep, random=random or (lambda: 1.0)), clock
+    limiter = RateLimiter(monotonic=clock.monotonic, sleep=clock.sleep, random=random or (lambda: 1.0), **seeds)
+    return limiter, clock
 
 
 class TestBurstThenSteadyRate:
@@ -314,3 +322,241 @@ class TestThreadSafety:
         limiter.wait()
 
         assert reported.is_set(), "the listener could not touch the limiter while the sender was backing off"
+
+
+class TestResumingStateFromAPreviousProcess:
+    """A limiter may be built already knowing what the last process knew.
+
+    Everything this class holds is per-process, and for a long-lived service that
+    state is what stands between one address and an IP ban. A restart begins with a
+    fresh allowance: the burst is full, the first command goes out with no delay,
+    and any back-off that was standing is simply forgotten. One burst per deploy
+    sits inside AniDB's documented flood allowance; a crash loop repeating it is the
+    shape of the incident this library has already been bitten by.
+
+    `init()` accepts a limiter (SPEC-006), so where that state lives is the
+    application's decision rather than this library's.
+    """
+
+    def test_a_plain_limiter_resumes_nothing(self):
+        """The default is exactly what it was."""
+        limiter, _clock = make()
+
+        assert not limiter.is_banned
+        assert limiter.ban_remaining() == 0
+        assert limiter.ban_cause is None
+
+    def test_a_standing_ban_is_resumed(self):
+        limiter, _clock = make(banned_for=900, ban_multiplier=1, ban_cause=BanCause.REFUSED)
+
+        assert limiter.is_banned
+        assert limiter.ban_remaining() == pytest.approx(900)
+        assert limiter.ban_multiplier == 1
+        assert limiter.ban_cause is BanCause.REFUSED
+
+    def test_the_multiplier_carries_so_the_next_ban_is_longer(self):
+        """The point of resuming it.
+
+        A client that comes back after a restart and is refused again must back off
+        for longer, rather than starting the doubling over at the base delay --
+        which is what a fresh limiter would do, forever, for a client that keeps
+        being refused across restarts.
+        """
+        limiter, _clock = make(ban_multiplier=4, ban_cause=BanCause.SILENCE)
+
+        assert limiter.register_ban() == 8
+
+    def test_the_window_is_measured_from_now_rather_than_from_a_stored_instant(self):
+        """The trap this shape of API exists to avoid.
+
+        `monotonic()` has an undefined zero point, so a deadline stored by one
+        process means nothing in the next -- and it would mean nothing *silently*,
+        reading as already elapsed or as hours away with no error either way.
+        Seeding a duration is what makes the value portable: the same 900 seconds
+        must come back as 900 seconds whatever this process's clock happens to read.
+        """
+        early_clock = FakeClock()
+        early_clock.now = 5.0
+        late_clock = FakeClock()
+        late_clock.now = 9_000_000.0
+
+        seeds = {"banned_for": 900, "ban_multiplier": 1, "ban_cause": BanCause.REFUSED}
+        early, _ = make(clock=early_clock, **seeds)
+        late, _ = make(clock=late_clock, **seeds)
+
+        assert early.ban_remaining() == pytest.approx(late.ban_remaining())
+
+    def test_a_resumed_window_elapses_like_any_other(self):
+        limiter, clock = make(banned_for=100, ban_multiplier=2, ban_cause=BanCause.REFUSED)
+
+        clock.advance(100)
+
+        assert limiter.ban_remaining() == 0
+        # Elapsing does not clear the ban, resumed or not.
+        assert limiter.is_banned
+        assert limiter.ban_multiplier == 2
+
+    def test_a_multiplier_may_be_resumed_with_no_window_left(self):
+        """A legitimate state: the window elapsed, and no authentication has
+        succeeded to clear the multiplier it left behind."""
+        limiter, _clock = make(ban_multiplier=3, ban_cause=BanCause.LOCAL)
+
+        assert limiter.is_banned
+        assert limiter.ban_remaining() == 0
+        assert limiter.ban_multiplier == 3
+
+    def test_the_last_send_is_resumed_as_an_age(self):
+        """So the first command after a restart is paced rather than free."""
+        limiter, _clock = make(seconds_since_last_send=1)
+
+        assert limiter.seconds_since_last_send() == pytest.approx(1)
+        # One second into a two-second burst interval, so one second is still owed.
+        assert limiter.delay_for_next_send() == pytest.approx(1)
+
+    def test_omitting_the_last_send_still_reads_as_never_sent(self):
+        limiter, _clock = make()
+
+        assert limiter.seconds_since_last_send() > RateLimiter.IDLE_RESET
+        assert limiter.delay_for_next_send() <= 0
+
+    def test_a_successful_auth_clears_resumed_state_like_any_other(self):
+        limiter, _clock = make(banned_for=900, ban_multiplier=2, ban_cause=BanCause.REFUSED)
+
+        limiter.clear_ban()
+
+        assert not limiter.is_banned
+        assert limiter.ban_remaining() == 0
+        assert limiter.ban_cause is None
+
+    def test_every_seedable_field_can_also_be_read(self):
+        """The rule that keeps this honest.
+
+        State that can be resumed must also be capturable, or a caller can
+        rehydrate a limiter it has no way to persist again -- which is a worse trap
+        than not being able to resume it at all.
+        """
+        limiter, _clock = make(banned_for=900, ban_multiplier=2, ban_cause=BanCause.SILENCE, seconds_since_last_send=7)
+
+        assert limiter.ban_remaining() == pytest.approx(900)
+        assert limiter.ban_multiplier == 2
+        assert limiter.ban_cause is BanCause.SILENCE
+        assert limiter.seconds_since_last_send() == pytest.approx(7)
+
+
+class TestIncoherentStateIsRefused:
+    """Refused rather than repaired, because repairing it hides the bug upstream.
+
+    The combination that matters is a back-off with no multiplier. `is_banned`
+    reads the multiplier, so such a limiter holds a deadline while reporting itself
+    unbanned -- and the transport, which asks `is_banned` before it asks anything
+    else, sends straight through the ban it was told about. A ban that exists always
+    has a multiplier of at least one, because `register_ban` sets that on the first
+    one, so a zero here says the stored state is already wrong.
+    """
+
+    def test_a_window_without_a_multiplier_is_refused(self):
+        with pytest.raises(ValueError, match="ban_multiplier"):
+            RateLimiter(banned_for=900)
+
+    def test_the_refusal_explains_what_would_have_gone_wrong(self):
+        with pytest.raises(ValueError, match="reporting itself unbanned"):
+            RateLimiter(banned_for=900)
+
+    def test_a_cause_without_a_multiplier_is_refused(self):
+        """`ban_cause` answers None while unbanned, so this one could not be read back."""
+        with pytest.raises(ValueError, match="ban_multiplier"):
+            RateLimiter(ban_cause=BanCause.REFUSED)
+
+    def test_a_multiplier_without_a_cause_is_refused(self):
+        with pytest.raises(ValueError, match="ban_cause"):
+            RateLimiter(ban_multiplier=1)
+
+    def test_a_negative_window_is_refused(self):
+        with pytest.raises(ValueError, match="banned_for"):
+            RateLimiter(banned_for=-1, ban_multiplier=1, ban_cause=BanCause.REFUSED)
+
+    def test_a_negative_last_send_is_refused(self):
+        with pytest.raises(ValueError, match="seconds_since_last_send"):
+            RateLimiter(seconds_since_last_send=-1)
+
+    def test_a_multiplier_past_the_ceiling_is_refused(self):
+        """The doubling stops at the ceiling, so nothing legitimate is above it."""
+        with pytest.raises(ValueError, match="ceiling"):
+            RateLimiter(ban_multiplier=RateLimiter.MAX_BAN_MULTIPLIER + 1, ban_cause=BanCause.REFUSED)
+
+    def test_a_negative_multiplier_is_refused(self):
+        with pytest.raises(ValueError, match="ban_multiplier"):
+            RateLimiter(ban_multiplier=-1, ban_cause=BanCause.REFUSED)
+
+
+class TestTheLimiterInitIsGiven:
+    """`init()` accepts a limiter, so the pacing state can be the caller's to keep.
+
+    `AniDBLink` has always taken one; `init()` is the only supported entry point
+    and did not expose it, so the sole route to supplying one was to construct the
+    transport directly and assign it into a module-private global -- a fork of this
+    library's own construction sequence, which would break or silently drive a
+    second transport the next time that sequence changed.
+    """
+
+    @pytest.fixture
+    def opened(self, monkeypatch, tmp_path):
+        """Run init() for real and record what reached the transport."""
+        for name, value in (
+            ("log", logging.getLogger("anidb_client.test")),
+            ("_anidb", None),
+            ("_sessionmaker", None),
+            ("_engine", None),
+            ("fanart_key", None),
+        ):
+            monkeypatch.setattr(anidb_client, name, value, raising=False)
+
+        seen: list[dict[str, object]] = []
+
+        class FakeLink:
+            def __init__(self, *args, **kwargs):
+                seen.append(kwargs)
+
+            def stop(self, *args, **kwargs):
+                pass
+
+        monkeypatch.setattr(anidb_client.link, "AniDBLink", FakeLink)
+
+        def go(**kwargs):
+            anidb_client.init(f"sqlite:///{tmp_path}/cache.db", api_user="u", api_pass="p", **kwargs)
+            return seen[-1]
+
+        yield go
+
+        anidb_client.close()
+
+    def test_the_limiter_given_is_the_one_handed_over(self, opened):
+        mine = RateLimiter()
+
+        assert opened(rate_limiter=mine)["rate_limiter"] is mine
+
+    def test_omitting_it_leaves_the_transport_to_build_its_own(self, opened):
+        """None keeps today's behaviour exactly, which is what every caller that
+        does not care about pacing state gets."""
+        assert opened()["rate_limiter"] is None
+
+    def test_a_resumed_limiter_arrives_still_banned(self, opened):
+        """End to end: the state a previous process stored is the state the
+        transport starts with, rather than something a restart forgets."""
+        resumed = RateLimiter(banned_for=900, ban_multiplier=2, ban_cause=BanCause.SILENCE)
+
+        handed_over = opened(rate_limiter=resumed)["rate_limiter"]
+
+        assert handed_over.is_banned
+        assert handed_over.ban_multiplier == 2
+        assert handed_over.ban_cause is BanCause.SILENCE
+
+    def test_the_limiter_is_part_of_the_declared_public_surface(self):
+        """Supplying one is only supported if the type can be named.
+
+        `BanCause` is here for the same reason: a limiter resuming a back-off has
+        to say which of the three refusals opened it, so a caller cannot construct
+        one without the vocabulary.
+        """
+        assert "RateLimiter" in anidb_client.__all__
+        assert "BanCause" in anidb_client.__all__

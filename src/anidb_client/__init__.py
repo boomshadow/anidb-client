@@ -43,7 +43,9 @@ from anidb_client.animeobjs import (
     RelatedAnime,
     RelationWalkStop,
 )
+from anidb_client.errors import BanCause
 from anidb_client.link import DEFAULT_OUTGOING_PORT, AniDBLink
+from anidb_client.ratelimit import RateLimiter
 
 # The library's public surface. Declared explicitly so that re-exports here are
 # understood as the API rather than as unused imports, and so `from anidb_client import *`
@@ -53,11 +55,13 @@ __all__ = [
     "AniDBLink",
     "Anime",
     "AnimeTitle",
+    "BanCause",
     "Episode",
     "File",
     "Group",
     "MylistAddOutcome",
     "MylistAddition",
+    "RateLimiter",
     "RelatedAnime",
     "RelationWalkStop",
     "close",
@@ -142,6 +146,7 @@ def init(
     client_name: str | None = None,
     client_version: int | None = None,
     db_pool_size: int = anidb_client.db.DEFAULT_POOL_SIZE,
+    rate_limiter: RateLimiter | None = None,
 ) -> None:
     # Declared before the guard below, which reads one of these: Python requires the
     # declaration to precede every use of the name in the function, not merely every
@@ -341,6 +346,9 @@ def init(
                 api_key=api_key,
                 client_name=client_name,
                 client_version=client_version,
+                # None means the transport builds its own, which is what every
+                # caller that does not care about pacing state gets.
+                rate_limiter=rate_limiter,
             )
             # logout=False: this client has not authenticated and may never, and a
             # courtesy packet from one that has no session is worse than silence.
