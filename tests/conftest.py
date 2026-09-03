@@ -143,6 +143,7 @@ def anidb(cache_url, link, monkeypatch):
         ("log", logging.getLogger("anidb_client.test")),
         ("_anidb", None),
         ("_sessionmaker", None),
+        ("_engine", None),
         ("fanart_key", None),
     ):
         monkeypatch.setattr(anidb_client, name, value, raising=False)
@@ -156,13 +157,14 @@ def anidb(cache_url, link, monkeypatch):
 
     yield anidb_client
 
-    # Dispose the engine explicitly. init_db() builds one per call and nothing owns
-    # it afterwards, so without this each test leaks its pooled SQLite connections
-    # until the garbage collector gets to them -- which surfaces as a drift of
-    # ResourceWarnings and, on a server database, as connections held open.
-    bind = anidb_client._sessionmaker.kw.get("bind")
-    if bind is not None:
-        bind.dispose()
+    # close() gives back what init() took, including the cache engine. This used to
+    # dig the engine out of the session factory's stored keyword arguments and
+    # dispose it by hand, because init_db() built one per call and nothing owned it
+    # afterwards -- without which every test leaked its pooled SQLite connections
+    # until the garbage collector got to them. Four other fixtures had each
+    # invented the same dig. The library owns the engine now, so this is the API
+    # call those workarounds were working around.
+    anidb_client.close()
 
 
 @pytest.fixture

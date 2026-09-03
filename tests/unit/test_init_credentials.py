@@ -20,25 +20,23 @@ import anidb_client
 def clean_globals(monkeypatch):
     """init() writes module globals; restore them regardless of what happens.
 
-    Teardown also disposes whatever engine init() left behind. That used to be a
-    line at the end of each test body, which is the same unpaired open/close the
-    library itself had: an assertion failing above it skipped the dispose and
-    leaked the pooled connections. A fixture cannot be skipped.
+    Teardown closes the library, which is what gives the cache engine back. That
+    used to be a line at the end of each test body, which is the same unpaired
+    open/close the library itself had: an assertion failing above it skipped the
+    dispose and leaked the pooled connections. A fixture cannot be skipped.
     """
     for name, value in (
         ("log", logging.getLogger("anidb_client.test")),
         ("_anidb", None),
         ("_sessionmaker", None),
+        ("_engine", None),
         ("fanart_key", None),
     ):
         monkeypatch.setattr(anidb_client, name, value, raising=False)
 
     yield
 
-    factory = anidb_client._sessionmaker
-    bind = factory.kw.get("bind") if factory is not None else None
-    if bind is not None:
-        bind.dispose()
+    anidb_client.close()
 
 
 @pytest.fixture
@@ -61,6 +59,9 @@ def captured_link(monkeypatch):
     class StubLink:
         def __init__(self, user, pwd, **kwargs):
             calls.append({"user": user, "pwd": pwd, **kwargs})
+
+        def stop(self, *args, **kwargs):
+            """init() registers a teardown against what it built; nothing to undo here."""
 
     monkeypatch.setattr(anidb_client.link, "AniDBLink", StubLink)
     return calls

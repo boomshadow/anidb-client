@@ -170,7 +170,8 @@ print(f"'{file.path}' contains episode {file.episode.episode_number} of "
 with open("poster.jpg", "wb") as f:
     anidb_client.download_image(f, anime)
 
-# Always close the UDP session before exiting, so the client logs out cleanly.
+# Always close before exiting: it logs out cleanly and, just as importantly, gives
+# back the pinned UDP port and the cache's connections.
 anidb_client.close()
 ```
 
@@ -231,6 +232,34 @@ request is not fatal when it is refused: if SQLite answers with some other mode,
 the cache runs in that mode and logs which one it is; if the request fails
 outright, the cache keeps whatever mode it had and logs that WAL was not granted.
 Foreign keys are enforced on every SQLite connection.
+
+**`init()` refuses to run twice.** This library holds one client in module state,
+and its transport binds one fixed UDP source port that it will not share, so a
+second client could not open anyway — it used to fail with an address-in-use error
+naming a port nothing visible was using. Call `close()` first if you mean to
+re-initialise. A failed `init()` leaves nothing running, so you can correct
+whatever it complained about and call it again.
+
+### close()
+
+```python
+anidb_client.close(timeout=None)
+```
+
+Ends the UDP session and gives back everything `init()` took: the transport is
+stopped, the cache's pooled connections are released, the fanart key is cleared,
+and the outgoing UDP port is free to bind again — before `close()` returns, not
+shortly afterwards. Once it has returned, `init()` may be called again.
+
+`timeout` bounds the wait for AniDB to acknowledge the logout, defaulting to the
+transport's command timeout of 20 seconds. **Pass your own if your shutdown budget
+is tighter than that.** A client AniDB has banned is never told its logout
+arrived, so that wait runs to the full bound — and a container with a ten-second
+stop grace period will be killed in the middle of it, losing whatever your own
+shutdown does after this call. Logging out is best effort; the teardown happens
+either way.
+
+Calling `close()` twice, or without having called `init()`, does nothing.
 
 ## Reference
 

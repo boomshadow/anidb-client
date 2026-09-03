@@ -1,8 +1,8 @@
 ---
 title: "Configuration and Credentials"
-description: "Behavioral expectations for initialising anidb-client: init() as the single required entry point, the database URL and the in-memory URL it refuses outside db_only mode, the connection-pool size it exposes, the three credential sources it resolves (direct arguments, a netrc file, or neither in db_only mode), the exact netrc machine-name matching rules for AniDB credentials, database credentials and the fanart key, safe injection of a netrc-sourced password into the SQL URL, the registered client identity, the encryption key, the pinned outgoing UDP port, logging setup — including a logger that exists from import, so no path reachable before init() can fail by reporting something too early — and close() as the clean shutdown."
+description: "Behavioral expectations for initialising anidb-client: init() as the single required entry point, the database URL and the in-memory URL it refuses outside db_only mode, the connection-pool size it exposes, the three credential sources it resolves (direct arguments, a netrc file, or neither in db_only mode), the exact netrc machine-name matching rules for AniDB credentials, database credentials and the fanart key, safe injection of a netrc-sourced password into the SQL URL, the registered client identity, the encryption key, the pinned outgoing UDP port, logging setup — including a logger that exists from import, so no path reachable before init() can fail by reporting something too early — the refusal of a second init() while one is already live, the all-or-nothing construction that leaves nothing running when init() fails, and close() as the clean shutdown that gives back everything init() took, including the pinned source port."
 status: accepted
-tags: [configuration, init, credentials, netrc, database-url, sql-url, db-only, in-memory, connection-pool, client-registration, client-name, client-version, encryption-key, api-key, fanart-key, logging, logger, pre-init, udp-port, source-port, port-pinning, http-timeout, close, shutdown]
+tags: [configuration, init, credentials, netrc, database-url, sql-url, db-only, in-memory, connection-pool, client-registration, client-name, client-version, encryption-key, api-key, fanart-key, logging, logger, pre-init, udp-port, source-port, port-pinning, http-timeout, close, shutdown, lifecycle, re-entry, idempotence, teardown, resource-management, engine-disposal]
 ---
 
 # Configuration and Credentials
@@ -74,13 +74,38 @@ The library holds a logger from the moment it is imported, and `init()` replaces
 
 **HTTP timeout** — every HTTP request the library makes (the two bulk XML fetches, cover images and the fanart API) is bounded by a per-socket-operation timeout. This is not a bound on the whole transfer: it ends a stalled connection but not a pathologically slow one. Without it, urllib's default of no timeout at all lets any of those calls block their caller forever on a server that accepts a connection and then stops talking — the one hang the UDP transport's own timeouts do not cover.
 
+## One client at a time
+
+**`init()` refuses to run while a client is already live**, and says so rather than letting the caller find out on the socket. This library holds its client in module state — there is no client object to pass around — and the transport binds one fixed source port that is deliberately not shareable, so a second client could not have opened anyway. What a caller used to get was an address-in-use error naming a port nothing visible was using, raised from a call that reads like configuration. ADR-008 records the decision, and why a silent no-op and a tear-down-and-rebuild are both worse.
+
+`close()` is the way back: after it, `init()` succeeds again.
+
+## Failing to start leaves nothing running
+
+**A failed `init()` acquires nothing, or gives back whatever it had already acquired.** Everything the call can refuse over — the in-memory URL, missing credentials, a database URL that will not parse — is decided before anything is opened. The two things that *are* opened are opened together, cache first, and if the second fails the first is released.
+
+The order is not arbitrary. The cache is the cheaper thing to fail and the easier thing to give back, so it goes first; the transport goes last, so the resource that is hardest to recover is never the one left stranded. This used to run the other way round, and the consequence was sharp rather than untidy: the UDP socket was bound and both of its threads were running fifty lines before the database was touched, so a bad database URL raised with a live socket owned by nothing the caller could reach — and because the port is pinned and not shareable, the caller who corrected the URL and called `init()` again could not bind. Two individually correct decisions that interacted badly.
+
+The one thing a failed `init()` does leave changed is the logger, which is not a resource and which this spec already says exists from import and is configured rather than created.
+
 ## Shutting down
 
-`close()` ends the UDP session cleanly, logging out so AniDB is not left holding a session. A caller that skips it leaves the session to expire on the server's schedule. In `db_only` mode there is nothing to close.
+`close()` ends the UDP session cleanly, logging out so AniDB is not left holding a session. A caller that skips it leaves the session to expire on the server's schedule. In `db_only` mode there is no transport to stop.
+
+**After `close()` returns, the process is in the state it was in before `init()` ran.** That is the property, and it is worth more than the courtesy of the logout:
+
+- **The transport is stopped and not handed out.** `get_link()` refuses rather than answering with a stopped transport. The health surface it carries (SPEC-002) exists to be believed without sending anything to check it, so an object describing a session that no longer exists is worse than a refusal.
+- **The cache's connections are given back.** The engine is disposed rather than left holding its pool. Invisible in a process that initialises once and exits; a genuine leak in anything that initialises and closes more than once.
+- **The source port is free.** Not eventually free — free before `close()` returns, so a caller restarting can bind it immediately. SPEC-002 covers what that costs the transport to guarantee, because closing the socket is not by itself enough to achieve it.
+- **The fanart key is cleared**, because it is configuration this call is undoing.
+
+**Logging out is best effort; shutting down is not.** A client AniDB has stopped answering can never be told its logout arrived, so the wait for that acknowledgement is bounded and the teardown happens either way. The bound may be shortened by the caller: an application whose own shutdown budget is tighter than the transport's command timeout should say so rather than discover the difference during a deployment.
+
+`close()` on a library that was never initialised, and `close()` twice, both do nothing and neither is an error.
 
 ## Related Artifacts
 
 - **Line of truth (external):** the netrc file format, and AniDB's client-registration requirement for the name-and-version pair sent in AUTH.
-- **Related ADRs:** ADR-007 (why the outgoing source port is pinned rather than chosen per call).
+- **Related ADRs:** ADR-007 (why the outgoing source port is pinned rather than chosen per call); ADR-008 (why a second `init()` is refused rather than ignored or rebuilt).
 - **Related specs:** SPEC-002 (what the resolved credentials, client identity, encryption key and outgoing port are used for); SPEC-003 (the database URL's role and the backends it may name); SPEC-005 (the fanart key's effect on `Anime.fanart`); SPEC-001 (objects, none of which may be constructed before `init()` has run).
-- **Tests:** credential resolution and the `db_only` path in `tests/unit/test_init_credentials.py`; the in-memory refusal — including that no UDP link is opened before it — and the pool-size argument reaching the engine in `tests/unit/test_init_database.py`; the SQL URL rewriting rules — hostname matching, user pairing, percent-encoding, IPv6 and ports — in `tests/unit/test_sql_url_credentials.py`; the outgoing UDP port — that the default is the pinned one, that it does not move between calls, and that a caller may still choose its own — in `tests/unit/test_init_udp_port.py`; the HTTP timeout's presence at every call site in `tests/unit/test_http_timeouts.py`; that a logger exists before `init()` and that the entry points reachable that early report rather than raising, in `tests/unit/test_xml_cache_fetch.py`; the package's declared public surface in `tests/unit/test_package.py`.
+- **Tests:** credential resolution and the `db_only` path in `tests/unit/test_init_credentials.py`; the in-memory refusal — including that no UDP link is opened before it — and the pool-size argument reaching the engine in `tests/unit/test_init_database.py`; the SQL URL rewriting rules — hostname matching, user pairing, percent-encoding, IPv6 and ports — in `tests/unit/test_sql_url_credentials.py`; the outgoing UDP port — that the default is the pinned one, that it does not move between calls, and that a caller may still choose its own — in `tests/unit/test_init_udp_port.py`; the HTTP timeout's presence at every call site in `tests/unit/test_http_timeouts.py`; that a logger exists before `init()` and that the entry points reachable that early report rather than raising, in `tests/unit/test_xml_cache_fetch.py`; the package's declared public surface in `tests/unit/test_package.py`. The lifecycle is covered in `tests/unit/test_lifecycle.py`: that a second `init()` is refused, that the refusal names the way out and leaves the first client working, and that closing first makes a second call legal; that a failed `init()` builds no transport when the cache is what refused, disposes the cache when the transport is what refused, leaves no global set and no fanart key behind, and lets a corrected call succeed; that `close()` disposes the engine, drops the session factory, clears the key, stops the transport, refuses to hand a stopped one out, and still returns the pool when stopping raises; and that closing twice or without having initialised is a no-op. The reported failure is pinned there end to end with a real socket, in `TestThePinnedPortComesBack`: after `close()` the same port binds again, immediately and in the same process.

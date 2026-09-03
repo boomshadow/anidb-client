@@ -70,17 +70,22 @@ def make_link(monkeypatch):
     yield factory
 
     for link in links:
-        # Suppressed because a link whose listener already stopped (several tests
-        # exercise exactly that) has nothing left to close.
+        # `stop(logout=False)` rather than reaching past it to the listener. That
+        # reach-in was written when the sender genuinely had no stop short of a
+        # LOGOUT round trip, so every test in this file left one running; the
+        # transport can now be ended without sending anything, which is what
+        # `TestStoppingTheTransport` below pins and what SPEC-002 promises.
         #
-        # AniDBLink's sender thread has no stop short of a LOGOUT round-trip, so it
-        # outlives this teardown by design. Tests that deliberately provoke a ban
-        # leave it retrying, and it can therefore log one "Failed to send command"
-        # on the now-closed socket -- pytest reports that as a thread-exception
-        # warning. It is teardown noise, not a leak: the thread is a daemon and the
-        # send path handles the error rather than dying on it.
+        # `logout=False` because a link built for a test has no session worth
+        # ending, and several of these tests deliberately provoke a ban -- where
+        # sending is the one thing that must not happen.
+        #
+        # Suppressed because a link whose transport a test already stopped has
+        # nothing left to tear down, and because a test that provoked a ban may
+        # leave the sender mid-error on a socket this is closing. Teardown noise
+        # either way: both threads are daemons and both handle it.
         with contextlib.suppress(Exception):
-            link._listener.stop()
+            link.stop(logout=False)
 
 
 def _await(predicate, timeout=5.0, message="condition never became true"):
@@ -1319,3 +1324,142 @@ class TestCallbackIsolation:
             _await(lambda: second, message="a blocked callback stalled the receive loop")
         finally:
             release.set()
+
+
+class TestStoppingTheTransport:
+    """`stop()` ends the transport and gives the source port back.
+
+    There was no path through it that did both. Authenticated, it sent LOGOUT,
+    waited for the acknowledgement and returned -- never closing the socket, so a
+    clean `init()`/`close()` cycle left the pinned port bound for the life of the
+    process and the listener thread reading it. Unauthenticated, it closed the
+    socket but never signalled the sender, which went on waking every idle tick
+    forever. Each branch did half the job, and neither did the other half.
+
+    The port matters more than it looks. Releasing it is not simply a matter of
+    closing the descriptor: a thread blocked in `recv` keeps the socket alive in
+    the kernel until that call returns, so the port stays bound after the close.
+    With an ephemeral, shareable port that is invisible. With one pinned port and
+    no SO_REUSEADDR (ADR-007) it is the difference between a client that can
+    restart and one that cannot.
+    """
+
+    def test_the_port_is_free_once_stop_returns(self, server, make_link):
+        """The property a restarting or retrying caller actually depends on."""
+        holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        holder.bind(("", 0))
+        port = holder.getsockname()[1]
+        holder.close()
+
+        link = make_link(server, myport=port)
+        link.stop()
+
+        # Rebound immediately, in this process, with no waiting. This failed with
+        # EADDRINUSE while the listener was still sitting in recv.
+        rebound = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            rebound.bind(("", port))
+        finally:
+            rebound.close()
+
+    def test_the_port_is_free_after_an_authenticated_stop(self, server, make_link):
+        """The branch that logs out has to release it too, and released nothing."""
+        server.on("AUTH", AUTH_OK)
+        server.on("LOGOUT", "203 LOGGED OUT")
+
+        holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        holder.bind(("", 0))
+        port = holder.getsockname()[1]
+        holder.close()
+
+        link = make_link(server, myport=port)
+        link.request(anidb_client.commands.UptimeCommand(), lambda resp: None)
+        server.wait_for("UPTIME")
+
+        link.stop()
+
+        rebound = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            rebound.bind(("", port))
+        finally:
+            rebound.close()
+
+    def test_both_threads_end(self, server, make_link):
+        """A stopped transport leaves nothing running, which is the stated property."""
+        link = make_link(server)
+        link.stop()
+
+        assert not link.is_alive(), "the sender thread is still running"
+        assert not link._listener.is_alive(), "the listener thread is still running"
+
+    def test_an_unauthenticated_stop_sends_nothing(self, server, make_link):
+        """A courtesy packet from a client with no session is worse than silence."""
+        link = make_link(server)
+        link.stop()
+
+        assert server.received_commands() == []
+
+    def test_logout_false_sends_nothing_even_when_authenticated(self, server, make_link):
+        """The teardown a failed `init()` uses: end it, do not talk to it.
+
+        A half-built client may be one that is backing off, and while a back-off is
+        open sending is the one thing that must not happen (SPEC-002).
+        """
+        server.on("AUTH", AUTH_OK)
+        server.on("LOGOUT", "203 LOGGED OUT")
+
+        link = make_link(server)
+        link.request(anidb_client.commands.UptimeCommand(), lambda resp: None)
+        server.wait_for("UPTIME")
+
+        link.stop(logout=False)
+
+        assert "LOGOUT" not in server.received_commands()
+
+    def test_a_logout_that_is_never_answered_still_tears_down(self, server, make_link):
+        """The case that hurt an embedder most: a banned client cannot be told.
+
+        `stop()` waited the full command timeout for an acknowledgement that was
+        never coming and *then* returned with everything still running. Now the
+        wait is bounded and the teardown happens either way.
+        """
+        server.on("AUTH", AUTH_OK)
+        server.on("LOGOUT", lambda req: None)
+
+        link = make_link(server)
+        link.request(anidb_client.commands.UptimeCommand(), lambda resp: None)
+        server.wait_for("UPTIME")
+
+        started = monotonic()
+        link.stop(timeout=0.5)
+        elapsed = monotonic() - started
+
+        assert link._listener.sock is None
+        assert not link._listener.is_alive()
+        # Bounded by what was asked for, not by the command timeout.
+        assert elapsed < 5, f"stop() took {elapsed:.1f}s despite being given 0.5s"
+
+    def test_stopping_twice_is_safe(self, server, make_link):
+        """`close()` may be called on a client that has already been closed."""
+        link = make_link(server)
+        link.stop()
+        link.stop()
+
+    def test_a_command_in_flight_is_failed_rather_than_stranded(self, server, make_link):
+        """SPEC-002: a waiter is always released.
+
+        A command outstanding when the transport stops can never be answered, and
+        leaving it registered hangs whoever asked for it instead of telling them.
+        """
+        server.on("AUTH", AUTH_OK)
+        server.on("UPTIME", lambda req: None)
+
+        link = make_link(server)
+        command = anidb_client.commands.UptimeCommand()
+        link.request(command, lambda resp: None)
+        server.wait_for("UPTIME")
+
+        link.stop(logout=False)
+
+        with pytest.raises(AniDBError):
+            command.future.result(timeout=5)

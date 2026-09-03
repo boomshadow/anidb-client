@@ -21,6 +21,7 @@ def clean_globals(monkeypatch):
         ("log", logging.getLogger("anidb_client.test")),
         ("_anidb", None),
         ("_sessionmaker", None),
+        ("_engine", None),
         ("fanart_key", None),
     ):
         monkeypatch.setattr(anidb_client, name, value, raising=False)
@@ -36,10 +37,7 @@ def opened_cache(clean_globals):
 
     yield go
 
-    factory = anidb_client._sessionmaker
-    bind = factory.kw.get("bind") if factory is not None else None
-    if bind is not None:
-        bind.dispose()
+    anidb_client.close()
 
 
 class TestTheInMemoryGuard:
@@ -75,11 +73,11 @@ class TestTheInMemoryGuard:
 
 class TestThePoolBound:
     def test_the_default_bound_reaches_the_engine(self, tmp_path, opened_cache):
-        factory = opened_cache(f"sqlite:///{tmp_path}/cache.db")
-        pool = factory.kw["bind"].pool
+        opened_cache(f"sqlite:///{tmp_path}/cache.db")
+        pool = anidb_client._engine.pool
         assert pool.size() == 10
         assert pool._max_overflow == POOL_MAX_OVERFLOW
 
     def test_the_override_reaches_the_engine(self, tmp_path, opened_cache):
-        factory = opened_cache(f"sqlite:///{tmp_path}/cache.db", db_pool_size=2)
-        assert factory.kw["bind"].pool.size() == 2
+        opened_cache(f"sqlite:///{tmp_path}/cache.db", db_pool_size=2)
+        assert anidb_client._engine.pool.size() == 2

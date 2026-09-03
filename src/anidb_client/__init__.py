@@ -15,6 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with anidb-client.  If not, see <http://www.gnu.org/licenses/>.
 
+import contextlib
 import logging
 import logging.handlers
 import netrc
@@ -23,6 +24,7 @@ import urllib.parse
 import urllib.request
 from typing import IO
 
+import sqlalchemy.engine
 import sqlalchemy.orm
 
 import anidb_client.db
@@ -116,6 +118,12 @@ HTTP_TIMEOUT = 30
 log: logging.Logger = logging.getLogger(__name__)
 _anidb: AniDBLink | None = None
 _sessionmaker: sqlalchemy.orm.sessionmaker[sqlalchemy.orm.Session] | None = None
+# The cache's engine, kept because it is the thing that owns something. The
+# sessionmaker is a handle derived from it; the pool of live connections belongs
+# to the engine, and `close()` cannot give those back without it. Held here rather
+# than dug back out of the sessionmaker's stored keyword arguments, which is what
+# every caller that needed it had been doing.
+_engine: sqlalchemy.engine.Engine | None = None
 fanart_key: str | None = None
 
 
@@ -135,6 +143,32 @@ def init(
     client_version: int | None = None,
     db_pool_size: int = anidb_client.db.DEFAULT_POOL_SIZE,
 ) -> None:
+    # Declared before the guard below, which reads one of these: Python requires the
+    # declaration to precede every use of the name in the function, not merely every
+    # assignment.
+    global log, _anidb, _sessionmaker, _engine, fanart_key
+
+    # One live client per process, and a second call says so rather than finding out
+    # on the socket. The transport pins one source port and no longer makes it
+    # shareable (ADR-007), so a second init() built a second link that failed to
+    # bind -- an address-in-use error naming a port nothing visible was using, from
+    # a call that looked like configuration rather than like opening a socket.
+    #
+    # Refused rather than ignored, and rather than rebuilt. A silent no-op lets a
+    # caller believe it reconfigured something it did not, and the disagreement
+    # surfaces much later and somewhere else. Rebuilding is worse against a
+    # rate-limited API: it discards a live authenticated session and makes the next
+    # command pay a fresh handshake, for a call that was most likely a mistake. The
+    # same reasoning as ADR-007 one level up -- this client would rather fail to
+    # start than be quietly wrong about its own identity. See ADR-008.
+    if _sessionmaker is not None:
+        raise adbb_errors.AniDBError(
+            "anidb_client.init() has already been called in this process. This library holds "
+            "one client, and the transport binds one fixed UDP source port that cannot be "
+            "shared, so a second one could not open anyway. Call anidb_client.close() first if "
+            "you mean to re-initialise."
+        )
+
     # In-memory SQLite cannot back a client that opens a UDP session, and failing
     # here is the only honest answer: SQLAlchemy gives it a SingletonThreadPool, so
     # every thread gets its own connection -- and every connection to :memory: is a
@@ -177,9 +211,19 @@ def init(
         lh.setFormatter(logging.Formatter("anidb_client %(filename)s/%(funcName)s:%(lineno)d - %(message)s"))
         logger.addHandler(lh)
 
-    global log, _anidb, _sessionmaker, fanart_key
+    # The logger is installed now rather than at the end, because the resolution
+    # below logs and `init_db` logs the journal mode it obtained. It is not a
+    # resource and installing it twice costs nothing, so it is the one piece of
+    # state a failed init() does leave changed -- and SPEC-006 already says this
+    # object exists from import and that init() configures it rather than creating
+    # it. Everything that *owns* something is assigned at the end, once it exists.
     log = logger
-    fanart_key = fanart_api_key
+
+    # Resolved into a local and published at the end with the rest. It is not a
+    # resource, but it is state a caller can read, and a failed init() that left a
+    # key behind would have half-configured the library it just refused to
+    # configure.
+    resolved_fanart_key = fanart_api_key
 
     try:
         nrc = netrc.netrc(netrc_file)
@@ -210,21 +254,12 @@ def init(
                     api_key = account
                 break
 
-    if not db_only:
-        if not (api_user and api_pass):
-            # A netrc file that exists but names none of AniDB's hosts left the
-            # credentials unset and opened the link anyway, which failed later at
-            # AUTH with nothing pointing back at the configuration.
-            raise adbb_errors.AniDBError(
-                "An AniDB username and password are required, either as arguments or in a netrc file"
-            )
-        _anidb = anidb_client.link.AniDBLink(
-            api_user,
-            api_pass,
-            myport=outgoing_udp_port,
-            api_key=api_key,
-            client_name=client_name,
-            client_version=client_version,
+    if not db_only and not (api_user and api_pass):
+        # A netrc file that exists but names none of AniDB's hosts left the
+        # credentials unset and opened the link anyway, which failed later at
+        # AUTH with nothing pointing back at the configuration.
+        raise adbb_errors.AniDBError(
+            "An AniDB username and password are required, either as arguments or in a netrc file"
         )
 
     if nrc:
@@ -258,7 +293,7 @@ def init(
                     netloc = f"{quoted_user}:{quoted_password}@{host}"
                     sql_db_url = parsed._replace(netloc=netloc).geturl()
 
-        if not fanart_key:
+        if not resolved_fanart_key:
             for host in ["fanart.tv", "assets.fanart.tv", "webservice.fanart.tv", "api.fanart.tv"]:
                 fanart_auth = nrc.authenticators(host)
                 if fanart_auth is None:
@@ -268,9 +303,55 @@ def init(
                 if not key:
                     continue
                 log.debug("Fanart key found in netrc")
-                fanart_key = key[0]
+                resolved_fanart_key = key[0]
 
-    _sessionmaker = anidb_client.db.init_db(sql_db_url, pool_size=db_pool_size)
+    # Everything above this line either validates or resolves; nothing above it owns
+    # anything, so a failure up there leaves nothing to clean up. Below it two
+    # resources are acquired, and either can fail with the other already open.
+    #
+    # It used to run the other way round: the transport was built first and the
+    # cache fifty lines later, so a bad database URL raised with the UDP socket
+    # already bound and both of its threads already running, owned by nothing the
+    # caller could reach. That was survivable while the source port was random and
+    # the socket was shareable. It stopped being survivable when the port was pinned
+    # and SO_REUSEADDR was removed (ADR-007): the leaked socket kept the port, so the
+    # caller who corrected the URL and called init() again could not bind -- an
+    # address-in-use error naming a port nothing visible was using. Two individually
+    # correct changes that interacted badly.
+    #
+    # So the acquisitions are adjacent, the cheaper one goes first, and an ExitStack
+    # unwinds whatever was already built if the next thing raises. Ordering alone
+    # would have been enough for the failure that was reported and not for the one
+    # underneath it: AniDBLink binds the socket and starts the listener inside its
+    # own constructor, so it can raise with both already live and no reference
+    # escaping to anyone. `pop_all()` is the commit -- reached only when everything
+    # is open, after which the stack unwinds nothing.
+    with contextlib.ExitStack() as stack:
+        engine, sessionmaker_ = anidb_client.db.init_db(sql_db_url, pool_size=db_pool_size)
+        stack.callback(engine.dispose)
+
+        link: AniDBLink | None = None
+        if not db_only:
+            # Narrowed for the type checker, and true by the check above.
+            assert api_user is not None and api_pass is not None
+            link = anidb_client.link.AniDBLink(
+                api_user,
+                api_pass,
+                myport=outgoing_udp_port,
+                api_key=api_key,
+                client_name=client_name,
+                client_version=client_version,
+            )
+            # logout=False: this client has not authenticated and may never, and a
+            # courtesy packet from one that has no session is worse than silence.
+            stack.callback(link.stop, logout=False)
+
+        stack.pop_all()
+
+    _engine = engine
+    _sessionmaker = sessionmaker_
+    _anidb = link
+    fanart_key = resolved_fanart_key
 
 
 def get_session() -> sqlalchemy.orm.Session:
@@ -306,8 +387,10 @@ def get_link() -> AniDBLink:
     """
     if _anidb is None:
         raise anidb_client.errors.AniDBError(
-            "There is no AniDB transport to read: init() has not been called, or it was "
-            "called with db_only=True, which opens no UDP session."
+            "There is no AniDB transport to read: init() has not been called, it was called "
+            "with db_only=True, which opens no UDP session, or close() has since shut one "
+            "down. Answering with the stopped transport instead would describe a session "
+            "that no longer exists."
         )
     return _anidb
 
@@ -340,7 +423,54 @@ def download_fanart(filehandle: IO[bytes], url: str, preview: bool = False) -> N
         filehandle.write(f.read())
 
 
-def close() -> None:
-    global _anidb
-    if _anidb:
-        _anidb.stop()
+def close(timeout: float | None = None) -> None:
+    """Shut the library down and give back everything `init()` took.
+
+    After this returns the process is in the state it was in before `init()` ran:
+    no transport, no session factory, no cache connections held, and no fanart key.
+    A subsequent `init()` succeeds -- which is the point, and which was not true
+    before. The declaration here used to name the globals and assign none of them,
+    which is a tell: something was meant to be cleared and never was.
+
+    Two things leaked, and each was invisible for a different reason.
+
+    `get_link()` went on handing out a *stopped* transport, so a caller reading the
+    health surface (SPEC-002) got a plausible object describing a session that no
+    longer existed, rather than being told there was nothing to read. Wrong answers
+    are worse than refusals here, because the whole purpose of that surface is to be
+    believed without sending anything to check it.
+
+    And the cache engine was never disposed, so its pool kept whatever it was
+    holding -- invisible in a process that initialises once and exits, a genuine
+    leak in anything that initialises and closes more than once. The test suite had
+    been paying for this for a while: five separate fixtures reached into the
+    session factory's stored keyword arguments to find the engine and dispose it by
+    hand, each carrying a comment noting that nothing owned it.
+
+    The globals are cleared *before* the teardown runs, so a failure while stopping
+    cannot leave the library both broken and marked as initialised -- a caller who
+    catches it can still call `init()` again.
+
+    `timeout` bounds the wait for AniDB to acknowledge the logout. It defaults to
+    the transport's command timeout. An application with a shutdown budget shorter
+    than that should pass its own: a banned client is never going to be told its
+    logout arrived, and no amount of waiting changes that.
+
+    Calling this twice, or without having called `init()`, does nothing and is not
+    an error.
+    """
+    global _anidb, _sessionmaker, _engine, fanart_key
+
+    link, _anidb = _anidb, None
+    engine, _engine = _engine, None
+    _sessionmaker = None
+    fanart_key = None
+
+    try:
+        if link is not None:
+            link.stop(timeout=timeout)
+    finally:
+        # In a finally: a transport that fails to stop must not also cost the
+        # caller the connection pool.
+        if engine is not None:
+            engine.dispose()

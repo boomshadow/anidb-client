@@ -54,6 +54,15 @@ class RecordingLink:
     def __init__(self):
         self.requests = []
         self._responders = {}
+        self.stopped = False
+
+    def stop(self, timeout=None, logout=True):
+        """The lifecycle calls this; nothing here holds a socket or a thread.
+
+        Recorded rather than ignored so a test can assert that `close()` reached
+        the transport it was handed.
+        """
+        self.stopped = True
 
     def on(self, command, response):
         """Reply to `command` with a FakeResponse, or a callable taking the command."""

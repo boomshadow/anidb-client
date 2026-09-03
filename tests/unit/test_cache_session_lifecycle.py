@@ -31,7 +31,7 @@ def _fail_with_the_connection_in_hand(session):
 
 
 def _pool(anidb):
-    return anidb._sessionmaker.kw["bind"].pool
+    return anidb._engine.pool
 
 
 class TestTheContextManagerItself:

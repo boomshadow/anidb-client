@@ -41,12 +41,12 @@ def session(tmp_path):
     against the engine configuration real callers get -- foreign keys enforced,
     WAL where the filesystem grants it -- rather than against SQLite's defaults.
     """
-    factory = init_db(f"sqlite:///{tmp_path}/cache.db")
+    engine, factory = init_db(f"sqlite:///{tmp_path}/cache.db")
     with factory() as s:
         yield s
     # Without this the pooled connections survive the test and are only closed
     # when the collector gets round to them.
-    factory.kw["bind"].dispose()
+    engine.dispose()
 
 
 def _anime(aid=6187, **kwargs):
@@ -76,7 +76,7 @@ def _anime(aid=6187, **kwargs):
 
 class TestSchema:
     def test_init_db_creates_every_table(self, tmp_path):
-        init_db(f"sqlite:///{tmp_path}/cache.db")
+        _engine, _factory = init_db(f"sqlite:///{tmp_path}/cache.db")
         expected = {
             "anime",
             "anime_relation",
@@ -88,7 +88,7 @@ class TestSchema:
         assert expected <= set(Base.metadata.tables)
 
     def test_init_db_returns_a_usable_session_factory(self, tmp_path):
-        factory = init_db(f"sqlite:///{tmp_path}/cache.db")
+        engine, factory = init_db(f"sqlite:///{tmp_path}/cache.db")
         with factory() as s:
             assert s.scalar(select(func.count()).select_from(AnimeTable)) == 0
 
@@ -99,7 +99,7 @@ class TestSchema:
         were passed unconditionally, and in-memory SQLite gets a
         SingletonThreadPool, which accepts neither and raised TypeError.
         """
-        factory = init_db("sqlite://")
+        engine, factory = init_db("sqlite://")
         with factory() as s:
             assert s.scalar(select(func.count()).select_from(AnimeTable)) == 0
 
@@ -113,10 +113,10 @@ class TestEngineConfiguration:
     """
 
     def test_a_file_database_is_put_into_wal_mode(self, tmp_path):
-        factory = init_db(f"sqlite:///{tmp_path}/cache.db")
+        engine, factory = init_db(f"sqlite:///{tmp_path}/cache.db")
         with factory() as s:
             assert s.connection().exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"
-        factory.kw["bind"].dispose()
+        engine.dispose()
 
     def test_a_refused_journal_mode_still_yields_a_working_cache(self, tmp_path, monkeypatch):
         """WAL is asked for, not required.
@@ -134,14 +134,14 @@ class TestEngineConfiguration:
 
         monkeypatch.setattr(sqlalchemy.engine.Connection, "exec_driver_sql", refuse)
 
-        factory = init_db(f"sqlite:///{tmp_path}/cache.db")
+        engine, factory = init_db(f"sqlite:///{tmp_path}/cache.db")
         with factory() as s:
             assert s.scalar(select(func.count()).select_from(AnimeTable)) == 0
-        factory.kw["bind"].dispose()
+        engine.dispose()
 
     def test_an_in_memory_cache_keeps_the_mode_it_can_have(self):
         """The other half of the fallback, and a real one: `:memory:` has no WAL."""
-        factory = init_db("sqlite://")
+        engine, factory = init_db("sqlite://")
         with factory() as s:
             assert s.connection().exec_driver_sql("PRAGMA journal_mode").scalar() == "memory"
             assert s.scalar(select(func.count()).select_from(AnimeTable)) == 0
@@ -161,16 +161,16 @@ class TestEngineConfiguration:
 
     def test_the_pool_is_bounded(self, tmp_path):
         """It was max_overflow=-1: unlimited, by SQLAlchemy's own documentation."""
-        factory = init_db(f"sqlite:///{tmp_path}/cache.db")
-        pool = factory.kw["bind"].pool
+        engine, factory = init_db(f"sqlite:///{tmp_path}/cache.db")
+        pool = engine.pool
         assert pool.size() == 10
         assert pool._max_overflow == POOL_MAX_OVERFLOW
-        factory.kw["bind"].dispose()
+        engine.dispose()
 
     def test_the_pool_size_can_be_overridden(self, tmp_path):
-        factory = init_db(f"sqlite:///{tmp_path}/cache.db", pool_size=3)
-        assert factory.kw["bind"].pool.size() == 3
-        factory.kw["bind"].dispose()
+        engine, factory = init_db(f"sqlite:///{tmp_path}/cache.db", pool_size=3)
+        assert engine.pool.size() == 3
+        engine.dispose()
 
 
 class TestInMemoryDetection:
