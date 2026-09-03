@@ -6,6 +6,7 @@ AniDB is what we think it is.
 """
 
 import importlib.metadata
+import importlib.resources
 import tomllib
 from pathlib import Path
 
@@ -84,3 +85,51 @@ def test_the_version_file_invalidates_the_build_cache():
     assert VERSION_FILE in named, f"{VERSION_FILE} must be a uv cache key -- see the comment on cache-keys"
     # A key naming a path that no longer exists invalidates nothing and reports nothing.
     assert (REPO_ROOT / VERSION_FILE).is_file(), f"the cache key names {VERSION_FILE}, which does not exist"
+
+
+class TestThePackageDeclaresItselfTyped:
+    """PEP 561: an annotated package that ships no marker is an *untyped* package.
+
+    Every module here is annotated and checked under mypy `strict` (SPEC-007), but
+    none of that is visible across the distribution boundary without the marker.
+    A consumer's type checker refuses the import and pushes them to a waiver --
+    either `ignore_missing_imports`, which replaces the whole library with `Any`
+    and discards every annotation it carries, or `follow_untyped_imports`, which
+    reads them but is still a hole in strict typing at exactly the boundary a
+    wrapping service most wants checked.
+
+    What these two cannot see is whether *packaging* still ships the marker: the
+    development environment installs this project editable, so the import system
+    resolves it straight back to the working tree either way. The artifacts are
+    checked where they are built -- `build:dist` in `.gitlab-ci.yml` asserts the
+    marker is inside the wheel and the sdist, which is the only place it can be
+    observed. These pin the half that is observable here.
+    """
+
+    def test_the_marker_sits_inside_the_importable_package(self):
+        """Beside `__init__.py`, which is the only place a type checker looks."""
+        marker = importlib.resources.files("anidb_client") / "py.typed"
+        assert marker.is_file(), (
+            "src/anidb_client/py.typed is missing. Without it every annotation in "
+            "this package is invisible to a consumer running mypy."
+        )
+
+    def test_the_marker_is_empty(self):
+        """PEP 561 reads the file's existence, not its contents.
+
+        The one thing content *would* mean is `partial\n`, which declares a stub
+        package that only partially covers its target -- a different kind of
+        distribution to this one, and not a claim to make by accident.
+        """
+        marker = importlib.resources.files("anidb_client") / "py.typed"
+        assert marker.read_bytes() == b""
+
+    def test_the_metadata_says_so_too(self):
+        """The classifier and the marker are two halves of one claim.
+
+        The marker is what a type checker reads; the classifier is what a human
+        browsing PyPI reads. Removing either one alone leaves the distribution
+        saying two different things about itself.
+        """
+        classifiers = importlib.metadata.metadata("anidb-client").get_all("Classifier") or []
+        assert "Typing :: Typed" in classifiers

@@ -38,3 +38,9 @@ indent_style = space
 [tests/fixtures/**]
 trim_trailing_whitespace = false
 insert_final_newline = false
+
+# The PEP 561 marker. Its contents are never read -- the file's existence is the
+# whole signal -- so it is committed empty, and an editor must not "fix" that by
+# inserting a newline into it.
+[py.typed]
+insert_final_newline = false
