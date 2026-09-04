@@ -404,7 +404,7 @@ def get_link() -> AniDBLink:
     return _anidb
 
 
-def connect() -> None:
+def connect(timeout: float | None = None) -> None:
     """Establish the AniDB session now, rather than on the first request.
 
     `init()` opens the cache and starts the transport but sends nothing: the
@@ -433,7 +433,20 @@ def connect() -> None:
     read `is_banned`, `ban_cause`, `ban_remaining` and `session_age` (SPEC-002).
 
     Raises the reason it could not connect -- the refusal AniDB gave, the back-off
-    that forbade sending, or a timeout -- on a bounded wait.
+    that forbade sending, or a timeout.
+
+    **`timeout` bounds how long you wait, not how long the protocol gets.**
+    Omitted, the wait is the transport's own handshake budget: sixty seconds by
+    default, which is longer than most orchestrators will hold a container's
+    startup open. Supplied, it is your patience, and giving up early is safe --
+    the handshake is not cancelled, it settles on its own, and a later `connect()`
+    joins whatever it settled as rather than starting a second one. An application
+    with a shutdown budget already passes one to `close()`; this is the same
+    argument at the other end of the process.
+
+    Note that this is deliberately *not* the per-command reply timeout, which also
+    governs the retry budget -- wanting a five-second startup check is not wanting
+    fewer retries for the rest of the process's life.
     """
     if _anidb is None:
         raise anidb_client.errors.AniDBError(
@@ -441,7 +454,7 @@ def connect() -> None:
             "called with db_only=True, which opens no UDP session and needs none, or "
             "close() has since shut one down."
         )
-    _anidb.connect()
+    _anidb.connect(timeout=timeout)
 
 
 def download_image(filehandle: IO[bytes], obj: Anime | Group) -> None:

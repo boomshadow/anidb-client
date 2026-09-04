@@ -345,14 +345,22 @@ class AniDBLink(threading.Thread):
         self._settle_auth(error)
         return error
 
-    def _await_auth(self) -> None:
+    def _await_auth(self, timeout: float | None = None) -> None:
         """Block until the handshake settles, raising if it settled as a failure.
 
         Was `self._authed.wait()` with no timeout and no failure case, which is
         the second half of the reported hang: the first half dropped the reply,
         this half waited for it forever.
+
+        `timeout` bounds **how long this caller waits**, not how long the protocol
+        gets. Omitted, the wait is the transport's own handshake budget, which is
+        what the sender uses when a command needs a session. Supplied, it is the
+        caller's own patience -- shorter changes nothing about the handshake, which
+        carries on and settles either way; longer does not extend the protocol's
+        budget, because an attempt that fails raises here as soon as it does.
         """
-        deadline = monotonic() + self.timeout * self.AUTH_TIMEOUT_FACTOR
+        budget = self.timeout * self.AUTH_TIMEOUT_FACTOR if timeout is None else timeout
+        deadline = monotonic() + budget
         while True:
             with self._auth_lock:
                 if self._auth_fatal is not None:
@@ -362,14 +370,36 @@ class AniDBLink(threading.Thread):
                 attempt = self._auth_attempt
             remaining = deadline - monotonic()
             if remaining <= 0:
-                raise AniDBCommandTimeoutError("Timed out waiting for authentication")
+                # Named as a wait that ended rather than a handshake that failed,
+                # because those are different facts and only one of them is known
+                # here. The attempt is still in flight; it will settle, and a later
+                # caller joins whatever it settled as.
+                raise AniDBCommandTimeoutError(
+                    f"Gave up waiting for authentication after {budget:g}s. The handshake has "
+                    f"not been cancelled -- it settles on its own, and the next attempt to "
+                    f"connect joins the result rather than starting a second one."
+                )
             if attempt is None:
                 # Nothing in flight and not authenticated: an attempt settled
                 # without authenticating us. Waiting longer cannot change that.
                 raise AniDBMustAuthError("Authentication did not complete")
-            # Raises whatever failed the attempt, or returns and the loop above
-            # confirms the session really is up before any command goes out.
-            attempt.result(timeout=remaining)
+            try:
+                # Raises whatever failed the attempt, or returns and the loop above
+                # confirms the session really is up before any command goes out.
+                attempt.result(timeout=remaining)
+            except TimeoutError:
+                # The attempt has not settled inside what is left of the budget.
+                # Loop rather than letting this out: `Future.result` raises
+                # `concurrent.futures.TimeoutError`, which is an implementation
+                # detail of how the wait is built and says nothing a caller can act
+                # on. Going round again reaches the deadline check above, which
+                # states the same outcome in this library's own terms.
+                #
+                # This was unreachable in practice while the only budget was the
+                # transport's own: the AUTH command's timeout settled the attempt
+                # first, every time. A caller-supplied bound shorter than that
+                # reaches it immediately, which is how it surfaced.
+                continue
 
     def _new_tag(self) -> str:
         """Return the next correlation tag, cycling T001..T999.
@@ -722,7 +752,7 @@ class AniDBLink(threading.Thread):
             retry_after=remaining,
         )
 
-    def connect(self) -> None:
+    def connect(self, timeout: float | None = None) -> None:
         """Establish the session now, or raise the reason it cannot be.
 
         The transport authenticates lazily: nothing reaches AniDB until a command
@@ -753,15 +783,32 @@ class AniDBLink(threading.Thread):
         `session_age` -- which answers out of state already held and sends nothing.
 
         Raises whatever stopped it: the refusal AniDB gave, the back-off that
-        forbade sending, or a timeout. Bounded by the handshake deadline
-        (`timeout * AUTH_TIMEOUT_FACTOR`), so it cannot hang a caller's startup.
+        forbade sending, or a timeout.
+
+        **`timeout` bounds how long the caller waits, not how long the protocol
+        gets**, and those are genuinely different. Omitted, the wait is the
+        transport's own handshake budget -- `self.timeout * AUTH_TIMEOUT_FACTOR`,
+        sixty seconds by default, which is a long time to hold a container's
+        startup. Supplied, it is this caller's patience, and giving up early is
+        safe by construction: the handshake is not cancelled, it settles on its
+        own, and the next call joins whatever it settled as rather than starting a
+        second one. That is exactly what a startup probe wants -- *tell me within N
+        seconds whether this is up, and do not break anything if I stop asking.*
+
+        Deliberately not `self.timeout`. That value is the per-command reply
+        timeout: it also drives the listener's socket, the timeout sweep and
+        therefore the retry budget, so lowering it to bound a startup check would
+        change how every command behaves as a side effect. Wanting a shorter
+        startup is not wanting fewer retries.
         """
         # `_reauthenticate` rather than `reauthenticate`: the private one already
         # declines to act when a session is up, when one is being established, or
         # when credentials have been latched as refused. That is precisely the
         # idempotence this method promises, so it is reused rather than restated.
+        if timeout is not None and timeout < 0:
+            raise ValueError(f"timeout is how many seconds to wait and cannot be negative: {timeout!r}")
         self._reauthenticate()
-        self._await_auth()
+        self._await_auth(timeout)
 
     def reauthenticate(self) -> None:
         # One critical section: a half-cleared state -- session gone but cipher
