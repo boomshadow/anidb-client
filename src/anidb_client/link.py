@@ -17,6 +17,8 @@
 
 import contextlib
 import hashlib
+import re
+import secrets
 import socket
 import threading
 import zlib
@@ -40,12 +42,82 @@ from anidb_client.errors import (
     BanCause,
 )
 from anidb_client.ratelimit import RateLimiter
-from anidb_client.responses import Disposition, Response, ResponseResolver, disposition_for
+from anidb_client.responses import (
+    Disposition,
+    LoginAcceptedNewVerResponse,
+    LoginAcceptedResponse,
+    Response,
+    ResponseResolver,
+    disposition_for,
+)
+from anidb_client.responses import responses as _response_table
 
 # The AES cipher objects pycryptodome hands back are one of several mode classes
 # with no common base, and this code only ever calls encrypt/decrypt on them. Any
 # rather than a union that would have to be widened for every mode never used.
 type Cipher = Any
+
+# Salt for the session fingerprints below, fresh per process. Salted because an
+# unsalted digest of a short token is a lookup away from the token, and per-process
+# because the only correlation a log needs is within one run: "is this the same
+# session as ten lines ago, and did the re-authentication produce a new one".
+# Nothing outside this process should be able to line two logs up by session.
+_SESSION_LOG_SALT = secrets.token_bytes(16)
+
+# The reply codes that carry a session key. Derived from the response table rather
+# than written out here, because that table is the transcription of AniDB's own
+# code list and this must follow it rather than drift beside it.
+_LOGIN_ACCEPTED_CODES = frozenset(
+    code
+    for code, response_type in _response_table.items()
+    if response_type in (LoginAcceptedResponse, LoginAcceptedNewVerResponse)
+)
+
+# `<login code> <session key>` at the head of a reply. The key has to be matched by
+# shape here because this is the packet that *tells* us what it is -- there is
+# nothing to compare against yet.
+_LOGIN_REPLY_SESSION = re.compile(rf"\b({'|'.join(sorted(_LOGIN_ACCEPTED_CODES))}) +(\S+)")
+
+
+def session_fingerprint(session: str) -> str:
+    """A stable, non-reversible stand-in for a session key, safe to log.
+
+    Short enough to read at a glance and long enough not to collide within a run.
+    """
+    digest = hashlib.sha256(_SESSION_LOG_SALT + session.encode("utf-8", "replace")).hexdigest()
+    return f"<session:{digest[:8]}>"
+
+
+def scrub_session(payload: bytes | str, session: str | None = None) -> str:
+    """`repr()` of a wire payload with any session key replaced by its fingerprint.
+
+    A session key is a bearer credential: it authenticates as the account for as
+    long as it lives, so it belongs on the same side of the line as the password,
+    which this transport has always refused to log. It was not on that side. The
+    key reached the log by two routes -- outbound, as the `s=` parameter every
+    command after the handshake carries, and inbound, in the login reply that
+    delivers it -- and two of the five call sites are `warning` and `error`, so
+    this was never only a debug-level exposure.
+
+    What is kept is what debugging actually needs: whether two lines belong to the
+    same session, and whether a re-authentication produced a new one. What is
+    removed is the ability to *use* it. That is the trade the OWASP logging
+    guidance describes, and it is a better answer than dropping the payload
+    entirely -- most of this transport's behaviour is only observable from these
+    lines, and a log that omits the packet to protect one field of it has thrown
+    away the reason the log exists.
+
+    Both routes are covered: the key we already hold is replaced wherever it
+    appears, and the login reply -- whose key we do not hold yet, because it is the
+    packet that tells us -- is matched by shape. The reported NAT address beside it
+    is deliberately left alone; it is the only outside confirmation of which source
+    address AniDB is metering, and it is not a secret.
+    """
+    text = repr(payload)
+    if session:
+        text = text.replace(session, session_fingerprint(session))
+    return _LOGIN_REPLY_SESSION.sub(lambda m: f"{m.group(1)} {session_fingerprint(m.group(2))}", text)
+
 
 # The outgoing UDP source port this client binds when it is not given one.
 #
@@ -284,7 +356,14 @@ class AniDBLink(threading.Thread):
             self._authed.set()
             self._authenticating.clear()
         self._settle_auth(None)
-        anidb_client.log.info(f"Logged in to AniDB with session {self.session}")
+        # Fingerprinted, not printed. This line is at INFO -- the default level --
+        # so it wrote a live bearer credential into the log of every client that
+        # ever authenticated, without anyone turning debug on. It was the last of
+        # the six routes and the worst of them, and it was invisible to a search
+        # for logged *payloads* because the key is interpolated straight from the
+        # attribute here.
+        session = self.session
+        anidb_client.log.info(f"Logged in to AniDB with session {session_fingerprint(session) if session else 'none'}")
 
     def auth_failed(self, rescode: str, reason: str, cause: BanCause = BanCause.REFUSED) -> AniDBError:
         """Report that a handshake round trip came back as anything but success.
@@ -615,7 +694,7 @@ class AniDBLink(threading.Thread):
         if command.command == "AUTH":
             anidb_client.log.debug("NetIO > AUTH data is not logged!")
         else:
-            anidb_client.log.debug(f"NetIO > {repr(data)}")
+            anidb_client.log.debug(f"NetIO > {scrub_session(data, self.session)}")
 
         try:
             self._listener.sock.sendto(data, self._server)
@@ -1199,7 +1278,7 @@ class AniDBListener(threading.Thread):
             if self._stopping.is_set():
                 return
             self._note_datagram()
-            anidb_client.log.debug(f"NetIO < {repr(data)}")
+            anidb_client.log.debug(f"NetIO < {scrub_session(data, self._sender.session)}")
             if self.cipher:
                 with contextlib.suppress(ValueError):
                     data = self.decrypt(data)
@@ -1211,11 +1290,13 @@ class AniDBListener(threading.Thread):
             payload = data
             if payload[:2] == b"\x00\x00":
                 payload = zlib.decompressobj().decompress(payload[2:])
-                anidb_client.log.debug(f"UnZip | {repr(payload)}")
+                anidb_client.log.debug(f"UnZip | {scrub_session(payload, self._sender.session)}")
             try:
                 resolved = ResponseResolver(payload)
             except (UnicodeDecodeError, ValueError) as e:
-                anidb_client.log.warning(f"Unparsable response from API ({e}): {repr(data)}")
+                anidb_client.log.warning(
+                    f"Unparsable response from API ({e}): {scrub_session(data, self._sender.session)}"
+                )
                 continue
 
             # Disposition first, tag second. A code that says stop is a statement
@@ -1336,7 +1417,7 @@ class AniDBListener(threading.Thread):
             return
         # Previously sys.exit(2). An untagged reply we do not recognise is worth
         # shouting about, but it is not worth killing the caller's process over.
-        anidb_client.log.error(f"Unhandled response from API: {repr(data)}")
+        anidb_client.log.error(f"Unhandled response from API: {scrub_session(data, self._sender.session)}")
 
     def _deliver(self, cmd: Command, resp: Response) -> None:
         """Run a reply's callback, then settle the command it answers.
