@@ -24,7 +24,7 @@ from anidb_client.errors import (
     AniDBError,
     BanCause,
 )
-from anidb_client.link import AniDBLink, AniDBListener
+from anidb_client.link import AniDBLink, AniDBListener, scrub_session, session_fingerprint
 from anidb_client.ratelimit import RateLimiter
 from tests.fake_anidb import FakeAniDBServer
 
@@ -1678,3 +1678,111 @@ class TestConnectingOnDemand:
             link.connect()
 
         assert monotonic() - started < 30
+
+
+class TestTheSessionKeyNeverReachesTheLog:
+    """A session key is a bearer credential and is logged like one -- not at all.
+
+    The AUTH *request* has always been suppressed, so the intent was there; the
+    key AniDB hands back in reply to it was not covered. It reached the log by two
+    routes -- inbound in the login reply, and outbound as the `s=` parameter every
+    command after the handshake carries -- and two of the five call sites are
+    `warning` and `error`, so this was never confined to debug.
+
+    Found by the first consumer running at DEBUG against the real API.
+    """
+
+    def test_the_key_does_not_appear_when_it_arrives(self, server, make_link, caplog):
+        server.on("AUTH", AUTH_OK)
+
+        with caplog.at_level(logging.DEBUG):
+            link = make_link(server)
+            link.connect()
+
+        assert link.session == "sess1234"
+        assert "sess1234" not in caplog.text
+
+    def test_it_does_not_appear_at_the_default_level_either(self, server, make_link, caplog):
+        """The worst of the routes, and the one a debug-only framing would miss.
+
+        The successful-login line is at INFO, so every client that ever
+        authenticated wrote a live bearer credential into its log without anyone
+        turning debug on. It was also invisible to a search for logged *payloads*,
+        because the key was interpolated straight from the attribute rather than
+        arriving as part of a packet. Captured at INFO deliberately: DEBUG would
+        pass this even if the fix only covered the payload paths.
+        """
+        server.on("AUTH", AUTH_OK)
+
+        with caplog.at_level(logging.INFO):
+            link = make_link(server)
+            link.connect()
+
+        assert link.session == "sess1234"
+        assert "Logged in to AniDB" in caplog.text, "the login line should still be there to read"
+        assert "sess1234" not in caplog.text
+
+    def test_the_key_does_not_appear_on_the_commands_that_carry_it(self, server, make_link, caplog):
+        """Every command after the handshake sends `s=<key>`."""
+        server.on("AUTH", AUTH_OK)
+        server.on("UPTIME", "208 100000")
+
+        link = make_link(server)
+        link.connect()
+        with caplog.at_level(logging.DEBUG):
+            link.request(anidb_client.commands.UptimeCommand(), lambda resp: None)
+            server.wait_for("UPTIME")
+
+        assert "sess1234" not in caplog.text
+
+    def test_an_unparsable_reply_does_not_leak_it_either(self, server, make_link, caplog):
+        """This path logs at WARNING, so it is reached without anyone turning
+        debug on -- which is what makes it worth covering rather than assuming."""
+        with caplog.at_level(logging.DEBUG):
+            scrubbed = scrub_session(b"200 sess1234 1.2.3.4:9000 LOGIN ACCEPTED", None)
+
+        assert "sess1234" not in scrubbed
+        assert "session:" in scrubbed
+
+    def test_the_fingerprint_still_correlates(self, server, make_link, caplog):
+        """The point of a fingerprint rather than a blackout.
+
+        Debugging this transport needs to know whether two lines belong to the
+        same session and whether a re-authentication produced a new one. Both
+        survive; only the ability to use the key is gone.
+        """
+        server.on("AUTH", AUTH_OK)
+        server.on("UPTIME", "208 100000")
+
+        link = make_link(server)
+        with caplog.at_level(logging.DEBUG):
+            link.connect()
+            link.request(anidb_client.commands.UptimeCommand(), lambda resp: None)
+            server.wait_for("UPTIME")
+
+        fingerprint = session_fingerprint("sess1234")
+        # The reply that delivered the key and the command that used it are
+        # recognisably the same session.
+        assert caplog.text.count(fingerprint) >= 2
+
+    def test_the_reported_address_is_not_redacted(self, server, make_link, caplog):
+        """It is the only outside confirmation of which source address AniDB is
+        metering (ADR-007), and it is not a secret."""
+        server.on("AUTH", "200 sess1234 68.45.116.94:24700 LOGIN ACCEPTED")
+
+        with caplog.at_level(logging.DEBUG):
+            link = make_link(server)
+            link.connect()
+
+        assert "68.45.116.94:24700" in caplog.text
+
+    def test_the_credential_suppression_still_holds(self, server, make_link, caplog):
+        """The rule this extends rather than replaces."""
+        server.on("AUTH", AUTH_OK)
+
+        with caplog.at_level(logging.DEBUG):
+            link = make_link(server)
+            link.connect()
+
+        assert "AUTH data is not logged!" in caplog.text
+        assert "pw" not in caplog.text.split("AUTH data is not logged!")[0][-200:]
