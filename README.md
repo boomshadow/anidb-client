@@ -275,6 +275,50 @@ naming a port nothing visible was using. Call `close()` first if you mean to
 re-initialise. A failed `init()` leaves nothing running, so you can correct
 whatever it complained about and call it again.
 
+### connect()
+
+```python
+anidb_client.connect()
+```
+
+`init()` sends nothing — the login is lazy, and happens whenever something first
+needs a session. That means a wrong password or a standing ban surfaces on the
+first real request rather than at startup. If you are writing a long-running
+service, that is the difference between a process that refuses to start and one
+that starts, looks healthy, and fails in front of a user an hour later.
+
+`connect()` asks at startup instead. It establishes the session, or raises the
+reason it cannot — the refusal AniDB gave, the back-off that forbade sending, or
+a timeout — on a bounded wait.
+
+```python
+anidb_client.init("sqlite:///anidb.db", api_user="me", api_pass="secret")
+try:
+    anidb_client.connect()
+except anidb_client.errors.AniDBError as exc:
+    raise SystemExit(f"cannot reach AniDB: {exc}")
+```
+
+It is **idempotent** — a session already up is left alone, and a handshake in
+flight is waited on rather than duplicated — so calling it twice is safe. It also
+adds no traffic in the ordinary case: the login happens either way, this just
+moves it earlier.
+
+**Do not poll it.** It is not a health check. In most clients the equivalent is a
+free `ping()`; here every command is metered by a service that enforces with an IP
+ban, so calling this on a readiness probe's timer is a way to earn one. For the
+repeated question, read the transport's state instead — it answers from what it
+already knows and sends nothing:
+
+```python
+link = anidb_client.get_link()
+if link.is_banned:
+    print(f"backing off for {link.ban_remaining:.0f}s ({link.ban_cause.name.lower()})")
+```
+
+`connect()` is optional. If you do not mind finding out on the first request, skip
+it.
+
 ### close()
 
 ```python

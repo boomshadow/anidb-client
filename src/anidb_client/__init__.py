@@ -66,6 +66,7 @@ __all__ = [
     "RelationWalkStop",
     "close",
     "close_session",
+    "connect",
     "download_fanart",
     "download_image",
     "get_link",
@@ -401,6 +402,46 @@ def get_link() -> AniDBLink:
             "that no longer exists."
         )
     return _anidb
+
+
+def connect() -> None:
+    """Establish the AniDB session now, rather than on the first request.
+
+    `init()` opens the cache and starts the transport but sends nothing: the
+    handshake happens lazily, whenever something first needs a session. A wrong
+    password or a standing ban is therefore discovered by whichever request
+    happens to be first, which for a long-running service means an hour after
+    startup, in front of a user, rather than at boot.
+
+    This is the third of the three lifecycle calls -- `init()`, `connect()`,
+    `close()` -- and the only optional one. A caller that does not mind finding
+    out later never needs it.
+
+    **Idempotent**, so it is safe to call more than once: a session already up is
+    left alone and a handshake in flight is waited on rather than duplicated.
+
+    **It adds no traffic in the ordinary case.** The login happens either way;
+    this moves it earlier. Only a process that connects and then asks for nothing
+    pays for a handshake it would not otherwise have needed.
+
+    **It is not a health check.** Do not poll it. Every command is metered by a
+    service that enforces with an IP ban, so calling this on a readiness probe's
+    timer is a way to earn one -- and the ordinary idiom in other clients, where a
+    `ping()` is free, is exactly the habit that would lead someone here. The
+    transport's health surface answers the repeated question instead, out of state
+    it already holds and without sending anything: reach it with `get_link()` and
+    read `is_banned`, `ban_cause`, `ban_remaining` and `session_age` (SPEC-002).
+
+    Raises the reason it could not connect -- the refusal AniDB gave, the back-off
+    that forbade sending, or a timeout -- on a bounded wait.
+    """
+    if _anidb is None:
+        raise anidb_client.errors.AniDBError(
+            "There is no AniDB transport to connect: init() has not been called, it was "
+            "called with db_only=True, which opens no UDP session and needs none, or "
+            "close() has since shut one down."
+        )
+    _anidb.connect()
 
 
 def download_image(filehandle: IO[bytes], obj: Anime | Group) -> None:

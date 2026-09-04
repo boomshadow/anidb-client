@@ -722,6 +722,47 @@ class AniDBLink(threading.Thread):
             retry_after=remaining,
         )
 
+    def connect(self) -> None:
+        """Establish the session now, or raise the reason it cannot be.
+
+        The transport authenticates lazily: nothing reaches AniDB until a command
+        needs a session, so a wrong password or a standing ban is discovered by
+        whichever request happens to be first. For a script that is fine. For a
+        long-running service it is the difference between refusing to start and
+        starting, looking healthy, and failing in front of a user an hour later.
+        This is how such an application asks the question at boot instead.
+
+        **Idempotent.** A session already up is left alone, and a handshake already
+        in flight is waited on rather than duplicated -- neither starts a second
+        one. That is deliberate rather than incidental: against an API that meters
+        by request frequency, a call that logs in again every time it is invoked is
+        a way to get banned, and the shape most likely to invite that is exactly
+        this one. `reauthenticate()` is the other method, and it is not this: it
+        drops a live session on purpose, which is what a *lost* session needs and
+        what a startup check must not do.
+
+        **This adds no traffic in the ordinary case.** The handshake happens either
+        way; calling this moves it from the first request to startup. Only a
+        process that connects and then never asks for anything pays for a login it
+        did not otherwise need.
+
+        **It is not a health check, and must not be polled.** Every command here is
+        metered by a service whose enforcement is an IP ban, so a readiness probe
+        calling this on a timer is a machine for earning one. Read the health
+        surface instead -- `is_banned`, `ban_cause`, `ban_remaining`,
+        `session_age` -- which answers out of state already held and sends nothing.
+
+        Raises whatever stopped it: the refusal AniDB gave, the back-off that
+        forbade sending, or a timeout. Bounded by the handshake deadline
+        (`timeout * AUTH_TIMEOUT_FACTOR`), so it cannot hang a caller's startup.
+        """
+        # `_reauthenticate` rather than `reauthenticate`: the private one already
+        # declines to act when a session is up, when one is being established, or
+        # when credentials have been latched as refused. That is precisely the
+        # idempotence this method promises, so it is reused rather than restated.
+        self._reauthenticate()
+        self._await_auth()
+
     def reauthenticate(self) -> None:
         # One critical section: a half-cleared state -- session gone but cipher
         # still set, or the reverse -- is a command encrypted with a key the server

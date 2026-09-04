@@ -1463,3 +1463,133 @@ class TestStoppingTheTransport:
 
         with pytest.raises(AniDBError):
             command.future.result(timeout=5)
+
+
+class TestConnectingOnDemand:
+    """`connect()` establishes the session at startup instead of on first use.
+
+    The transport authenticates lazily, so a wrong password or a standing ban is
+    otherwise discovered by whichever request happens to be first. For a service
+    that is an hour after boot, in front of a user. This is the call that asks the
+    question early -- and the properties that matter are that it is idempotent and
+    that it reports the reason, because a startup check that silently succeeded or
+    that logged in twice per call would be worse than not having one.
+    """
+
+    def test_it_establishes_a_session(self, server, make_link):
+        server.on("AUTH", AUTH_OK)
+
+        link = make_link(server)
+        link.connect()
+
+        assert link.session == "sess1234"
+        assert len(server.requests_for("AUTH")) == 1
+
+    def test_calling_it_again_does_not_authenticate_again(self, server, make_link):
+        """The property that keeps it from being a way to get banned.
+
+        Against an API that meters by request frequency, a call shaped like this
+        one is exactly what someone wires into a readiness probe. A second login
+        per invocation would turn that habit into an IP ban.
+        """
+        server.on("AUTH", AUTH_OK)
+
+        link = make_link(server)
+        link.connect()
+        link.connect()
+        link.connect()
+
+        assert len(server.requests_for("AUTH")) == 1
+
+    def test_concurrent_callers_produce_one_handshake(self, server, make_link):
+        """The third case the idempotence rests on: an attempt already in flight.
+
+        A session already up and a credential already refused are the easy two.
+        This is the one that only appears under load -- two threads reaching
+        `connect()` at once, or one reaching it while the sender is already
+        mid-handshake. Both must join the attempt that exists rather than starting
+        a second, because two AUTHs racing is both a wasted command against a
+        metered API and a way to have one of them answered into a session the
+        other has already replaced.
+        """
+        server.on("AUTH", AUTH_OK)
+        link = make_link(server)
+
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(4)
+
+        def go():
+            barrier.wait()
+            try:
+                link.connect()
+            except BaseException as exc:  # noqa: BLE001 - recorded and re-raised below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=go) for _ in range(4)]
+        for t in threads:
+            t.start()
+        # The barrier has exactly as many parties as there are threads, and this
+        # one is not among them -- it only waits for them to finish.
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not errors, f"connect() raised under concurrency: {errors}"
+        assert not any(t.is_alive() for t in threads), "a caller was left waiting"
+        assert len(server.requests_for("AUTH")) == 1
+        assert link.session == "sess1234"
+
+    def test_it_is_distinct_from_reauthenticate(self, server, make_link):
+        """`reauthenticate()` drops a live session on purpose; this must not.
+
+        The two read similarly and do opposite things, which is why a startup
+        check must not be built on the other one.
+        """
+        server.on("AUTH", AUTH_OK)
+
+        link = make_link(server)
+        link.connect()
+        link.reauthenticate()
+        _await(lambda: len(server.requests_for("AUTH")) == 2, message="reauthenticate did not log in again")
+
+        assert len(server.requests_for("AUTH")) == 2
+
+    def test_a_refused_credential_is_raised_not_swallowed(self, server, make_link):
+        """The whole point: the caller learns at startup rather than later."""
+        server.on("AUTH", "500 LOGIN FAILED")
+
+        link = make_link(server)
+        with pytest.raises(AniDBAuthFailedError):
+            link.connect()
+
+    def test_a_latched_refusal_is_raised_again_without_resending(self, server, make_link):
+        """A rejected credential is never offered a second time (SPEC-002)."""
+        server.on("AUTH", "500 LOGIN FAILED")
+
+        link = make_link(server)
+        with pytest.raises(AniDBAuthFailedError):
+            link.connect()
+        with pytest.raises(AniDBAuthFailedError):
+            link.connect()
+
+        assert len(server.requests_for("AUTH")) == 1
+
+    def test_a_standing_ban_is_raised_and_nothing_is_sent(self, server, make_link):
+        """Connecting while backed off must not become the send that deepens it."""
+        link = make_link(server)
+        link.set_banned(code=555, reason="BANNED")
+
+        with pytest.raises(AniDBBannedError):
+            link.connect()
+
+        assert server.received_commands() == []
+
+    def test_it_does_not_hang_when_the_handshake_is_never_answered(self, server, make_link):
+        """A startup check that blocks forever is worse than no startup check."""
+        server.on("AUTH", lambda req: None)
+
+        link = make_link(server, timeout=1)
+        started = monotonic()
+        with pytest.raises(AniDBError):
+            link.connect()
+
+        assert monotonic() - started < 30
