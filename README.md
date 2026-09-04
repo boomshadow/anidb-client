@@ -278,7 +278,7 @@ whatever it complained about and call it again.
 ### connect()
 
 ```python
-anidb_client.connect()
+anidb_client.connect(timeout=None)
 ```
 
 `init()` sends nothing — the login is lazy, and happens whenever something first
@@ -303,6 +303,25 @@ It is **idempotent** — a session already up is left alone, and a handshake in
 flight is waited on rather than duplicated — so calling it twice is safe. It also
 adds no traffic in the ordinary case: the login happens either way, this just
 moves it earlier.
+
+**`timeout` bounds how long you wait, not how long the protocol gets.** Left out,
+you wait the transport's own handshake budget — 60 seconds — which is longer than
+most orchestrators will hold a container's startup open. Pass your own if your
+budget is shorter:
+
+```python
+anidb_client.connect(timeout=5)
+```
+
+Giving up early is safe. The handshake is not cancelled: it settles on its own,
+and a later `connect()` joins whatever it settled as rather than starting a
+second one. So a startup probe can say *tell me within five seconds whether this
+is up* without meaning *and abandon the session if not*. `timeout=0` asks without
+waiting at all; a negative value is refused.
+
+Note this is not the per-command reply timeout, which also governs retries —
+wanting a five-second startup check is not wanting fewer retries for the rest of
+the process's life.
 
 **Do not poll it.** It is not a health check. In most clients the equivalent is a
 free `ping()`; here every command is metered by a service that enforces with an IP

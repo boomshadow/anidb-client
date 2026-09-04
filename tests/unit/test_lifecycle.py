@@ -351,7 +351,7 @@ class TestConnectingAtStartup:
             def __init__(self, *a, **kw):
                 self.connected = 0
 
-            def connect(self):
+            def connect(self, timeout=None):
                 self.connected += 1
 
             def stop(self, *a, **kw):
@@ -365,11 +365,31 @@ class TestConnectingAtStartup:
 
         assert built[-1].connected == 1
 
+    def test_the_callers_bound_reaches_the_transport(self, tmp_path, clean_globals, monkeypatch):
+        """An application whose startup budget is shorter than sixty seconds has to
+        be able to say so, and the value has to actually arrive."""
+        seen: list[object] = []
+
+        class FakeLink:
+            def connect(self, timeout=None):
+                seen.append(timeout)
+
+            def stop(self, *a, **kw):
+                pass
+
+        monkeypatch.setattr(anidb_client.link, "AniDBLink", lambda *a, **kw: FakeLink())
+
+        anidb_client.init(f"sqlite:///{tmp_path}/cache.db", api_user="u", api_pass="p")
+        anidb_client.connect(timeout=5)
+        anidb_client.connect()
+
+        assert seen == [5, None], "the bound must reach the transport, and omitting it must stay the default"
+
     def test_the_reason_it_could_not_connect_reaches_the_caller(self, tmp_path, clean_globals, monkeypatch):
         """Not swallowed: being told at startup is the entire point of the call."""
 
         class RefusingLink:
-            def connect(self):
+            def connect(self, timeout=None):
                 raise AniDBError("AniDB refused these credentials")
 
             def stop(self, *a, **kw):
@@ -401,7 +421,7 @@ class TestConnectingAtStartup:
         having nothing to connect."""
 
         class FakeLink:
-            def connect(self):
+            def connect(self, timeout=None):
                 pass
 
             def stop(self, *a, **kw):

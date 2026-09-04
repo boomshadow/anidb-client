@@ -20,6 +20,7 @@ import anidb_client.commands
 from anidb_client.errors import (
     AniDBAuthFailedError,
     AniDBBannedError,
+    AniDBCommandTimeoutError,
     AniDBError,
     BanCause,
 )
@@ -1582,6 +1583,90 @@ class TestConnectingOnDemand:
             link.connect()
 
         assert server.received_commands() == []
+
+    def test_the_caller_may_bound_its_own_wait(self, server, make_link):
+        """Sixty seconds is longer than an orchestrator will hold a start open.
+
+        The default bound is the transport's handshake budget -- `timeout *
+        AUTH_TIMEOUT_FACTOR`, sixty seconds as shipped -- and nothing an embedder
+        could reach changed it. A service whose own startup budget is shorter than
+        that had no way to say so, and an operator setting one in their own config
+        would have been setting a value that did nothing.
+        """
+        server.on("AUTH", lambda req: None)
+        link = make_link(server, timeout=20)
+
+        started = monotonic()
+        with pytest.raises(AniDBCommandTimeoutError):
+            link.connect(timeout=0.5)
+        elapsed = monotonic() - started
+
+        # The point: bounded by what was asked for, not by 20 * 3.
+        assert elapsed < 10, f"connect() waited {elapsed:.1f}s despite being given 0.5s"
+
+    def test_giving_up_early_does_not_cancel_the_handshake(self, server, make_link):
+        """The property that makes an early bound safe rather than destructive.
+
+        A caller that stops waiting must not leave the transport worse off. The
+        handshake carries on, settles, and the next caller joins the result --
+        which is why a startup probe can say "tell me within N seconds" without
+        having to mean "and abandon the session if not".
+        """
+        release = threading.Event()
+
+        def slow_auth(req):
+            release.wait(5)
+            return AUTH_OK
+
+        server.on("AUTH", slow_auth)
+        link = make_link(server)
+
+        with pytest.raises(AniDBCommandTimeoutError):
+            link.connect(timeout=0.2)
+
+        # Let the handshake AniDB was always going to answer come back.
+        release.set()
+        _await(lambda: link.session is not None, message="the abandoned handshake never settled")
+
+        # And it was one handshake, not two: the caller left, the attempt did not.
+        assert len(server.requests_for("AUTH")) == 1
+        link.connect(timeout=5)
+        assert len(server.requests_for("AUTH")) == 1
+
+    def test_the_timeout_names_what_actually_happened(self, server, make_link):
+        """A wait that ended is not a handshake that failed, and only one is known."""
+        server.on("AUTH", lambda req: None)
+        link = make_link(server)
+
+        with pytest.raises(AniDBCommandTimeoutError) as raised:
+            link.connect(timeout=0.3)
+
+        assert "has not been cancelled" in str(raised.value)
+
+    def test_a_negative_bound_is_refused(self, server, make_link):
+        link = make_link(server)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            link.connect(timeout=-1)
+
+    def test_a_zero_bound_still_answers_when_the_session_is_up(self, server, make_link):
+        """`timeout=0` is "tell me now" rather than "wait forever" or "always fail"."""
+        server.on("AUTH", AUTH_OK)
+        link = make_link(server)
+        link.connect()
+
+        link.connect(timeout=0)
+
+        assert len(server.requests_for("AUTH")) == 1
+
+    def test_the_default_is_still_the_transports_own_budget(self, server, make_link):
+        """Omitting it must not change what every existing caller gets."""
+        server.on("AUTH", AUTH_OK)
+        link = make_link(server)
+
+        link.connect()
+
+        assert link.session == "sess1234"
 
     def test_it_does_not_hang_when_the_handshake_is_never_answered(self, server, make_link):
         """A startup check that blocks forever is worse than no startup check."""
