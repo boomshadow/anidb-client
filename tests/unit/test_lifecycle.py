@@ -329,3 +329,88 @@ class TestThePinnedPortComesBack:
         anidb_client.close()
 
         assert link._listener.sock is None
+
+
+class TestConnectingAtStartup:
+    """`connect()` is the third lifecycle call, and the only optional one.
+
+    `init()` sends nothing -- the handshake is lazy -- so an application that
+    wants a wrong credential or a standing ban to fail at boot rather than in
+    front of a user needs a way to ask. Before this there was none, and the only
+    route was to hand-build a command and push it through the transport, which
+    meant importing a module below the declared public surface for a type the
+    public API requires.
+    """
+
+    def test_it_is_part_of_the_declared_public_surface(self):
+        """A caller told to use it has to be able to find it."""
+        assert "connect" in anidb_client.__all__
+
+    def test_it_reaches_the_transport(self, tmp_path, clean_globals, monkeypatch):
+        class FakeLink:
+            def __init__(self, *a, **kw):
+                self.connected = 0
+
+            def connect(self):
+                self.connected += 1
+
+            def stop(self, *a, **kw):
+                pass
+
+        built = []
+        monkeypatch.setattr(anidb_client.link, "AniDBLink", lambda *a, **kw: built.append(FakeLink()) or built[-1])
+
+        anidb_client.init(f"sqlite:///{tmp_path}/cache.db", api_user="u", api_pass="p")
+        anidb_client.connect()
+
+        assert built[-1].connected == 1
+
+    def test_the_reason_it_could_not_connect_reaches_the_caller(self, tmp_path, clean_globals, monkeypatch):
+        """Not swallowed: being told at startup is the entire point of the call."""
+
+        class RefusingLink:
+            def connect(self):
+                raise AniDBError("AniDB refused these credentials")
+
+            def stop(self, *a, **kw):
+                pass
+
+        monkeypatch.setattr(anidb_client.link, "AniDBLink", lambda *a, **kw: RefusingLink())
+
+        anidb_client.init(f"sqlite:///{tmp_path}/cache.db", api_user="u", api_pass="p")
+
+        with pytest.raises(AniDBError, match="refused these credentials"):
+            anidb_client.connect()
+
+    def test_a_cache_only_client_says_it_has_no_session_to_open(self, tmp_path, clean_globals):
+        """db_only opens no UDP session and needs none, so asking is a configuration
+        mistake worth naming rather than a silent no-op."""
+        anidb_client.init(f"sqlite:///{tmp_path}/cache.db", db_only=True)
+
+        with pytest.raises(AniDBError) as raised:
+            anidb_client.connect()
+
+        assert "db_only" in str(raised.value)
+
+    def test_connecting_before_init_says_so(self, clean_globals):
+        with pytest.raises(AniDBError, match="init"):
+            anidb_client.connect()
+
+    def test_connecting_after_close_says_so(self, tmp_path, clean_globals, monkeypatch):
+        """`close()` returns the library to its pre-init state, and that includes
+        having nothing to connect."""
+
+        class FakeLink:
+            def connect(self):
+                pass
+
+            def stop(self, *a, **kw):
+                pass
+
+        monkeypatch.setattr(anidb_client.link, "AniDBLink", lambda *a, **kw: FakeLink())
+
+        anidb_client.init(f"sqlite:///{tmp_path}/cache.db", api_user="u", api_pass="p")
+        anidb_client.close()
+
+        with pytest.raises(AniDBError, match=r"close\(\)"):
+            anidb_client.connect()
