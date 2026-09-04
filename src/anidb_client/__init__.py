@@ -83,7 +83,7 @@ __all__ = [
 # the wheel filename. See ADR-002 and SPEC-009.
 #
 # Bumped as part of cutting a release, never by hand in the course of other work.
-__version__ = "2.2.0-rc.1"
+__version__ = "3.0.0-rc.1"
 
 # Identity sent to AniDB in the AUTH command. The (name, version) pair must be
 # registered with AniDB before it will authenticate, and `anidb_client_version` is
