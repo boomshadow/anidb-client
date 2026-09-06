@@ -242,20 +242,28 @@ allowance once per deploy; it is not inside it on the tenth restart of a crash
 loop. Keep the state wherever you like and hand back a limiter that knows it:
 
 ```python
-from anidb_client import BanCause, RateLimiter
+from anidb_client import BackOffKind, BanCause, RateLimiter
 
 # Whatever you stored last time this process shut down.
 limiter = RateLimiter(
     banned_for=900,               # seconds of back-off remaining, not a deadline
     ban_multiplier=2,             # so the next ban is longer, not a fresh one
-    ban_cause=BanCause.SILENCE,
+    ban_cause=BanCause.SILENCE,   # how the back-off arose
+    back_off_kind=BackOffKind.BANNED,  # which refusal it is, and so how long it lasts
     seconds_since_last_send=30,
 )
 anidb_client.init("sqlite:///anidb.db", rate_limiter=limiter)
 ```
 
-Read the same values back with `ban_remaining()`, `ban_multiplier`, `ban_cause`
-and `seconds_since_last_send()` — everything you can seed, you can capture.
+Read the same values back with `ban_remaining()`, `ban_multiplier`, `ban_cause`,
+`back_off_kind` and `seconds_since_last_send()` — everything you can seed, you can
+capture.
+
+Store `back_off_kind` with the rest. Without it a restart resumes a busy upstream
+as a ban, and the process that comes back reports something different from the one
+that went away. Omitting it is safe rather than silent-wrong — the back-off resumes
+as `BANNED`, which waits too long rather than too little — but it is a distinction
+you had and gave up.
 
 **Pass durations, never timestamps.** These are measured on a monotonic clock,
 whose zero point is undefined and does not survive the process. A deadline stored
@@ -332,8 +340,21 @@ already knows and sends nothing:
 ```python
 link = anidb_client.get_link()
 if link.is_banned:
-    print(f"backing off for {link.ban_remaining:.0f}s ({link.ban_cause.name.lower()})")
+    print(
+        f"backing off for {link.ban_remaining:.0f}s "
+        f"({link.back_off_kind.name.lower()}, {link.ban_cause.name.lower()})"
+    )
 ```
+
+**`back_off_kind` is the one to branch on.** A back-off means *stop sending*; it
+does not always mean the same thing about your client. `BackOffKind.BANNED` is
+AniDB refusing this client, and the window is the length of one of its temporary
+bans — half an hour, doubling if it keeps happening. `BackOffKind.BUSY` is the
+service being busy, out of service or asking for a resubmit, and the window is
+half a minute, doubling to a ceiling of four minutes. `ban_cause` answers the other
+question — whether AniDB refused you, went silent, or was never reached — and
+`AniDBBannedError` carries both, so the error your request raised and the state
+your health check reads agree about the same back-off.
 
 `connect()` is optional. If you do not mind finding out on the first request, skip
 it.

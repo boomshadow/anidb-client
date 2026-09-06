@@ -37,6 +37,33 @@ class BanCause(enum.Enum):
     LOCAL = enum.auto()
 
 
+class BackOffKind(enum.Enum):
+    """What the standing back-off is a reaction to, and so how long it lasts.
+
+    A different axis from `BanCause`, which says *how* the back-off arose -- the
+    upstream refused, the upstream said nothing, it never left this host. This
+    says *which refusal it was*, and it is the axis the schedule is chosen from:
+    a client being punished and an upstream having a bad minute are not the same
+    situation and must not wait the same length of time.
+
+    The response table already draws this line -- `602 SERVER BUSY`, `601 ANIDB
+    OUT OF SERVICE`, `604 TIMEOUT` and `600 INTERNAL SERVER ERROR` are dispositioned
+    `BACK_OFF`, while `555 BANNED` and `504 CLIENT BANNED` are `BANNED`. This is
+    where that distinction stops being computed and discarded.
+    """
+
+    # AniDB has banned this client, or the transport has concluded it has. The
+    # back-off is the length of an AniDB temporary ban and doubles per consecutive
+    # refusal, because a client that keeps being refused is being told it is the
+    # problem.
+    BANNED = enum.auto()
+    # The upstream is unwell but not with this client specifically -- busy, out of
+    # service, asking for a resubmit. Backing off is still correct, and hammering
+    # through a 602 is a way to earn a real ban; but the wait is proportionate to
+    # a service having a bad minute rather than to a punishment.
+    BUSY = enum.auto()
+
+
 class AniDBError(Exception):
     pass
 
@@ -93,6 +120,13 @@ class AniDBBannedError(AniDBError):
     second back-off read as "0 minutes", and it said nothing at all about which
     of the three refusals had happened -- leaving a caller to choose between
     parsing English and treating every back-off identically.
+
+    `kind` answers the other question a caller has to ask of a back-off: whether
+    this client has been banned or the upstream is merely busy. `rescode` already
+    separated the two for a caller that knows AniDB's response table by heart;
+    `kind` is the same answer without that knowledge, it is present on a back-off
+    that carries no code at all, and it is the answer the transport's health
+    surface gives for the same window.
     """
 
     def __init__(
@@ -100,12 +134,18 @@ class AniDBBannedError(AniDBError):
         message: str,
         *,
         cause: BanCause = BanCause.REFUSED,
+        kind: BackOffKind = BackOffKind.BANNED,
         retry_after: float = 0.0,
         rescode: str | None = None,
     ) -> None:
         super().__init__(message)
         # Which of the three refusals this is.
         self.cause = cause
+        # Whether this is a ban or a busy upstream -- the same answer the health
+        # surface gives for the same window. Carried here as well as there so that
+        # a caller reading the error and a caller reading the transport's state
+        # cannot disagree with each other about one situation.
+        self.kind = kind
         # Seconds until anything may be sent again, unrounded. Zero means the
         # window has already closed.
         self.retry_after = retry_after

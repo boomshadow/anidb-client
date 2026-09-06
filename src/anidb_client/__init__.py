@@ -43,7 +43,7 @@ from anidb_client.animeobjs import (
     RelatedAnime,
     RelationWalkStop,
 )
-from anidb_client.errors import BanCause
+from anidb_client.errors import BackOffKind, BanCause
 from anidb_client.link import DEFAULT_OUTGOING_PORT, AniDBLink
 from anidb_client.ratelimit import RateLimiter
 
@@ -55,6 +55,7 @@ __all__ = [
     "AniDBLink",
     "Anime",
     "AnimeTitle",
+    "BackOffKind",
     "BanCause",
     "Episode",
     "File",

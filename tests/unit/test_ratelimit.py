@@ -12,7 +12,7 @@ import threading
 import pytest
 
 import anidb_client
-from anidb_client.errors import BanCause
+from anidb_client.errors import BackOffKind, BanCause
 from anidb_client.ratelimit import RateLimiter
 
 
@@ -280,6 +280,163 @@ class TestBanCause:
         assert limiter.ban_cause is BanCause.SILENCE
 
 
+class TestBackOffKind:
+    """A busy upstream and a banned client get different schedules.
+
+    The response table already separates the two -- `602 SERVER BUSY`, `601 OUT OF
+    SERVICE`, `604 TIMEOUT` and `600 INTERNAL SERVER ERROR` are dispositioned
+    `BACK_OFF`, while `555 BANNED` and `504 CLIENT BANNED` are `BANNED` -- and this
+    is the class that spends that distinction rather than discarding it.
+
+    Backing off from a busy server is not the defect and is not removed here:
+    pushing through a `602` is a good way to earn a real ban. What is wrong is a
+    transient busy signal inheriting a schedule written for punishment. The
+    reported incident is the shape to keep in mind -- seven metered calls in ninety
+    minutes, a `602` that was the upstream's own load, and a back-off of nineteen
+    minutes with the multiplier climbing.
+    """
+
+    def test_a_busy_upstream_backs_off_for_seconds_rather_than_half_an_hour(self):
+        limiter, _clock = make()
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+
+        assert limiter.ban_remaining() == RateLimiter.BUSY_BASE_DELAY
+
+    def test_a_ban_still_backs_off_for_the_length_of_a_ban(self):
+        """The schedule that was right stays exactly as it was."""
+        limiter, _clock = make()
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BANNED)
+
+        assert limiter.ban_remaining() == RateLimiter.BAN_BASE_DELAY
+
+    def test_a_ban_is_the_default_kind(self):
+        """A caller with no verdict from AniDB to read waits as though banned.
+
+        The safe direction: being wrong costs a client that is quiet too long,
+        where the other default costs a client probing a service that banned it.
+        """
+        limiter, _clock = make()
+        limiter.register_ban()
+
+        assert limiter.back_off_kind is BackOffKind.BANNED
+        assert limiter.ban_remaining() == RateLimiter.BAN_BASE_DELAY
+
+    def test_a_busy_back_off_still_escalates(self):
+        """Exponential back-off on a busy upstream is correct and stays.
+
+        What changes is what it counts from, not that it counts.
+        """
+        limiter, _clock = make()
+
+        windows = []
+        for _ in range(3):
+            limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+            windows.append(limiter.ban_remaining())
+
+        assert windows == [
+            RateLimiter.BUSY_BASE_DELAY,
+            RateLimiter.BUSY_BASE_DELAY * 2,
+            RateLimiter.BUSY_BASE_DELAY * 4,
+        ]
+
+    def test_the_longest_a_busy_upstream_can_cost_is_bounded(self):
+        """Minutes, against the ban schedule's hours."""
+        limiter, _clock = make()
+        for _ in range(20):
+            limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+
+        assert limiter.ban_remaining() == RateLimiter.BUSY_BASE_DELAY * RateLimiter.MAX_BAN_MULTIPLIER
+        assert limiter.ban_remaining() < RateLimiter.BAN_BASE_DELAY
+
+    def test_the_kind_is_readable_from_the_limiter(self):
+        """The point of the field: the live state answers, not only the error."""
+        limiter, _clock = make()
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+
+        assert limiter.back_off_kind is BackOffKind.BUSY
+
+    def test_a_limiter_that_is_not_banned_has_no_kind(self):
+        limiter, _clock = make()
+        assert limiter.back_off_kind is None
+
+    def test_clearing_the_ban_clears_the_kind(self):
+        limiter, _clock = make()
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+        limiter.clear_ban()
+
+        assert limiter.back_off_kind is None
+
+    def test_an_elapsed_window_still_reports_its_kind(self):
+        """Elapsing is not clearing, for the kind as for the cause."""
+        limiter, clock = make()
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+        clock.advance(RateLimiter.BUSY_BASE_DELAY + 1)
+
+        assert limiter.ban_remaining() == 0
+        assert limiter.back_off_kind is BackOffKind.BUSY
+
+    def test_the_kind_and_the_cause_are_independent(self):
+        """Two axes, deliberately not collapsed into one.
+
+        The cause says how the back-off arose; the kind says which refusal it was.
+        A `602` and a `555` are both `REFUSED`, which is exactly why the cause on
+        its own could not tell the reported incident from a real ban.
+        """
+        limiter, _clock = make()
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+
+        assert limiter.ban_cause is BanCause.REFUSED
+        assert limiter.back_off_kind is BackOffKind.BUSY
+
+    def test_a_busy_back_off_does_not_inherit_a_ban_s_escalation(self):
+        """The defect, stated as a schedule.
+
+        The multiplier counts consecutive refusals of one kind. A busy reply is
+        not the next step of a ban's escalation, so it starts its own count --
+        otherwise a client that had been banned once would serve a four-minute
+        sentence for the upstream having a bad second.
+        """
+        limiter, _clock = make()
+        for _ in range(3):
+            limiter.register_ban(BanCause.REFUSED, BackOffKind.BANNED)
+        assert limiter.ban_multiplier == 4
+
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+
+        assert limiter.ban_multiplier == 1
+        assert limiter.ban_remaining() == RateLimiter.BUSY_BASE_DELAY
+
+    def test_a_ban_after_a_busy_run_starts_from_the_full_ban_delay(self):
+        """And the same rule the other way, which is the one that must not be lax.
+
+        A run of busy replies must not leave a real ban starting at a multiplier
+        it did not earn -- but nor may it shorten one. The ban's own base delay is
+        what the first ban is worth.
+        """
+        limiter, _clock = make()
+        for _ in range(3):
+            limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BANNED)
+
+        assert limiter.ban_multiplier == 1
+        assert limiter.ban_remaining() == RateLimiter.BAN_BASE_DELAY
+
+    def test_a_busy_back_off_is_jittered_like_any_other(self):
+        """The herd argument does not stop applying because the window is shorter."""
+        limiter, _clock = make(random=lambda: 0.0)
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+
+        assert limiter.ban_remaining() == RateLimiter.BUSY_BASE_DELAY * RateLimiter.BAN_JITTER_FLOOR
+
+    def test_a_busy_back_off_is_not_slept(self):
+        """A window on the clock, whichever schedule drew it."""
+        limiter, clock = make()
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+
+        assert clock.slept == []
+
+
 class TestSendAccounting:
     def test_seconds_since_last_send_tracks_the_clock(self):
         limiter, clock = make()
@@ -435,12 +592,67 @@ class TestResumingStateFromAPreviousProcess:
         rehydrate a limiter it has no way to persist again -- which is a worse trap
         than not being able to resume it at all.
         """
-        limiter, _clock = make(banned_for=900, ban_multiplier=2, ban_cause=BanCause.SILENCE, seconds_since_last_send=7)
+        limiter, _clock = make(
+            banned_for=900,
+            ban_multiplier=2,
+            ban_cause=BanCause.SILENCE,
+            back_off_kind=BackOffKind.BUSY,
+            seconds_since_last_send=7,
+        )
 
         assert limiter.ban_remaining() == pytest.approx(900)
         assert limiter.ban_multiplier == 2
         assert limiter.ban_cause is BanCause.SILENCE
+        assert limiter.back_off_kind is BackOffKind.BUSY
         assert limiter.seconds_since_last_send() == pytest.approx(7)
+
+    def test_the_kind_survives_the_round_trip(self):
+        """Without this, a restart silently converts a busy back-off into a ban.
+
+        The application stores the window and the multiplier and hands them back;
+        if the kind is not part of that, the resumed limiter reports a ban to a
+        status endpoint that was reporting a busy upstream a moment earlier -- the
+        process disagreeing with itself across its own restart.
+        """
+        limiter, _clock = make(
+            banned_for=20, ban_multiplier=1, ban_cause=BanCause.REFUSED, back_off_kind=BackOffKind.BUSY
+        )
+
+        assert limiter.back_off_kind is BackOffKind.BUSY
+
+    def test_the_resumed_kind_chooses_the_next_schedule(self):
+        """Which is what makes resuming it worth anything.
+
+        A resumed busy back-off that escalated on the ban schedule would hand the
+        incident back the moment the process restarted.
+        """
+        limiter, _clock = make(ban_multiplier=1, ban_cause=BanCause.REFUSED, back_off_kind=BackOffKind.BUSY)
+
+        limiter.register_ban(BanCause.REFUSED, BackOffKind.BUSY)
+
+        assert limiter.ban_multiplier == 2
+        assert limiter.ban_remaining() == RateLimiter.BUSY_BASE_DELAY * 2
+
+    def test_an_omitted_kind_resumes_as_a_ban(self):
+        """A limiter seeded by an application that names no kind must still resume.
+
+        Assuming a ban errs the safe way: the resumed window is whatever
+        `banned_for` said either way, and only the next escalation differs -- so
+        the mistake this default can make is waiting too long.
+        """
+        limiter, _clock = make(banned_for=900, ban_multiplier=1, ban_cause=BanCause.REFUSED)
+
+        assert limiter.back_off_kind is BackOffKind.BANNED
+        assert limiter.ban_remaining() == pytest.approx(900)
+
+    def test_a_successful_auth_clears_a_resumed_kind_too(self):
+        limiter, _clock = make(
+            banned_for=20, ban_multiplier=1, ban_cause=BanCause.REFUSED, back_off_kind=BackOffKind.BUSY
+        )
+
+        limiter.clear_ban()
+
+        assert limiter.back_off_kind is None
 
 
 class TestIncoherentStateIsRefused:
@@ -470,6 +682,11 @@ class TestIncoherentStateIsRefused:
     def test_a_multiplier_without_a_cause_is_refused(self):
         with pytest.raises(ValueError, match="ban_cause"):
             RateLimiter(ban_multiplier=1)
+
+    def test_a_kind_without_a_multiplier_is_refused(self):
+        """`back_off_kind` answers None while unbanned, so this could not be read back."""
+        with pytest.raises(ValueError, match="ban_multiplier"):
+            RateLimiter(back_off_kind=BackOffKind.BUSY)
 
     def test_a_negative_window_is_refused(self):
         with pytest.raises(ValueError, match="banned_for"):
@@ -543,20 +760,25 @@ class TestTheLimiterInitIsGiven:
     def test_a_resumed_limiter_arrives_still_banned(self, opened):
         """End to end: the state a previous process stored is the state the
         transport starts with, rather than something a restart forgets."""
-        resumed = RateLimiter(banned_for=900, ban_multiplier=2, ban_cause=BanCause.SILENCE)
+        resumed = RateLimiter(
+            banned_for=900, ban_multiplier=2, ban_cause=BanCause.SILENCE, back_off_kind=BackOffKind.BANNED
+        )
 
         handed_over = opened(rate_limiter=resumed)["rate_limiter"]
 
         assert handed_over.is_banned
         assert handed_over.ban_multiplier == 2
         assert handed_over.ban_cause is BanCause.SILENCE
+        assert handed_over.back_off_kind is BackOffKind.BANNED
 
     def test_the_limiter_is_part_of_the_declared_public_surface(self):
         """Supplying one is only supported if the type can be named.
 
-        `BanCause` is here for the same reason: a limiter resuming a back-off has
-        to say which of the three refusals opened it, so a caller cannot construct
-        one without the vocabulary.
+        `BanCause` and `BackOffKind` are here for the same reason: a limiter
+        resuming a back-off has to say which of the three refusals opened it and
+        which kind of back-off it is, so a caller cannot construct one -- or read
+        the answer back off the health surface -- without the vocabulary.
         """
         assert "RateLimiter" in anidb_client.__all__
         assert "BanCause" in anidb_client.__all__
+        assert "BackOffKind" in anidb_client.__all__

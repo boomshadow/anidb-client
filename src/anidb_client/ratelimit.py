@@ -47,11 +47,18 @@ import threading
 import time as _time
 from collections.abc import Callable
 
-from anidb_client.errors import BanCause
+from anidb_client.errors import BackOffKind, BanCause
 
 
 class RateLimiter:
-    """Paces outgoing commands, and backs off exponentially once banned.
+    """Paces outgoing commands, and backs off exponentially once refused.
+
+    **There are two back-off schedules, chosen by `BackOffKind`.** A banned client
+    waits the length of an AniDB temporary ban; a client turned away by a busy
+    upstream waits half a minute. Both double per consecutive refusal of the same
+    kind and both stop at the same ceiling -- the difference is what they count
+    from, because "you are the problem" and "come back in a moment" are not the
+    same instruction however similarly they are obeyed.
 
     Part of the public surface, because `init()` accepts one (SPEC-006). An
     application that wants this state to outlive its process constructs a limiter
@@ -72,7 +79,26 @@ class RateLimiter:
     # bans last on the order of half an hour, so there is no point retrying sooner.
     BAN_BASE_DELAY = 1800
 
-    # Ceiling on that doubling, giving a longest back-off of BAN_BASE_DELAY * this.
+    # The same, for a back-off the upstream asked for rather than one this client
+    # earned: `602 SERVER BUSY`, `601 OUT OF SERVICE`, `604 TIMEOUT`, `600 INTERNAL
+    # SERVER ERROR`. Backing off from those is still correct -- pushing through a
+    # 602 is a good way to turn it into a real ban -- but the wait is sized for a
+    # service having a bad minute, not for a punishment. Thirty seconds, doubling
+    # the same way to the same ceiling, so the longest a busy upstream can cost is
+    # four minutes rather than four hours.
+    #
+    # This is the reported defect. Seven metered calls in ninety minutes drew a
+    # `602`, which the upstream's own load explains and this client's behaviour does
+    # not; the back-off opened was ban-sized and escalating, so an application that
+    # had done nothing wrong lost twenty minutes and was on course to lose hours.
+    BUSY_BASE_DELAY = 30
+
+    # Ceiling on that doubling, giving a longest back-off of the kind's base delay
+    # times this. One ceiling for both kinds: the schedules differ in what they are
+    # counting from, not in how far they are willing to count, and a second ceiling
+    # would be a second thing to seed, validate and keep in step for no behaviour
+    # the first does not already bound.
+    #
     # A successful authentication calls clear_ban(), so in the ordinary
     # banned-then-readmitted cycle the multiplier rarely leaves 1. It compounds when
     # authentication itself keeps failing, and without a ceiling that sequence walks
@@ -102,6 +128,7 @@ class RateLimiter:
         banned_for: float = 0.0,
         ban_multiplier: int = 0,
         ban_cause: BanCause | None = None,
+        back_off_kind: BackOffKind | None = None,
         seconds_since_last_send: float | None = None,
     ) -> None:
         """Build a limiter, optionally resuming state from a previous process.
@@ -128,8 +155,16 @@ class RateLimiter:
         move to another host, and are converted to this process's clock here.
 
         Every seedable field has a public reader, so state that can be resumed can
-        also be captured: `ban_remaining()`, `ban_multiplier`, `ban_cause` and
-        `seconds_since_last_send()`.
+        also be captured: `ban_remaining()`, `ban_multiplier`, `ban_cause`,
+        `back_off_kind` and `seconds_since_last_send()`.
+
+        **`back_off_kind` defaults to the punishing schedule when it is omitted.**
+        It is not refused the way a missing `ban_cause` is, because a limiter seeded
+        by an application written against an earlier release names no kind and must
+        still resume. Assuming `BANNED` errs in the safe direction: the resumed
+        window is whatever `banned_for` says it is either way, and only the *next*
+        escalation is affected, so the mistake this default can make is waiting too
+        long rather than sending into a service that has banned this client.
 
         **Incoherent combinations are refused rather than repaired.** A back-off
         with no multiplier is the one that matters: `is_banned` reads the
@@ -160,13 +195,13 @@ class RateLimiter:
         # value here -- a window that has elapsed while its multiplier stands -- and
         # writing it as `if banned_for` leaves a reader working out whether that case
         # was considered or merely fell through.
-        if (banned_for > 0 or ban_cause is not None) and not ban_multiplier:
+        if (banned_for > 0 or ban_cause is not None or back_off_kind is not None) and not ban_multiplier:
             raise ValueError(
                 "A back-off was described with no ban_multiplier. A ban that exists has a "
                 "multiplier of at least 1, so this state is already inconsistent: is_banned "
                 "reads the multiplier, and a limiter seeded this way would hold a deadline "
                 "while reporting itself unbanned. Pass ban_multiplier together with "
-                "banned_for and ban_cause, or pass none of the three."
+                "banned_for, ban_cause and back_off_kind, or pass none of them."
             )
         if ban_multiplier and ban_cause is None:
             raise ValueError(
@@ -198,6 +233,12 @@ class RateLimiter:
         # including the ones raised by a code path far from where the ban was
         # registered.
         self._ban_cause: BanCause | None = ban_cause if ban_multiplier else None
+        # Which schedule the window was drawn from, and the answer the health
+        # surface gives when asked what kind of trouble this is. Held beside the
+        # cause rather than folded into it: the cause says how the back-off arose,
+        # this says which refusal it was, and collapsing the two would make either
+        # question unanswerable.
+        self._back_off_kind: BackOffKind | None = (back_off_kind or BackOffKind.BANNED) if ban_multiplier else None
 
     @property
     def is_banned(self) -> bool:
@@ -215,6 +256,17 @@ class RateLimiter:
         with self._lock:
             return self._ban_cause if self._ban_multiplier else None
 
+    @property
+    def back_off_kind(self) -> BackOffKind | None:
+        """Whether the standing back-off is a ban or a busy upstream, or None.
+
+        Readable from the live state rather than only from the error that opened
+        the window, because an application asking "what is happening right now"
+        does not have that error in its hand -- and, after a restart, never saw it.
+        """
+        with self._lock:
+            return self._back_off_kind if self._ban_multiplier else None
+
     def _seconds_since_last_send(self) -> float:
         """Caller holds the lock. The public form below takes it."""
         return self._monotonic() - self._last_send
@@ -229,23 +281,39 @@ class RateLimiter:
             self._sent_in_burst += 1
             self._last_send = self._monotonic()
 
-    def register_ban(self, cause: BanCause = BanCause.REFUSED) -> int:
+    def register_ban(self, cause: BanCause = BanCause.REFUSED, kind: BackOffKind = BackOffKind.BANNED) -> int:
         """Record a ban or server-busy reply and return the new multiplier.
 
-        Doubles per consecutive ban, so a server that stays unhappy is backed away
-        from rather than hammered at a fixed interval, up to MAX_BAN_MULTIPLIER.
-        Opens the window in which nothing at all is sent.
+        Doubles per consecutive refusal, so a server that stays unhappy is backed
+        away from rather than hammered at a fixed interval, up to
+        MAX_BAN_MULTIPLIER. Opens the window in which nothing at all is sent.
 
-        `cause` says which kind of refusal opened it. It is recorded rather than
-        acted on: the policy is the same for all three, but a caller told to wait
-        wants to know whether AniDB refused it, ignored it, or was never asked.
+        `cause` says how the refusal arose. It is recorded rather than acted on:
+        the policy is the same for all three, but a caller told to wait wants to
+        know whether AniDB refused it, ignored it, or was never asked.
+
+        `kind` says which refusal it was, and that one *is* acted on -- it chooses
+        the base delay the doubling starts from. A busy upstream and a banned
+        client both mean "stop sending", and they do not mean "stop sending for
+        the same length of time".
+
+        **A change of kind restarts the doubling.** The multiplier counts
+        consecutive refusals of one kind; a busy reply is not the next step of a
+        ban's escalation, and inheriting one would be the defect this parameter
+        exists to fix arriving by a different route. It costs nothing in traffic:
+        the first window of either kind is still a window, and the sender still
+        sends one probe at the end of it.
         """
         with self._lock:
             self._ban_cause = cause
+            if kind is not self._back_off_kind:
+                self._ban_multiplier = 0
+            self._back_off_kind = kind
             self._ban_multiplier = (
                 1 if not self._ban_multiplier else min(self._ban_multiplier * 2, self.MAX_BAN_MULTIPLIER)
             )
-            window = float(self.BAN_BASE_DELAY * self._ban_multiplier)
+            base = self.BUSY_BASE_DELAY if kind is BackOffKind.BUSY else self.BAN_BASE_DELAY
+            window = float(base * self._ban_multiplier)
             jittered = window * (self.BAN_JITTER_FLOOR + (1.0 - self.BAN_JITTER_FLOOR) * self._random())
             self._banned_until = self._monotonic() + jittered
             return self._ban_multiplier
@@ -256,6 +324,7 @@ class RateLimiter:
             self._ban_multiplier = 0
             self._banned_until = 0.0
             self._ban_cause = None
+            self._back_off_kind = None
 
     def ban_remaining(self) -> float:
         """Seconds until anything may be sent again, or 0 if something may be now.

@@ -39,6 +39,7 @@ from anidb_client.errors import (
     AniDBError,
     AniDBInternalError,
     AniDBMustAuthError,
+    BackOffKind,
     BanCause,
 )
 from anidb_client.ratelimit import RateLimiter
@@ -135,6 +136,15 @@ _REFUSAL_TEXT: dict[BanCause, str] = {
     BanCause.REFUSED: "AniDB asked this client to back off",
     BanCause.SILENCE: "AniDB has stopped answering this client",
     BanCause.LOCAL: "this client could not reach AniDB",
+}
+
+# Which back-off schedule a disposition earns. The response table already separates
+# "the server is unhappy" from "this client is banned"; this is where that stops
+# being computed and discarded. `Disposition.NORMAL` has no entry because a normal
+# code never opens a back-off -- both readers test for it before looking here.
+_BACK_OFF_KIND: dict[Disposition, BackOffKind] = {
+    Disposition.BACK_OFF: BackOffKind.BUSY,
+    Disposition.BANNED: BackOffKind.BANNED,
 }
 
 
@@ -381,7 +391,21 @@ class AniDBLink(threading.Thread):
         will change, so it is latched and no further AUTH is sent.
         """
         error: AniDBError
-        if disposition_for(rescode) is not Disposition.NORMAL:
+        disposition = disposition_for(rescode)
+        if disposition is not Disposition.NORMAL:
+            # Silence is reported to this method as 604 because that is what the
+            # response table classifies -- a handshake that goes unanswered has to
+            # come out retryable, not latched, and only a code decides that. But
+            # AniDB sent nothing, so the code is a local stand-in for a reply that
+            # never came and must not be handed on as one: `rescode` is the code
+            # AniDB *answered* with, and a silent ban has none.
+            silent = cause is BanCause.SILENCE
+            # For the same reason the stand-in must not choose the schedule. 604 is
+            # dispositioned BACK_OFF, so read literally it would buy silence the
+            # thirty-second busy back-off -- and silence is AniDB's *primary* ban
+            # enforcement, so that is a client probing a service that has banned it
+            # twice a minute. Only a code AniDB actually sent describes AniDB.
+            kind = BackOffKind.BANNED if silent else _BACK_OFF_KIND[disposition]
             # register_ban() rather than set_banned(): this runs on the listener
             # thread, and set_banned() re-authenticates, which would send AUTH --
             # and pay the back-off sleep -- from the thread that has to keep
@@ -390,19 +414,13 @@ class AniDBLink(threading.Thread):
             #
             # Registered before the error is built, because the error carries how
             # long the window it just opened has left to run.
-            self._rate_limiter.register_ban(cause)
-            # Silence is reported to this method as 604 because that is what the
-            # response table classifies -- a handshake that goes unanswered has to
-            # come out retryable, not latched, and only a code decides that. But
-            # AniDB sent nothing, so the code is a local stand-in for a reply that
-            # never came and must not be handed on as one: `rescode` is the code
-            # AniDB *answered* with, and a silent ban has none.
-            silent = cause is BanCause.SILENCE
+            self._rate_limiter.register_ban(cause, kind)
             error = AniDBBannedError(
                 f"AniDB did not answer the handshake: {reason}"
                 if silent
                 else f"AniDB refused authentication: {rescode} {reason}",
                 cause=cause,
+                kind=kind,
                 retry_after=self._rate_limiter.ban_remaining(),
                 rescode=None if silent else rescode,
             )
@@ -783,6 +801,24 @@ class AniDBLink(threading.Thread):
         return self._rate_limiter.ban_cause
 
     @property
+    def back_off_kind(self) -> BackOffKind | None:
+        """Whether the standing back-off is a ban or a busy upstream, or None.
+
+        `ban_cause` says how the window was opened; this says which refusal it
+        was, and so which schedule it is running on. Both are needed: an
+        application that reads only the cause is told `REFUSED` by a `555 BANNED`
+        and by a `602 SERVER BUSY` alike, which is the whole of the difference
+        between "stop, this account is in trouble" and "the site is having a
+        moment".
+
+        Readable here rather than only off the error that opened the window,
+        because an application asking what the state *is* does not hold that error
+        -- and after a restart never saw it. A limiter resumed with
+        `back_off_kind` answers this the same way the process that stored it did.
+        """
+        return self._rate_limiter.back_off_kind
+
+    @property
     def ban_remaining(self) -> float:
         """Seconds until anything may be sent again, unrounded. 0 if it may now."""
         return self._rate_limiter.ban_remaining()
@@ -825,9 +861,11 @@ class AniDBLink(threading.Thread):
         if remaining <= 0:
             return None
         cause = self._rate_limiter.ban_cause or BanCause.REFUSED
+        kind = self._rate_limiter.back_off_kind or BackOffKind.BANNED
         return AniDBBannedError(
             f"{_REFUSAL_TEXT[cause]}; nothing will be sent for another {remaining:.0f}s",
             cause=cause,
+            kind=kind,
             retry_after=remaining,
         )
 
@@ -991,6 +1029,7 @@ class AniDBLink(threading.Thread):
         code: int | None = None,
         reason: bytes | str | None = None,
         cause: BanCause = BanCause.REFUSED,
+        kind: BackOffKind = BackOffKind.BANNED,
     ) -> AniDBBannedError:
         """Open a back-off window, and hand back the refusal it opened.
 
@@ -1002,15 +1041,21 @@ class AniDBLink(threading.Thread):
 
         `code` is the AniDB response code when there was one. Silence has none,
         and neither does a datagram that never left this host.
+
+        `kind` chooses the schedule. It defaults to the punishing one, so a caller
+        that has no verdict from AniDB to read -- a socket that would not send, a
+        silence -- backs off as though banned. That is the safe direction: the
+        cost of being wrong is a client that is quiet for too long, and the cost of
+        the other default is a client probing a service that has banned it.
         """
         # Decoded rather than interpolated: the reasons raised from commands.py are
         # bytes literals, which formatted as b'API not responding' in the log line.
         if isinstance(reason, bytes):
             reason = reason.decode("utf-8", "replace")
-        self._rate_limiter.register_ban(cause)
+        self._rate_limiter.register_ban(cause, kind)
         detail = f"{code} {reason}" if code is not None else str(reason)
         anidb_client.log.error(
-            f"Backing off ({cause.name.lower()}): {detail} "
+            f"Backing off ({kind.name.lower()}/{cause.name.lower()}): {detail} "
             f"(nothing will be sent for {self._rate_limiter.ban_remaining():.0f}s)"
         )
         # The session is dropped but no new one is started here. This runs on the
@@ -1029,6 +1074,7 @@ class AniDBLink(threading.Thread):
         return AniDBBannedError(
             f"{_REFUSAL_TEXT[cause]}: {detail}",
             cause=cause,
+            kind=kind,
             retry_after=self._rate_limiter.ban_remaining(),
             rescode=str(code) if code is not None else None,
         )
@@ -1265,6 +1311,9 @@ class AniDBListener(threading.Thread):
             except TimeoutError:
                 self._handle_timeouts()
                 continue
+            # PEP 758: unparenthesized `except A, B:` is valid Python 3.14, and `ruff format`
+            # produces this form -- adding parentheses fails `format:check`. Not Python 2, and
+            # not something an automated reviewer should flag.
             except OSError, AttributeError:
                 # AttributeError covers stop() setting self.sock to None between
                 # the loop check and the call above.
@@ -1389,7 +1438,11 @@ class AniDBListener(threading.Thread):
             # would count one refusal twice and double the back-off for it.
             cmd.fail(self._sender.auth_failed(code, reason))
             return
-        refusal = self._sender.set_banned(code=int(code), reason=reason, cause=BanCause.REFUSED)
+        # The schedule comes from the disposition the table already computed for
+        # this code, which is the only place that knows a busy server from a ban.
+        refusal = self._sender.set_banned(
+            code=int(code), reason=reason, cause=BanCause.REFUSED, kind=_BACK_OFF_KIND[disposition]
+        )
         if cmd is not None:
             cmd.fail(refusal)
 
