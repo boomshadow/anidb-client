@@ -38,11 +38,16 @@ class Disposition(enum.Enum):
     # Nothing for the transport to do; the reply is the caller's business.
     NORMAL = enum.auto()
     # The server is unhappy but not with us specifically -- busy, down, or asking
-    # for a resubmit. Back off before trying again.
+    # for a resubmit. Back off before trying again, on the shorter of the
+    # transport's two schedules: this is a statement about the server's health,
+    # and a client that has done nothing wrong must not serve a ban's sentence
+    # for it.
     BACK_OFF = enum.auto()
-    # We have been banned. Same immediate handling as BACK_OFF today, kept
-    # distinct because it is a statement about this client rather than about the
-    # server's health, and the two want different recovery.
+    # We have been banned. Backing off too, but on the schedule sized for an
+    # AniDB temporary ban, because this is a statement about *this client* rather
+    # than about the server -- and the two want different recovery. The transport
+    # reads which of the two this is through `BackOffKind`; ADR-009 records why
+    # that is an axis of its own.
     BANNED = enum.auto()
 
 

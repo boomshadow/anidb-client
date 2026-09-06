@@ -998,6 +998,9 @@ class Anime(AniDBObj):
                 if e.code == 429:
                     try:
                         asked = int(e.headers.get("Retry-After", 0))
+                    # PEP 758: unparenthesized `except A, B:` is valid Python 3.14, and `ruff format`
+                    # produces this form -- adding parentheses fails `format:check`. Not Python 2, and
+                    # not something an automated reviewer should flag.
                     except TypeError, ValueError:
                         # Retry-After is also allowed to be an HTTP-date. Not worth
                         # parsing for this: move on rather than guess at a delay.
@@ -1641,6 +1644,9 @@ class File(AniDBObj):
                     finfo["aid"] = anime.aid
                     finfo["eid"] = _required(episodes, "episodes")[0].eid
                     finfo["is_generic"] = self._is_generic
+                # PEP 758: unparenthesized `except A, B:` is valid Python 3.14, and `ruff format`
+                # produces this form -- adding parentheses fails `format:check`. Not Python 2, and
+                # not something an automated reviewer should flag.
                 except IllegalAnimeObject, IndexError, TypeError:
                     self._illegal_object = True
                     # Signal before returning. `_file_updated` is otherwise only set

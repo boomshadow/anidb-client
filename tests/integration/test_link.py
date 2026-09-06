@@ -22,6 +22,7 @@ from anidb_client.errors import (
     AniDBBannedError,
     AniDBCommandTimeoutError,
     AniDBError,
+    BackOffKind,
     BanCause,
 )
 from anidb_client.link import AniDBLink, AniDBListener, scrub_session, session_fingerprint
@@ -29,6 +30,19 @@ from anidb_client.ratelimit import RateLimiter
 from tests.fake_anidb import FakeAniDBServer
 
 AUTH_OK = "200 sess1234 127.0.0.1:9000 LOGIN ACCEPTED"
+
+# The two schedules, by the code that opens them. Written out rather than derived
+# from the response table so that a code silently changing disposition shows up
+# here as a failing assertion rather than as a test that agrees with whatever the
+# table now says.
+BACK_OFF_KIND_FOR = {
+    "504": BackOffKind.BANNED,
+    "555": BackOffKind.BANNED,
+    "600": BackOffKind.BUSY,
+    "601": BackOffKind.BUSY,
+    "602": BackOffKind.BUSY,
+    "604": BackOffKind.BUSY,
+}
 
 
 @pytest.fixture
@@ -311,6 +325,7 @@ class TestTaggedRefusals:
         _await(lambda: link.is_banned, message=f"a tagged {code} registered no ban")
         assert link.ban_remaining > 0, "a ban was registered but no back-off window opened"
         assert link.ban_cause is BanCause.REFUSED
+        assert link.back_off_kind is BACK_OFF_KIND_FOR[code]
 
     @pytest.mark.parametrize("code", ["555", "600", "601", "602", "604"])
     def test_a_refusal_carrying_a_tag_settles_the_command_it_answered(self, server, make_link, code):
@@ -329,6 +344,7 @@ class TestTaggedRefusals:
             future.result(timeout=5)
         assert raised.value.rescode == code
         assert raised.value.cause is BanCause.REFUSED
+        assert raised.value.kind is BACK_OFF_KIND_FOR[code]
         assert raised.value.retry_after > 0
 
     def test_a_refusal_carrying_the_wrong_tag_closes_the_gate(self, server, make_link):
@@ -379,6 +395,37 @@ class TestSilenceIsABan:
         assert isinstance(error, AniDBBannedError)
         assert error.cause is BanCause.SILENCE
         assert error.rescode is None, "604 classifies the failure; it is not a code AniDB sent"
+
+    def test_silence_backs_off_as_a_ban_rather_than_as_a_busy_upstream(self, server, make_link):
+        """The stand-in code must not choose the schedule either.
+
+        Silence reaches `auth_failed` as "604", which the table dispositions
+        `BACK_OFF` -- read literally that would buy AniDB's *primary* ban
+        enforcement the half-minute busy window, and a client probing a service
+        that has banned it twice a minute. Only a code AniDB actually sent
+        describes AniDB.
+        """
+        link = make_link(server)
+
+        error = link.auth_failed("604", "API not responding", cause=BanCause.SILENCE)
+
+        assert isinstance(error, AniDBBannedError)
+        assert error.kind is BackOffKind.BANNED
+        assert link.back_off_kind is BackOffKind.BANNED
+        assert link.ban_remaining > RateLimiter.BUSY_BASE_DELAY * RateLimiter.MAX_BAN_MULTIPLIER
+
+    def test_a_local_failure_backs_off_as_a_ban(self, server, make_link):
+        """Nothing was asked of AniDB, so nothing said the upstream is merely busy.
+
+        The conservative schedule is the default for every back-off opened without
+        a verdict from AniDB to read.
+        """
+        link = make_link(server)
+
+        refusal = link.set_banned(reason=b"Network unavailable", cause=BanCause.LOCAL)
+
+        assert refusal.kind is BackOffKind.BANNED
+        assert link.back_off_kind is BackOffKind.BANNED
 
     def test_one_unanswered_command_is_not_silence(self, server, make_link):
         """UDP loses datagrams. Absorbing one is what the retry budget is for."""
@@ -500,6 +547,7 @@ class TestHealthSurface:
 
         assert link.is_banned is False
         assert link.ban_cause is None
+        assert link.back_off_kind is None
         assert link.ban_remaining == 0
         assert link.ban_multiplier == 0
         assert link.session_age is None
@@ -511,10 +559,59 @@ class TestHealthSurface:
 
         _await(lambda: link.is_banned, message="the ban was never registered")
         assert link.ban_cause is BanCause.REFUSED
+        assert link.back_off_kind is BackOffKind.BANNED
         assert link.ban_multiplier == 1
         # Unrounded, in seconds: the message this used to be rounded to whole
         # minutes, so anything under thirty seconds read as "0 minutes".
         assert 0 < link.ban_remaining <= RateLimiter.BAN_BASE_DELAY
+
+    def test_a_busy_upstream_is_visible_as_busy_rather_than_as_a_ban(self, server, make_link):
+        """The reported defect, read from the surface an embedder actually polls.
+
+        `602 SERVER BUSY` and `555 BANNED` both open a window and both report the
+        cause `REFUSED`, so an application reading the cause alone was told the
+        same thing by the upstream having a bad minute and by its own account
+        being in trouble -- and its status endpoint disagreed with the error its
+        request path had just raised.
+        """
+        server.on("AUTH", lambda req: b"602 SERVER BUSY - TRY AGAIN LATER\n")
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(lambda: link.is_banned, message="a busy upstream registered no back-off")
+        assert link.back_off_kind is BackOffKind.BUSY
+        assert link.ban_cause is BanCause.REFUSED
+        assert 0 < link.ban_remaining <= RateLimiter.BUSY_BASE_DELAY
+
+    def test_a_busy_upstream_does_not_cost_a_bans_worth_of_time(self, server, make_link):
+        """Backing off is right; backing off for nineteen minutes is the bug.
+
+        The incident: seven metered calls in ninety minutes, a `602` that was the
+        upstream's own load, and a window measured in the hundreds of seconds.
+        """
+        server.on("AUTH", lambda req: b"602 SERVER BUSY - TRY AGAIN LATER\n")
+        link = make_link(server)
+        link.reauthenticate()
+
+        _await(lambda: link.is_banned, message="a busy upstream registered no back-off")
+        assert link.ban_remaining > 0, "a busy upstream is still backed off from"
+        assert link.ban_remaining < RateLimiter.BAN_BASE_DELAY
+
+    def test_the_error_and_the_surface_agree_about_one_window(self, server, make_link):
+        """The half of the defect that made an embedder contradict itself.
+
+        `AniDBBannedError.rescode` could always tell a `602` from a `555`; the
+        health surface could not, so the request path said "busy" while the status
+        endpoint said "banned" about the same back-off.
+        """
+        server.on("PING", "602 SERVER BUSY")
+        link = make_link(server)
+
+        future = link.request(anidb_client.commands.PingCommand(), lambda _resp: None)
+
+        with pytest.raises(AniDBBannedError) as raised:
+            future.result(timeout=5)
+        assert raised.value.kind is link.back_off_kind is BackOffKind.BUSY
 
     def test_the_address_anidb_reported_is_kept(self, server, make_link):
         """The only outside confirmation that source-port pinning is working.
