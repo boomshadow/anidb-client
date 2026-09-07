@@ -22,6 +22,30 @@ print(f"{anime.title} has {anime.nr_of_episodes} episodes and is a {anime.type}"
 anidb_client.close()
 ```
 
+## Looking for a REST API? Try anidb-sluice
+
+> [**anidb-sluice**](https://gitlab.com/boomshadow-public/anidb-sluice) is an HTTP
+> broker built on this library. It owns the AniDB conversation so your applications
+> don't have to.
+>
+> What it adds on top of what is here:
+>
+> * **Call it from anything.** HTTP with a generated OpenAPI contract, not a Python
+>   import.
+> * **Reads that work while you're banned.** Fuzzy title search and an entry's whole
+>   TVDB mapping, served from local data without touching the socket.
+> * **Bulk mylist recording as jobs.** Submit and poll instead of waiting, with
+>   higher-priority work cutting in between paced requests.
+> * **Ask before you queue.** It reports session and back-off state without sending
+>   anything, and tells a merely busy AniDB apart from a ban.
+> * **Ban state that survives a restart**, built on the rate-limiter seam this
+>   library exposes.
+>
+> And the reason it exists: AniDB bans by IP. Every extra process holding its own
+> client is another apparent client spending one shared budget that none of them can
+> see. One sluice is one socket, one port, one session, one pacer — however many
+> things you run behind it.
+
 ## Lineage
 
 This is an independent fork of [adbb](https://github.com/winterbird-code/adbb)
