@@ -131,8 +131,21 @@ class TestAuthentication:
         link = make_link(server)
         link.reauthenticate()
 
-        _await(lambda: link._session == "sess1234", message="session key was never stored")
-        assert link._authed.is_set()
+        # Waited for together rather than one and then the other. The key is stored
+        # by the listener thread (`set_session`), and the flag is set later by the
+        # callback thread running `_auth_handler` -- under a *second* acquisition of
+        # the same lock. So there is a real window in which the key is present and
+        # the flag is not, and a test that waits for the first and immediately
+        # asserts the second is racing it. That window widens on a loaded runner:
+        # this lost the race on the `v3.0.0` tag pipeline, which skipped the publish.
+        #
+        # Every other `_await` in this file waits on the value written *last* -- the
+        # authed flag on the handshake path, or ban state that `register_ban` writes
+        # in a single critical section -- so this was the only one exposed.
+        _await(
+            lambda: link._session == "sess1234" and link._authed.is_set(),
+            message="the handshake never completed with the session key stored",
+        )
 
     def test_a_login_without_a_usable_address_still_authenticates(self, server, make_link):
         """The NAT check must not be able to fail the login it is only advising.
