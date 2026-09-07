@@ -248,6 +248,24 @@ test:
     # The PostgreSQL-backed tests skip silently when the server is unreachable, which
     # would make this job quietly weaker than it looks. Fail instead.
     - uv run --frozen pytest -q -m postgres --no-cov -p no:cacheprovider
+  # A flaky test must not be able to spend a version number. The `v3.0.0` tag
+  # pipeline failed on a handshake test that lost a race, which skipped `build:dist`
+  # and `publish:pypi` -- and a tag cannot be re-pointed, so one bad roll costs a
+  # release rather than a rerun. Retrying covers that.
+  #
+  # It re-runs genuine failures too. That costs pipeline time and nothing else: a
+  # real break fails all three attempts and is still reported, only later. The
+  # infrastructure reasons are here for the same reason -- a runner that dies is not
+  # a statement about the code.
+  #
+  # Deliberately not on `anchor-watch`, whose findings are the point rather than
+  # noise, and which would otherwise be re-rolled until it stopped objecting.
+  retry:
+    max: 2
+    when:
+      - script_failure
+      - runner_system_failure
+      - stuck_or_timeout_failure
   coverage: '/^TOTAL.+?(\d+\%)$/'
   artifacts:
     when: always
