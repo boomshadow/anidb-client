@@ -186,8 +186,10 @@ file = anidb_client.File(path="/media/Anime/Kemono no Souja Erin/[BD] Kemono no 
 # file = anidb_client.File(anime=anime, episode=episode)
 
 # This usually works even for a file AniDB has never seen.
-print(f"'{file.path}' contains episode {file.episode.episode_number} of "
-      f"'{file.anime.title}'. Mylist state is '{file.mylist_state}'")
+print(
+    f"'{file.path}' contains episode {file.episode.episode_number} of "
+    f"'{file.anime.title}'. Mylist state is '{file.mylist_state}'"
+)
 
 # Posters for Anime and Group objects.
 # NOTE: the AniDB CDN has added a CAPTCHA, so this is unreliable. See Fanart below.
@@ -270,9 +272,9 @@ from anidb_client import BackOffKind, BanCause, RateLimiter
 
 # Whatever you stored last time this process shut down.
 limiter = RateLimiter(
-    banned_for=900,               # seconds of back-off remaining, not a deadline
-    ban_multiplier=2,             # so the next ban is longer, not a fresh one
-    ban_cause=BanCause.SILENCE,   # how the back-off arose
+    banned_for=900,  # seconds of back-off remaining, not a deadline
+    ban_multiplier=2,  # so the next ban is longer, not a fresh one
+    ban_cause=BanCause.SILENCE,  # how the back-off arose
     back_off_kind=BackOffKind.BANNED,  # which refusal it is, and so how long it lasts
     seconds_since_last_send=30,
 )
@@ -365,8 +367,7 @@ already knows and sends nothing:
 link = anidb_client.get_link()
 if link.is_banned:
     print(
-        f"backing off for {link.ban_remaining:.0f}s "
-        f"({link.back_off_kind.name.lower()}, {link.ban_cause.name.lower()})"
+        f"backing off for {link.ban_remaining:.0f}s ({link.back_off_kind.name.lower()}, {link.ban_cause.name.lower()})"
     )
 ```
 
