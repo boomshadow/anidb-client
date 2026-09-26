@@ -30,7 +30,7 @@ dynamic = ["version"]
 # latest released on or before the 45-day soak cutoff at the time it was pinned.
 dependencies = [
     "pycryptodome==3.23.0",
-    "sqlalchemy==2.0.51",
+    "sqlalchemy==2.0.52",
 ]
 
 # No `nfs` extra on purpose. File(path='nfs://...') needs the `libnfs` Python module,
