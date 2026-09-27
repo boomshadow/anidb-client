@@ -7,7 +7,7 @@
     {
       "description": "Keep the uv image version in .gitlab-ci.yml and the Dockerfile moving together. They are pinned to the same tag and digest on purpose, so that a local `task test` and a CI run use an identical toolchain; splitting them across two MRs would leave the two disagreeing in between.",
       "matchDatasources": ["docker"],
-      "matchPackageNames": ["ghcr.io/astral-sh/uv"],
+      "matchPackageNames": ["astral/uv"],
       "groupName": "uv toolchain image"
     },
     {

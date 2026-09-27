@@ -5,8 +5,9 @@
 #
 # Pinned to the image INDEX (manifest-list) digest rather than a per-arch child, so the
 # correct binary is selected per build platform. uv 0.11.25 (2026-06-27, within the
-# 45-day soak); digest verified against ghcr.io.
-FROM ghcr.io/astral-sh/uv:0.11.25-python3.14-trixie-slim@sha256:2b2e474b3a72e84c92b18a2f011a14adcb045fb361f7d8667ed1f8f55eefdafd
+# 45-day soak); digest verified against Docker Hub. Pulled from Docker Hub because
+# Renovate only reads release timestamps there, which the soak needs.
+FROM astral/uv:0.11.25-python3.14-trixie-slim@sha256:2b2e474b3a72e84c92b18a2f011a14adcb045fb361f7d8667ed1f8f55eefdafd
 
 # The virtualenv lives outside /app so that bind-mounting the working tree over /app
 # during development does not shadow it. Without this, `docker compose run` would mask

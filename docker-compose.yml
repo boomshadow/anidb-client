@@ -65,15 +65,14 @@ services:
   # and writes the rendered notes to stdout.
   #
   # Digest-pinned like every other image here, tag and digest together so Renovate
-  # keeps the pair moving as one. Pulled from GHCR rather than Docker Hub -- both
-  # registries serve this identical index digest, and GHCR is bound to the same
-  # organisation that publishes the source.
+  # keeps the pair moving as one. Pulled from Docker Hub because Renovate only
+  # reads release timestamps there, which the 45-day soak needs.
   #
   # Mounted READ-ONLY. This tool exists to read history and say what changed; giving
   # it write access to the working tree would let a rendering step modify the thing it
   # is describing. Notes go to stdout, so it never needs to write anything.
   cliff:
-    image: ghcr.io/orhun/git-cliff/git-cliff:2.13.1@sha256:d49216b61658fc1b10bab6c5f82dfca03b8e37278618fdc3db235d95cf3c33f5
+    image: orhunp/git-cliff:2.13.1@sha256:d49216b61658fc1b10bab6c5f82dfca03b8e37278618fdc3db235d95cf3c33f5
     volumes:
       - .:/app:ro
     working_dir: /app
