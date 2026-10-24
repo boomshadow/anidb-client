@@ -27,7 +27,7 @@ classifiers = [
 dynamic = ["version"]
 
 # Pinned exact and hash-locked in uv.lock (supply-chain rule). Each version is the
-# latest released on or before the 45-day soak cutoff at the time it was pinned.
+# latest released on or before the soak cutoff in force when it was pinned.
 dependencies = [
     "pycryptodome==3.23.0",
     "sqlalchemy==2.0.52",
@@ -45,7 +45,7 @@ Issues = "https://github.com/boomshadow/anidb-client/issues"
 
 [dependency-groups]
 # Same supply-chain rule as the runtime dependencies above: exact and hash-locked,
-# latest within the 45-day soak window as of 2026-08-11.
+# latest within the soak window in force on 2026-08-11.
 dev = [
     "pytest==9.1.1",
     "pytest-cov==7.1.0",
@@ -64,13 +64,13 @@ dev = [
 ]
 
 [tool.uv]
-# Dependency cooldown -- the 45-day soak, enforced by the resolver rather than by
+# Dependency cooldown -- the 14-day soak, enforced by the resolver rather than by
 # discipline. Renovate's release-age filter governs the updates it *proposes*, but not
 # the lockfile refreshes it delegates to the package manager, so transitive
 # dependencies could otherwise land the day they are published. uv applies this to
 # every resolution -- CI's, the bot's, and a developer's -- and records the resulting
 # cutoff in uv.lock.
-exclude-newer = "45 days"
+exclude-newer = "14 days"
 
 # What makes uv rebuild this project rather than reuse a cached build of it.
 #
@@ -91,7 +91,7 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "src/anidb_client/__init__.p
 
 # Deliberate soak exceptions, each dated just past the release it admits so a further
 # bump has to be argued again rather than riding in on a standing waiver. **These are
-# temporary**: delete an entry once its pinned version passes 45 days on the date
+# temporary**: delete an entry once its pinned version passes 14 days on the date
 # noted. An empty table here is the healthy steady state.
 [tool.uv.exclude-newer-package]
 
