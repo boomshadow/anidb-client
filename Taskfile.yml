@@ -106,7 +106,7 @@ tasks:
       - "{{.RUN}} {{.UV}} python -m tests.schema_snapshot"
 
   lock:
-    desc: Re-resolve and update uv.lock (honours the 45-day soak)
+    desc: Re-resolve and update uv.lock (honours the 14-day soak)
     cmds:
       - "{{.RUN}} uv lock"
 

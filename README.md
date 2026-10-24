@@ -736,7 +736,7 @@ or make an HTTP request to a non-loopback address. Please keep it that way — a
 test that reaches the real API risks an IP ban for whoever runs it next.
 
 Dependencies are pinned exactly and hash-locked in `uv.lock`, and the resolver
-enforces a 45-day cooldown on new releases.
+enforces a 14-day cooldown on new releases.
 
 ### Documentation
 

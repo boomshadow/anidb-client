@@ -27,7 +27,7 @@ stages:
   - publish
 
 # Pinned uv image (Python 3.14 + uv) shared by every job below. uv 0.11.25
-# (2026-06-27, within the 45-day soak); index digest verified from Docker Hub (the one
+# (2026-06-27, within the 14-day soak); index digest verified from Docker Hub (the one
 # registry Renovate reads release timestamps from, which the soak needs), and the
 # same one the Dockerfile pins so local and CI runs use an identical toolchain.
 .uv-image: &uv_image >-
