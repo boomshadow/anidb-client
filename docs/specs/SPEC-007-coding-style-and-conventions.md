@@ -64,7 +64,7 @@ Every external input is pinned to an exact version and verified.
 
 ## Testing
 
-**The test suite never contacts AniDB.** A fake server on loopback stands in for the API, and an autouse guard fails any test that addresses a non-loopback host. The point worth stating is *where* that guard lives: it is enforced by the tests themselves, not by the container or the CI runner, so it holds on a developer's machine and in any environment the suite is run in. A test that reached the real API would risk an IP ban for whoever ran it next.
+**The test suite never contacts AniDB.** A fake server on loopback stands in for the API, and an autouse guard fails any test that addresses a non-loopback host. The point worth stating is *where* that guard lives: it is enforced by the tests themselves, not by the container or the CI runner, so it holds on a developer's machine and in any environment the suite is run in. A test that reached the real API would risk an IP ban for whoever ran it next. The one opening is name resolution of the PostgreSQL host in `ANIDB_TEST_POSTGRES_URL`, granted only to a test that requests the `postgres_url` fixture, because the psycopg driver resolves that host in Python before libpq connects; connects and sends stay loopback-only.
 
 Timing is injected, not slept through. The rate limiter takes its clock and its sleep function as parameters so ban back-off — measured in half-hours in production — is tested instantly. The suite carries a per-test timeout well above any legitimate test, so a test that blocks on a real socket or a real sleep fails loudly instead of hanging the run.
 

@@ -30,7 +30,7 @@ dynamic = ["version"]
 # latest released on or before the soak cutoff in force when it was pinned.
 dependencies = [
     "pycryptodome==3.24.0",
-    "sqlalchemy==2.0.52",
+    "sqlalchemy==2.1.4",
 ]
 
 # No `nfs` extra on purpose. File(path='nfs://...') needs the `libnfs` Python module,
@@ -55,7 +55,7 @@ dev = [
     "pytest-timeout==2.4.0",
     # PostgreSQL driver for the schema tests. Test-only: the library declares no
     # driver, since which one to install is the application's choice.
-    "psycopg2-binary==2.9.12",
+    "psycopg[binary]==3.3.6",
     "ruff==0.17.0",
     "mypy==2.4.0",
     "codespell==2.4.3",
