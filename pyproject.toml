@@ -29,7 +29,7 @@ dynamic = ["version"]
 # Pinned exact and hash-locked in uv.lock (supply-chain rule). Each version is the
 # latest released on or before the soak cutoff in force when it was pinned.
 dependencies = [
-    "pycryptodome==3.23.0",
+    "pycryptodome==3.24.0",
     "sqlalchemy==2.0.52",
 ]
 
