@@ -37,6 +37,33 @@ def test_name_resolution_is_blocked():
         socket.getaddrinfo("api.anidb.net", 9000)
 
 
+# A documentation address (RFC 5737): numeric, so resolving it sends no traffic.
+_DB_HOST = "192.0.2.1"
+
+
+def test_a_resolvable_host_is_resolved_and_nothing_else(block_external_network):
+    """The one opening a fixture can make is a lookup of the host it was given."""
+    block_external_network.add(_DB_HOST)
+    assert socket.getaddrinfo(_DB_HOST, 5432)
+    with pytest.raises(ExternalNetworkBlocked, match="resolve"):
+        socket.getaddrinfo("api.anidb.net", 9000)
+
+
+def test_a_resolvable_host_still_cannot_be_connected_to(block_external_network):
+    """Allowing the lookup opens no socket: connects stay loopback-only."""
+    block_external_network.add(_DB_HOST)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        with pytest.raises(ExternalNetworkBlocked, match="connect"):
+            sock.connect((_DB_HOST, 5432))
+    finally:
+        sock.close()
+
+
+def test_no_host_is_resolvable_by_default(block_external_network):
+    assert block_external_network == set()
+
+
 def test_urlopen_is_blocked():
     with pytest.raises(ExternalNetworkBlocked, match="anime-titles"):
         urllib.request.urlopen("https://anidb.net/api/anime-titles.xml.gz")

@@ -9,6 +9,12 @@ So every test runs behind `block_external_network`, an autouse fixture that lets
 loopback through and turns anything else into an immediate error. It is deliberately
 belt-and-braces: it guards the address a socket is pointed at, name resolution, and
 urllib's entry points, because the library reaches the network by all three routes.
+
+One hostname may be resolved besides loopback: the PostgreSQL server named by
+`ANIDB_TEST_POSTGRES_URL`, and only inside a test that asks for it through the
+`postgres_url` fixture. The psycopg driver resolves the host in Python before
+handing libpq an address, so the schema tests need that one lookup. Connects and
+sends stay loopback-only.
 """
 
 import ipaddress
@@ -18,6 +24,7 @@ import socket
 import urllib.request
 
 import pytest
+from sqlalchemy.engine import make_url
 
 from tests import factories
 from tests.objectlayer import RecordingLink
@@ -59,7 +66,12 @@ def _check(address, what):
 
 @pytest.fixture(autouse=True)
 def block_external_network(monkeypatch):
-    """Fail any test that addresses a non-loopback host. Applied to every test."""
+    """Fail any test that addresses a non-loopback host. Applied to every test.
+
+    Yields the set of extra hostnames this test may resolve, empty unless a fixture
+    such as `postgres_url` adds to it.
+    """
+    resolvable: set[str] = set()
     real_socket_cls = socket.socket
     real_getaddrinfo = socket.getaddrinfo
 
@@ -83,7 +95,8 @@ def block_external_network(monkeypatch):
             return super().sendmsg(buffers, ancdata, flags, address)
 
     def guarded_getaddrinfo(host, *args, **kwargs):
-        _check(host, "resolve")
+        if host not in resolvable:
+            _check(host, "resolve")
         return real_getaddrinfo(host, *args, **kwargs)
 
     def guarded_create_connection(address, *args, **kwargs):
@@ -103,7 +116,7 @@ def block_external_network(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", guarded_create_connection)
     monkeypatch.setattr(urllib.request, "urlopen", guarded_urlopen)
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", guarded_urlopen)
-    yield
+    yield resolvable
 
 
 # ---------------------------------------------------------------------------
@@ -178,14 +191,18 @@ def session(anidb):
 
 
 @pytest.fixture
-def postgres_url():
+def postgres_url(block_external_network):
     """URL of a real PostgreSQL, or skip.
 
     Supplied by docker-compose and by CI. Absent locally outside compose, in which
     case the schema tests that need a server database skip rather than fail -- CI
-    separately asserts that they did run.
+    separately asserts that they did run. Its host, and only its host, becomes
+    resolvable for the test that asked for it.
     """
     url = os.environ.get("ANIDB_TEST_POSTGRES_URL")
     if not url:
         pytest.skip("ANIDB_TEST_POSTGRES_URL is not set; start the compose `db` service")
+    host = make_url(url).host
+    if host:
+        block_external_network.add(host)
     return url

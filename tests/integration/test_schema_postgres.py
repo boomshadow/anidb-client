@@ -70,7 +70,7 @@ class TestSchemaSnapshot:
         """Compiled through the live engine's dialect, not a bare one.
 
         Which is the difference worth having a server for: the dialect a connected
-        engine carries knows the server's version and its psycopg2 driver, so this
+        engine carries knows the server's version and its psycopg driver, so this
         is the DDL PostgreSQL was actually sent rather than the DDL the dialect
         module renders in the abstract.
         """
