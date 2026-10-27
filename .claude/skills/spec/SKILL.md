@@ -67,7 +67,7 @@ That wraps `docker compose run --rm dev uv run --frozen python .claude/skills/sp
 
 ### What It Does
 
-1. **Validates** all `SPEC-*.md` files in `docs/specs/` — checks filename format, YAML frontmatter presence, required fields (`title`, `description`, `status`, `tags`), and status values.
+1. **Validates** all `SPEC-*.md` files in `docs/specs/` — checks filename format, unique numbers, YAML frontmatter presence and parseability, required fields (`title`, `description`, `status`, `tags`), status values, and that tags are a list of lowercase strings. Each problem is reported against its file, and checking continues across the remaining files.
 2. **Generates** `docs/specs/INDEX.md` — but only if validation passes with zero errors.
 
 Passing `--check` validates and rebuilds the index in memory but writes nothing, failing instead if the committed file is out of date. That is the mode CI runs; `task index:check` runs both checks locally.

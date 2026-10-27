@@ -14,16 +14,38 @@ VALID_STATUSES = {"draft", "accepted"}
 REQUIRED_FIELDS = ("title", "description", "status", "tags")
 
 
-def parse_frontmatter(path: Path) -> dict | None:
-    """Extract YAML frontmatter from a file. Returns None if no frontmatter."""
-    text = path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
+def split_frontmatter(text: str) -> tuple[str, str] | None:
+    """Split text into (frontmatter, body). Returns None if no frontmatter.
+
+    Frontmatter opens and closes on lines that are exactly `---`, so a `---`
+    inside a field value does not end it.
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
         return None
-    end = text.find("---", 3)
-    if end == -1:
-        return None
-    raw = text[3:end]
-    return yaml.safe_load(raw)
+    for i, line in enumerate(lines[1:], start=1):
+        if line.rstrip("\r\n") == "---":
+            return "".join(lines[1:i]), "".join(lines[i + 1 :])
+    return None
+
+
+def parse_frontmatter(raw: str) -> dict | None:
+    """Parse raw YAML frontmatter. Returns None if it is empty.
+
+    Raises ValueError if it is not valid YAML or not a mapping.
+    """
+    try:
+        fm = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Frontmatter is not valid YAML: {' '.join(str(exc).split())}") from exc
+    if fm is not None and not isinstance(fm, dict):
+        raise ValueError(f"Frontmatter must be a YAML mapping, got {type(fm).__name__}")
+    return fm
+
+
+def table_cell(value: object) -> str:
+    """Render a value as a single-line Markdown table cell."""
+    return " ".join(str(value).split()).replace("|", r"\|")
 
 
 def validate_specs(spec_files: list[Path]) -> tuple[list[dict], list[str], list[str]]:
@@ -31,6 +53,7 @@ def validate_specs(spec_files: list[Path]) -> tuple[list[dict], list[str], list[
     errors: list[str] = []
     warnings: list[str] = []
     entries: list[dict] = []
+    seen: dict[int, str] = {}
 
     for path in spec_files:
         name = path.name
@@ -40,7 +63,18 @@ def validate_specs(spec_files: list[Path]) -> tuple[list[dict], list[str], list[
             continue
 
         number = int(match.group(1))
-        fm = parse_frontmatter(path)
+        if number in seen:
+            errors.append(f"ERROR [{name}]: Number {number:03d} is already used by {seen[number]}")
+            continue
+        seen[number] = name
+
+        text = path.read_text(encoding="utf-8")
+        parts = split_frontmatter(text)
+        try:
+            fm = parse_frontmatter(parts[0]) if parts else None
+        except ValueError as exc:
+            errors.append(f"ERROR [{name}]: {exc}")
+            continue
 
         if fm is None:
             errors.append(f"ERROR [{name}]: Missing YAML frontmatter entirely")
@@ -60,15 +94,29 @@ def validate_specs(spec_files: list[Path]) -> tuple[list[dict], list[str], list[
             errors.append(f"ERROR [{name}]: Unrecognized status '{status}' (expected 'draft' or 'accepted')")
             file_errors = True
 
+        tags = fm.get("tags")
+        if tags:
+            if not isinstance(tags, list):
+                errors.append(f"ERROR [{name}]: tags must be a list, got {type(tags).__name__}")
+                file_errors = True
+            else:
+                for tag in tags:
+                    if not isinstance(tag, str):
+                        errors.append(f"ERROR [{name}]: Tag {tag!r} is not a string (quote it in YAML)")
+                        file_errors = True
+                    elif tag != tag.lower():
+                        errors.append(f"ERROR [{name}]: Tag '{tag}' is not lowercase")
+                        file_errors = True
+
         if not file_errors:
             entries.append(
                 {
                     "number": number,
                     "filename": name,
-                    "title": fm["title"],
-                    "description": fm["description"],
+                    "title": table_cell(fm["title"]),
+                    "description": table_cell(fm["description"]),
                     "status": fm["status"],
-                    "tags": ", ".join(fm.get("tags", [])),
+                    "tags": ", ".join(table_cell(tag) for tag in fm["tags"]),
                 }
             )
 
