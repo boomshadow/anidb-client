@@ -77,6 +77,9 @@ non-loopback host.
 ## Input
 
 If a diff is provided in the prompt, use it.
+In CI, the invocation script always provides the diff, or the base and head
+commits when the diff is too large to include. The steps below apply only when
+you run without one, such as locally.
 
 If no diff is provided, determine the diff from git context:
 
