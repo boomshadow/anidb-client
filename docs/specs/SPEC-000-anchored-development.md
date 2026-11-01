@@ -2,7 +2,7 @@
 title: "Anchored Development"
 description: "A framework for living documentation in AI-assisted software development. Defines four interconnected artifact types (code, tests, specs, ADRs), three enforcement modes (self-enforcing, verified, unverified), and the practices that keep documentation anchored to reality. Addresses documentation drift, spec sprawl, and the disconnect between product and engineering teams."
 status: accepted
-version: 2.0.0
+version: 2.1.0
 tags: [anchored-development, spec-driven-development, living-documentation, drift-detection, framework]
 license: CC-BY-SA-4.0
 ---
@@ -347,13 +347,13 @@ Every ADR MUST begin with YAML frontmatter following the same schema as specs:
 ---
 title: "Short human-readable title"
 description: "One to two sentences written for retrieval. Include the problem
-  domain, the decision made, and at least one major rejected alternative."
+  domain, the decision made, and the major rejected alternative, if any."
 status: accepted
 tags: [domain, decision, relevant-keywords]
 ---
 ```
 
-The description MUST contain the decision made AND at least one rejected alternative.
+The description MUST contain the decision made AND the major rejected alternative, when the decision has one.
 
 Good: `"Adopted PostgreSQL as the sole data store with a hand-rolled priority queue. Redis was rejected due to querying limitations for REST API endpoints."`
 
@@ -367,7 +367,7 @@ ADRs MUST contain at minimum:
 
 **Context** — What problem exists. What constraints apply. Be specific — do not assume the reader has the same context as the decision maker.
 
-**Decision** — What was decided and why. Lead with the choice, then the reasoning. Rejected alternatives MUST be named with explanations for why they were rejected. This is the section that prevents re-litigation.
+**Decision** — What was decided and why. Lead with the choice, then the reasoning. Rejected alternatives MUST be named with explanations for why they were rejected. The reasoning and the rejected alternatives are the decision maker's own; an agent asks the decision maker rather than supplying its own. If the decision maker rejected no alternative, the ADR names none. This is the section that prevents re-litigation.
 
 **Consequences** — What follows from this decision, both positive and negative. Note any follow-on decisions this creates.
 
