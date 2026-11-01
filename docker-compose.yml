@@ -41,7 +41,7 @@ services:
   # Credentials are fixed and trivial on purpose: this database holds nothing, is
   # reachable only on the compose network, and is destroyed with the container.
   db:
-    image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     environment:
       POSTGRES_USER: anidb
       POSTGRES_PASSWORD: anidb

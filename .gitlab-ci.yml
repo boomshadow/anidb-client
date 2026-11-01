@@ -237,7 +237,7 @@ test:
   # covers neither branch. Same image and digest as docker-compose.yml, so a local
   # `task test` and this job talk to the same server version.
   services:
-    - name: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    - name: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
       alias: db
   variables:
     POSTGRES_USER: anidb
