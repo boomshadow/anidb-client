@@ -4,10 +4,10 @@
 # and in CI without anything being installed on the host.
 #
 # Pinned to the image INDEX (manifest-list) digest rather than a per-arch child, so the
-# correct binary is selected per build platform. uv 0.13.5; digest verified against
-# Docker Hub. Pulled from Docker Hub because
-# Renovate only reads release timestamps there, which the soak needs.
-FROM astral/uv:0.13.5-python3.14-trixie-slim@sha256:d8e732839dfc4225a1ff698803b478b2223c05636c055d3add41ab9dbec0f315
+# correct binary is selected per build platform. Digest verified against Docker Hub,
+# where it is pulled from because Renovate only reads release timestamps there, which
+# the soak needs.
+FROM astral/uv:0.13.6-python3.14-trixie-slim@sha256:637619278855a77885a94312efa7decd8479ca6cec5f959e134cbab96582821e
 
 # The virtualenv lives outside /app so that bind-mounting the working tree over /app
 # during development does not shadow it. Without this, `docker compose run` would mask

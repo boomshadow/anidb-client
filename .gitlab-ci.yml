@@ -26,19 +26,19 @@ stages:
   - drift-detection   # Anchored Development anchor-watch (MR-only)
   - publish
 
-# Pinned uv image (Python 3.14 + uv) shared by every job below. uv 0.13.5; index
-# digest verified from Docker Hub (the one
-# registry Renovate reads release timestamps from, which the soak needs), and the
-# same one the Dockerfile pins so local and CI runs use an identical toolchain.
+# Pinned uv image (Python 3.14 + uv) shared by every job below. Index digest verified
+# from Docker Hub (the one registry Renovate reads release timestamps from, which the
+# soak needs), and the same one the Dockerfile pins so local and CI runs use an
+# identical toolchain.
 .uv-image: &uv_image >-
-  astral/uv:0.13.5-python3.14-trixie-slim@sha256:d8e732839dfc4225a1ff698803b478b2223c05636c055d3add41ab9dbec0f315
+  astral/uv:0.13.6-python3.14-trixie-slim@sha256:637619278855a77885a94312efa7decd8479ca6cec5f959e134cbab96582821e
 
 # The same uv, Python and Debian release as above, on the full base rather than the slim
 # one -- so it carries `git`, which the slim variant does not. Exactly one job needs it:
 # reading the subjects of the commits a push added. Renovate's "uv toolchain image" group
 # matches this repository too, so both digests move together and cannot drift apart.
 .uv-image-git: &uv_image_git >-
-  astral/uv:0.13.5-python3.14-trixie@sha256:00c6beb41f4ceb136a7e28a48f9d7ded75f85f4e99bce30a6c89dffbd5d10d7c
+  astral/uv:0.13.6-python3.14-trixie@sha256:69acf868b6e856281be85e6088b6e3bde4e46cd83cfd578dbe159076a2920322
 
 # Run a merge-request pipeline for MRs; otherwise a branch pipeline -- but never both for
 # the same branch at once (avoids duplicate pipelines when a branch has an open MR).
