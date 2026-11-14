@@ -47,7 +47,7 @@ Issues = "https://github.com/boomshadow/anidb-client/issues"
 # Same supply-chain rule as the runtime dependencies above: exact and hash-locked,
 # latest within the soak window in force on 2026-08-11.
 dev = [
-    "pytest==9.1.1",
+    "pytest==9.2.0",
     "pytest-cov==7.1.0",
     # Every test either talks to a loopback UDP server or exercises code that can
     # sleep on a retry path, and the transport is threaded. A suite-wide timeout
